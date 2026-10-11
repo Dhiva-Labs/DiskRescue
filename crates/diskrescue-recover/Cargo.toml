@@ -1,0 +1,34 @@
+[package]
+name = "diskrescue-recover"
+description = "End-to-end recovery pipeline: image, parse, extract, carve, validate, repair, report"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+diskrescue-core.workspace = true
+thiserror.workspace = true
+log.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+diskrescue-device.workspace = true
+diskrescue-imaging.workspace = true
+diskrescue-partition.workspace = true
+diskrescue-fat.workspace = true
+diskrescue-ntfs.workspace = true
+diskrescue-ext4.workspace = true
+diskrescue-jpeg.workspace = true
+diskrescue-png.workspace = true
+diskrescue-stills.workspace = true
+diskrescue-isobmff.workspace = true
+diskrescue-video.workspace = true
+diskrescue-carve.workspace = true
+rayon.workspace = true
+blake3.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+diskrescue-fixtures.workspace = true

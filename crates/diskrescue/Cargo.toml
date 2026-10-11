@@ -1,0 +1,29 @@
+[package]
+name = "diskrescue"
+description = "DiskRescue command-line tool"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+diskrescue-core.workspace = true
+thiserror.workspace = true
+log.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+diskrescue-device.workspace = true
+diskrescue-imaging.workspace = true
+diskrescue-recover.workspace = true
+diskrescue-partition.workspace = true
+clap.workspace = true
+env_logger.workspace = true
+indicatif.workspace = true
+ratatui.workspace = true
+crossterm.workspace = true
+ctrlc.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

@@ -1,0 +1,80 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/diskrescue-core",
+    "crates/diskrescue-device",
+    "crates/diskrescue-imaging",
+    "crates/diskrescue-partition",
+    "crates/diskrescue-fat",
+    "crates/diskrescue-ntfs",
+    "crates/diskrescue-ext4",
+    "crates/diskrescue-jpeg",
+    "crates/diskrescue-png",
+    "crates/diskrescue-stills",
+    "crates/diskrescue-isobmff",
+    "crates/diskrescue-video",
+    "crates/diskrescue-carve",
+    "crates/diskrescue-recover",
+    "crates/diskrescue-fixtures",
+    "crates/diskrescue",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/Dhiva-Labs/DiskRescue"
+authors = ["Dhiva-Labs"]
+rust-version = "1.85"
+
+[workspace.dependencies]
+diskrescue-core = { path = "crates/diskrescue-core" }
+diskrescue-device = { path = "crates/diskrescue-device" }
+diskrescue-imaging = { path = "crates/diskrescue-imaging" }
+diskrescue-partition = { path = "crates/diskrescue-partition" }
+diskrescue-fat = { path = "crates/diskrescue-fat" }
+diskrescue-ntfs = { path = "crates/diskrescue-ntfs" }
+diskrescue-ext4 = { path = "crates/diskrescue-ext4" }
+diskrescue-jpeg = { path = "crates/diskrescue-jpeg" }
+diskrescue-png = { path = "crates/diskrescue-png" }
+diskrescue-stills = { path = "crates/diskrescue-stills" }
+diskrescue-isobmff = { path = "crates/diskrescue-isobmff" }
+diskrescue-video = { path = "crates/diskrescue-video" }
+diskrescue-carve = { path = "crates/diskrescue-carve" }
+diskrescue-recover = { path = "crates/diskrescue-recover" }
+diskrescue-fixtures = { path = "crates/diskrescue-fixtures" }
+
+thiserror = "2"
+log = "0.4"
+env_logger = "0.11"
+memchr = "2"
+aho-corasick = "1"
+blake3 = "1"
+crc32fast = "1"
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+rayon = "1"
+libc = "0.2"
+clap = { version = "4", features = ["derive", "wrap_help"] }
+indicatif = "0.17"
+ratatui = "0.29"
+crossterm = "0.28"
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
+zune-jpeg = "0.4"
+png = "0.17"
+tempfile = "3"
+rand = "0.8"
+ctrlc = { version = "3", features = ["termination"] }
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_IO", "Win32_System_Ioctl", "Win32_Security"] }
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
+
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 2

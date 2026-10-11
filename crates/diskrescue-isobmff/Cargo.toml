@@ -1,0 +1,19 @@
+[package]
+name = "diskrescue-isobmff"
+description = "ISO BMFF (MP4/MOV/3GP/HEIC/CR3) parsing, carving, moov reconstruction and repair"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+diskrescue-core.workspace = true
+thiserror.workspace = true
+log.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

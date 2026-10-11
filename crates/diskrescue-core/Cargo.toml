@@ -1,0 +1,19 @@
+[package]
+name = "diskrescue-core"
+description = "Shared types and traits for DiskRescue: sources, ranges, devices, filesystems, file formats"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+blake3.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+log.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

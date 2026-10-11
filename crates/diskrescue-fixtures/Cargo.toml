@@ -1,0 +1,24 @@
+[package]
+name = "diskrescue-fixtures"
+description = "Synthetic test fixtures: filesystem images, media files and damaged variants"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+diskrescue-core.workspace = true
+thiserror.workspace = true
+log.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+image.workspace = true
+crc32fast.workspace = true
+flate2.workspace = true
+rand.workspace = true
+tempfile.workspace = true
+
+[dev-dependencies]
+
