@@ -66,7 +66,7 @@ impl Signature {
             let off = off as usize;
             head.len() >= off + pat.len() && &head[off..off + pat.len()] == pat
         };
-        ok(self.bytes, self.offset) && self.also.map_or(true, |(b, o)| ok(b, o))
+        ok(self.bytes, self.offset) && self.also.is_none_or(|(b, o)| ok(b, o))
     }
 }
 

@@ -96,7 +96,7 @@ impl RangeSet {
     }
 
     /// Build from any iterator of ranges (overlaps are merged).
-    pub fn from_iter<I: IntoIterator<Item = Range>>(iter: I) -> Self {
+    pub fn from_ranges<I: IntoIterator<Item = Range>>(iter: I) -> Self {
         let mut s = RangeSet::new();
         for r in iter {
             s.insert(r);
@@ -306,7 +306,7 @@ impl RangeSet {
 
 impl FromIterator<Range> for RangeSet {
     fn from_iter<I: IntoIterator<Item = Range>>(iter: I) -> Self {
-        RangeSet::from_iter(iter)
+        RangeSet::from_ranges(iter)
     }
 }
 

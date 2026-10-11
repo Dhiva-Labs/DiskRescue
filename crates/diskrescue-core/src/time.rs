@@ -56,7 +56,7 @@ impl Timestamp {
         let sec2 = (time & 0x1F) as i64;
         let min = ((time >> 5) & 0x3F) as i64;
         let hour = ((time >> 11) & 0x1F) as i64;
-        if !(1..=12).contains(&month) || day < 1 || day > 31 || hour > 23 || min > 59 || sec2 > 29 {
+        if !(1..=12).contains(&month) || !(1..=31).contains(&day) || hour > 23 || min > 59 || sec2 > 29 {
             return None;
         }
         let days = days_from_civil(year, month as u32, day as u32);
@@ -281,7 +281,7 @@ mod tests {
     #[test]
     fn exfat_offset_and_ext4_extra() {
         let date = (44u16 << 9) | (5 << 5) | 1;
-        let time = (12u16 << 11) | (30 << 5) | 0;
+        let time = (12u16 << 11) | (30 << 5);
         let packed = ((date as u32) << 16) | time as u32;
         // UTC+05:30 = 22 quarter hours, valid bit set.
         let ts = Timestamp::from_exfat(packed, 0, 0x80 | 22).unwrap();
