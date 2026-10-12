@@ -652,3 +652,33 @@ fn mft_record_size_4096_on_512_byte_sectors() {
     assert!(fs.record(18).is_err());
     let _ = RS;
 }
+
+#[test]
+fn damaged_base_reference_does_not_hide_a_file() {
+    let mut img = Img::new(256, 64);
+    let body = pattern(50, 9000);
+    let l = img.store(&body, true);
+    // A live file whose base reference got a bit flip: it now claims to be
+    // an extension record of record 40, but it holds the file's
+    // $STANDARD_INFORMATION, so it cannot be one.
+    let attrs = vec![
+        resident(types::STANDARD_INFORMATION, "", &si(), 0),
+        resident(
+            types::FILE_NAME,
+            "",
+            &fname(5, 5, "flipped.jpg", namespace::POSIX, false),
+            1,
+        ),
+        crate::synth_tests::nr_data("", l, 3, 9000),
+    ];
+    img.put(
+        16,
+        build_record_sized(1024, 16, 1, FLAG_IN_USE, 40 | (1 << 48), &attrs),
+    );
+    let fs = open_bytes(img.finish());
+    let all = collect_entries(&fs).unwrap();
+    let e = get(&all, "flipped.jpg");
+    assert!(!e.deleted);
+    assert_eq!(e.confidence, EntryConfidence::Allocated);
+    assert_eq!(read_all(&fs, e).0, body);
+}

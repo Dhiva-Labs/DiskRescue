@@ -194,9 +194,9 @@ impl NtfsFs {
         let mut bad_units = 0u64;
         for u in 0..units {
             let lstart = u * unit;
-            let lend = (lstart + unit).min(size);
+            let lend = lstart.saturating_add(unit).min(size);
             let vstart = u * unit_clusters;
-            let vend = vstart + unit_clusters;
+            let vend = vstart.saturating_add(unit_clusters);
             // Collect the unit's pieces.
             let mut pieces: Vec<(u64, u64, ExtentKind)> = Vec::new();
             let mut v = vstart;

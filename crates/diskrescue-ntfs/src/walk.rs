@@ -281,9 +281,15 @@ impl NtfsFs {
                     }
                     RecordRead::Invalid(_) => continue,
                 };
+                let (own, _) = rec.own_attributes(Some(self.total_clusters));
                 if let Some(base) = rec.base_record() {
-                    ext_map.entry(base).or_default().push(rec_no);
-                    continue;
+                    if crate::volume::acts_as_extension(&rec, &own) {
+                        ext_map.entry(base).or_default().push(rec_no);
+                        continue;
+                    }
+                    log::warn!(
+                        "NTFS: MFT record {rec_no} names base record {base} but holds $STANDARD_INFORMATION; treated as a file of its own"
+                    );
                 }
                 if !rec.in_use() && !self.opts.include_deleted {
                     continue;
@@ -291,7 +297,6 @@ impl NtfsFs {
                 if rec.is_torn() {
                     log::warn!("NTFS: MFT record {rec_no} has a torn write; parsed anyway");
                 }
-                let (own, _) = rec.own_attributes(Some(self.total_clusters));
                 let mut names: Vec<FileName> = own
                     .iter()
                     .filter(|a| a.type_code == types::FILE_NAME)
@@ -1017,7 +1022,12 @@ impl Emitter<'_, '_> {
                 let cseq = mseq(c.reference);
                 let live_src = c.source == IndexSource::Live;
                 match &rr {
-                    RecordRead::Ok(rec) if !rec.is_extension() => {
+                    RecordRead::Ok(rec)
+                        if !crate::volume::acts_as_extension(
+                            rec,
+                            &rec.own_attributes(Some(self.fs.total_clusters)).0,
+                        ) =>
+                    {
                         let same_file = sequence_matches(rec.sequence, rec.in_use(), cseq)
                             && (rec.in_use() || want_deleted);
                         if same_file {

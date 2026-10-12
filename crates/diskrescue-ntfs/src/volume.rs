@@ -426,6 +426,9 @@ impl NtfsFs {
                 continue;
             }
             let (attrs, _) = ext.own_attributes(Some(self.total_clusters));
+            if !acts_as_extension(&ext, &attrs) {
+                continue;
+            }
             let before = added;
             for a in attrs {
                 if f.taken.insert((a.record, a.offset)) {
@@ -502,7 +505,10 @@ impl NtfsFs {
             }
         };
         if rec.is_extension() {
-            return Ok(None);
+            let (own, _) = rec.own_attributes(Some(self.total_clusters));
+            if acts_as_extension(&rec, &own) {
+                return Ok(None);
+            }
         }
         Ok(Some(self.build_info(rec)))
     }
@@ -605,6 +611,18 @@ impl NtfsFs {
             .collect();
         assemble(&pieces, self.cluster, Some(self.total_clusters))
     }
+}
+
+/// True when `rec` is to be treated as an extension record. Extension
+/// records never hold `$STANDARD_INFORMATION` (it always stays in the base
+/// record), so a record that names a base record but carries one is a base
+/// record whose base reference is damaged: it is treated as a file of its
+/// own instead of vanishing from the listing.
+pub(crate) fn acts_as_extension(rec: &MftRecord, attrs: &[Attribute]) -> bool {
+    rec.is_extension()
+        && !attrs
+            .iter()
+            .any(|a| a.type_code == types::STANDARD_INFORMATION)
 }
 
 /// True for errors that must abort the whole operation (device gone).
@@ -711,8 +729,14 @@ pub(crate) fn fold_with(
                             rec.in_use(),
                             ext.base_sequence(),
                         );
-                    if base_ok {
-                        let (a, w) = ext.own_attributes(Some(total_clusters));
+                    let (a, w) = ext.own_attributes(Some(total_clusters));
+                    if base_ok && !acts_as_extension(&ext, &a) {
+                        warnings.push(format!(
+                            "record {}: record {r} holds $STANDARD_INFORMATION, so it is not an extension record; skipped",
+                            rec.number
+                        ));
+                        None
+                    } else if base_ok {
                         warnings.extend(w);
                         if ext.is_torn() {
                             ext_torn = true;

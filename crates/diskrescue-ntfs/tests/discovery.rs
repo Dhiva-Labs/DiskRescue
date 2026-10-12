@@ -200,3 +200,51 @@ fn noise_and_lookalikes_find_nothing() {
         .unwrap()
         .is_empty());
 }
+
+#[test]
+fn mutated_mft_never_panics_discovery() {
+    if !have(&["mkntfs", "ntfscp"]) {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let mut v = volume(tmp.path(), "fz", 4096, &[]);
+    wipe_boot(&mut v);
+    let mut seed = 0xABCD_EF01_2345_6789u64;
+    let mut rnd = move || {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        seed
+    };
+    let targets = [
+        (v.mft_offset as usize, 32 * 1024usize),
+        (v.mirror_offset as usize, 4096),
+    ];
+    for _ in 0..120 {
+        let mut img = v.bytes.clone();
+        for _ in 0..1 + rnd() % 30 {
+            let (base, len) = targets[(rnd() % 2) as usize];
+            let at = base + (rnd() as usize) % len;
+            img[at] = match rnd() % 3 {
+                0 => rnd() as u8,
+                1 => img[at] ^ (1 << (rnd() % 8)),
+                _ => 0,
+            };
+        }
+        let src: SharedSource = Arc::new(MemSource::new(img.clone()));
+        let found = find_volumes(&src, Range::new(0, img.len() as u64)).unwrap();
+        for f in &found {
+            if let Ok(fs) = open_found(src.clone(), f, &NtfsOptions::default()) {
+                let mut list = Vec::new();
+                let _ = fs.walk(&mut |e| {
+                    list.push(e.clone());
+                    diskrescue_core::fs::WalkControl::Continue
+                });
+                for e in list.iter().take(50) {
+                    let mut out = Vec::new();
+                    let _ = fs.read_file(e, &mut out);
+                }
+            }
+        }
+    }
+}

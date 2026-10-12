@@ -99,9 +99,13 @@ pub fn decompress(input: &[u8], max_out: usize, out: &mut Vec<u8>) -> Result<(),
         }
         let limit = CHUNK_SIZE.min(max_out - produced);
         if header & 0x8000 == 0 {
-            // Stored chunk: copy as-is (normally exactly 4096 bytes).
+            // Stored chunk: copy as-is (normally exactly 4096 bytes). A
+            // shorter one still occupies a whole 4096-byte slot, so the
+            // chunks after it stay at their offsets.
             let n = data_len.min(limit);
+            let chunk_out = out.len();
             out.extend_from_slice(&input[data_start..data_start + n]);
+            out.resize(chunk_out + limit, 0);
         } else {
             decompress_chunk(input, data_start, data_end, limit, out)?;
         }
@@ -258,6 +262,19 @@ mod tests {
         assert_eq!(&out[..4096], &raw[..]);
         assert_eq!(&out[4096..4096 + 6], b"xyzxyz");
         assert_eq!(out.len(), 65536);
+    }
+
+    #[test]
+    fn short_stored_chunk_keeps_the_next_chunk_in_its_slot() {
+        let mut input = (0x3000u16 | 9).to_le_bytes().to_vec();
+        input.extend_from_slice(b"0123456789");
+        let data = [0x08, b'x', b'y', b'z', 0x00, 0x20];
+        input.extend_from_slice(&compressed_chunk(&data));
+        let (out, err) = decompress_unit(&input, 65536);
+        assert!(err.is_none());
+        assert_eq!(&out[..10], b"0123456789");
+        assert!(out[10..4096].iter().all(|&b| b == 0));
+        assert_eq!(&out[4096..4102], b"xyzxyz");
     }
 
     #[test]

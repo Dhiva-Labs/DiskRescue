@@ -389,8 +389,10 @@ fn rebuild(disk: &Disk, copies: &[Copy], i: usize) -> Result<Option<FoundVolume>
         (256 - spc.trailing_zeros()) as u8
     };
     let rsize = copy.rsize;
+    // Encoded like the boot sector fields: a cluster count when it fits a
+    // positive i8, else -log2(bytes).
     let size_byte = |size: u64| -> i8 {
-        if size >= cluster {
+        if size >= cluster && size / cluster <= 127 {
             (size / cluster) as i8
         } else {
             -(size.trailing_zeros() as i8)
