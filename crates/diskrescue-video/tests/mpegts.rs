@@ -223,6 +223,58 @@ fn three_hundred_megabytes_stream_with_bounded_memory() {
 }
 
 #[test]
+fn camera_mts_with_bad_sectors_is_one_run() {
+    // An AVCHD-style .MTS rescued with ddrescue: two 4 KiB holes on 4 KiB
+    // boundaries read back as zeros and are listed in the mapfile. The run
+    // must cross them, not come back in pieces.
+    let Some(f) = ts_h264_aac() else { return };
+    let mts = to_m2ts(&f);
+    assert!(mts.len() > 64 * 1024, "{} bytes", mts.len());
+    let start = 8192usize;
+    let mut img = vec![0u8; start];
+    img.extend_from_slice(&mts);
+    img.extend(Rng(77).bytes(20_000));
+    let holes = [
+        (((start + mts.len() / 3) / 4096 * 4096) as u64, 4096u64),
+        (((start + 2 * mts.len() / 3) / 4096 * 4096) as u64, 4096u64),
+    ];
+    let mut bad = diskrescue_core::RangeSet::new();
+    for &(at, n) in &holes {
+        img[at as usize..(at + n) as usize].fill(0);
+        bad.insert(diskrescue_core::Range::with_len(at, n));
+    }
+    let (_dir, path) = write_temp("camera.img", &img);
+    let src: SharedSource = Arc::new(
+        diskrescue_core::source::FileSource::open(&path)
+            .unwrap()
+            .with_unreadable(bad),
+    );
+    let m = MpegTsFormat
+        .measure(&src, start as u64, u64::MAX)
+        .unwrap()
+        .unwrap();
+    assert_eq!(m.len, mts.len() as u64, "{:?}", m.notes);
+    assert_eq!(m.status, ExtentStatus::UnknownLength);
+    assert_eq!(m.meta.extra["extension"], "mts");
+    let rel: Vec<String> = holes
+        .iter()
+        .map(|&(at, n)| format!("{}..{}", at - start as u64, at + n - start as u64))
+        .collect();
+    let want = format!(
+        "packet sync resumed after 2 unreadable range(s) at file offsets {}",
+        rel.join(", ")
+    );
+    assert!(m.notes.contains(&want), "{:?}", m.notes);
+    // Before: the first hole ended the run.
+    let plain: SharedSource = Arc::new(diskrescue_core::source::FileSource::open(&path).unwrap());
+    let m = MpegTsFormat
+        .measure(&plain, start as u64, u64::MAX)
+        .unwrap()
+        .unwrap();
+    assert!(m.len < holes[0].0 + 4096 - start as u64);
+}
+
+#[test]
 fn limit_caps_the_run() {
     let Some(f) = ts_h264_aac() else { return };
     let m = MpegTsFormat

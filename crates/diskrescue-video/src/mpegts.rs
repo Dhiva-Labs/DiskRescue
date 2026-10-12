@@ -21,16 +21,26 @@
 //! PID. Duration is the difference between the first PCR in the head and the
 //! last PCR in the final 1024 packets (PES timestamps when there is no PCR).
 //!
+//! Known unreadable ranges ([`Source::unreadable`], e.g. from a ddrescue
+//! mapfile) do not end the run: a hole read as zeros (or failing to read)
+//! breaks the sync byte, but the packets after it still sit on the same
+//! grid. When the walk stops in a packet that a known hole covers, it skips
+//! to the end of the hole, resynchronises on the 188/192-byte grid (the
+//! next [`RESYNC_PACKETS`] sync bytes after the hole must hold) and carries
+//! on with the same run; the holes are listed in a note. A camera `.MTS`
+//! with bad sectors therefore comes back as one file instead of two pieces
+//! with the packets between the hole and the next aligned packet in
+//! neither.
+//!
 //! Limits: stream-level damage inside a run (garbage that keeps the stride)
 //! is not detected by `measure`; `validate` reports transport errors and
-//! continuity gaps. A hole that breaks the stride splits the stream into two
-//! carved files.
+//! continuity gaps. A sync miss that no known hole explains ends the run.
 
 use diskrescue_core::format::{
     Confidence, ExtentStatus, FileFormat, Measured, Signature, Validation, ValidationStatus,
 };
 use diskrescue_core::media::{MediaCategory, MediaMeta};
-use diskrescue_core::{Result, SharedSource};
+use diskrescue_core::{Range, RangeSet, Result, SharedSource, Source};
 
 use crate::io::{note_unreadable, Window};
 use crate::meta::{
@@ -47,6 +57,14 @@ const HEAD_PACKETS: u64 = 1024;
 const BLOCK_PACKETS: usize = 4096;
 /// Largest elementary stream prefix collected for the SPS search.
 const ES_PREFIX: usize = 128 * 1024;
+/// Consecutive sync bytes that must hold after a known hole before the run
+/// continues there.
+const RESYNC_PACKETS: u64 = 4;
+/// Packets examined while resynchronising after a hole (sync bytes inside
+/// further holes are skipped, not counted).
+const RESYNC_SCAN: u64 = 64;
+/// Holes listed by name in the note (the rest are counted).
+const MAX_LISTED_HOLES: usize = 16;
 
 /// What a program stream element is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -137,27 +155,89 @@ struct Run {
     plausible_start: bool,
     /// The run stopped on a sync miss (as opposed to the end of data).
     sync_miss: bool,
+    /// Known unreadable ranges the run was carried across (file-relative).
+    holes: Vec<Range>,
 }
 
-fn walk_run(win: &mut Window<'_>, stride: usize, off: usize) -> Run {
+impl Run {
+    /// Whether `off` lies in a hole the run was carried across.
+    fn skipped(&self, off: u64) -> bool {
+        self.holes.iter().any(|h| h.contains(off))
+    }
+
+    /// Note listing the holes the run was carried across.
+    fn holes_note(&self) -> Option<String> {
+        if self.holes.is_empty() {
+            return None;
+        }
+        let mut list: Vec<String> = self
+            .holes
+            .iter()
+            .take(MAX_LISTED_HOLES)
+            .map(|h| format!("{}..{}", h.start, h.end))
+            .collect();
+        if self.holes.len() > MAX_LISTED_HOLES {
+            list.push(format!("{} more", self.holes.len() - MAX_LISTED_HOLES));
+        }
+        Some(format!(
+            "packet sync resumed after {} unreadable range(s) at file offsets {}",
+            self.holes.len(),
+            list.join(", ")
+        ))
+    }
+}
+
+/// Where the run that stopped in the packet at `pos` continues after the
+/// known hole `h` (file-relative): the first packet on the grid after `pos`
+/// whose sync byte lies past the hole, provided [`RESYNC_PACKETS`] sync
+/// bytes from there on hold. Sync bytes inside further holes are skipped; a
+/// readable one that is not `0x47` fails.
+fn resync(
+    win: &mut Window<'_>,
+    holes: &RangeSet,
+    h: Range,
+    pos: u64,
+    stride: u64,
+    off: u64,
+) -> Option<u64> {
+    let first = (h.end.saturating_sub(off).div_ceil(stride) * stride).max(pos + stride);
+    let mut verified = 0u64;
+    for k in 0..RESYNC_SCAN {
+        let q = first + k * stride + off;
+        if holes.contains(q) {
+            continue;
+        }
+        match win.u8(q) {
+            Some(0x47) => verified += 1,
+            _ => return None,
+        }
+        if verified == RESYNC_PACKETS {
+            return Some(first);
+        }
+    }
+    None
+}
+
+fn walk_run(win: &mut Window<'_>, stride: usize, off: usize, holes: &RangeSet) -> Run {
     let mut run = Run::default();
     let mut cc_last = vec![0xFFu8; 8192];
     let mut non_null_in_start = false;
     let mut start_ok = true;
     let block = stride * BLOCK_PACKETS;
+    // File-relative start of the next packet; always on the grid.
     let mut pos = 0u64;
     loop {
         let data = win.get(pos, block);
+        let full = data.len() == block;
         let whole = data.len() / stride;
-        if whole == 0 {
-            break;
-        }
+        let done = pos / stride as u64;
+        let mut miss = false;
         let mut i = 0usize;
         while i < whole {
             let base = i * stride + off;
             let p = &data[base..base + 4];
             if p[0] != 0x47 {
-                run.sync_miss = true;
+                miss = true;
                 break;
             }
             let pid = (usize::from(p[1] & 0x1F) << 8) | usize::from(p[2]);
@@ -168,12 +248,12 @@ fn walk_run(win: &mut Window<'_>, stride: usize, off: usize) -> Run {
             }
             if afc == 0 {
                 run.bad_afc += 1;
-                if run.packets + (i as u64) < MIN_PACKETS {
+                if done + (i as u64) < MIN_PACKETS {
                     start_ok = false;
                 }
             }
             if pid != 0x1FFF {
-                if run.packets + (i as u64) < MIN_PACKETS {
+                if done + (i as u64) < MIN_PACKETS {
                     non_null_in_start = true;
                 }
                 let has_payload = afc & 1 != 0;
@@ -193,15 +273,34 @@ fn walk_run(win: &mut Window<'_>, stride: usize, off: usize) -> Run {
             }
             i += 1;
         }
-        run.packets += i as u64;
-        if run.sync_miss {
-            break;
+        pos += (i * stride) as u64;
+        if !miss && whole > 0 && full {
+            continue;
         }
-        pos += (whole * stride) as u64;
-        if data.len() < block {
-            break;
+        // The run stops at `pos`: a sync miss, a short read or the end of
+        // the window. A known hole in that packet does not end the stream
+        // when the grid holds again after it.
+        let hole = holes.first_intersecting(Range::new(pos, pos + stride as u64));
+        let explained = hole.filter(|_| !miss || holes.contains(pos + off as u64));
+        if let Some(h) = explained {
+            if let Some(next) = resync(win, holes, h, pos, stride as u64, off as u64) {
+                log::debug!(
+                    "MPEG-TS: resynchronised at {next} after unreadable bytes {}..{}",
+                    h.start,
+                    h.end
+                );
+                run.holes.push(h);
+                // Packets lost in the hole break continuity as expected.
+                cc_last.fill(0xFF);
+                win.forget_fault_before(next);
+                pos = next;
+                continue;
+            }
         }
+        run.sync_miss = miss;
+        break;
     }
+    run.packets = pos / stride as u64;
     run.plausible_start = start_ok && non_null_in_start;
     run
 }
@@ -472,11 +571,11 @@ struct Analysis {
     duration_ms: Option<u64>,
 }
 
-fn analyse(win: &mut Window<'_>) -> Option<Analysis> {
+fn analyse(win: &mut Window<'_>, holes: &RangeSet) -> Option<Analysis> {
     let first = win.get(0, 4 * 192 + 8).to_vec();
     let (stride, off) = detect_layout(&first)?;
     log::trace!("MPEG-TS: stride {stride}, sync offset {off}");
-    let run = walk_run(win, stride, off);
+    let run = walk_run(win, stride, off, holes);
     log::debug!(
         "MPEG-TS: run of {} packets, {} TEI, {} CC errors",
         run.packets,
@@ -548,6 +647,17 @@ fn build_meta(a: &Analysis) -> MediaMeta {
     m
 }
 
+/// Known unreadable ranges of `src` inside the window of `avail` bytes at
+/// `start`, file-relative.
+fn known_holes(src: &dyn Source, start: u64, avail: u64) -> RangeSet {
+    match src.unreadable() {
+        Some(set) if !set.is_empty() => set
+            .intersection_with_range(Range::new(start, start.saturating_add(avail)))
+            .shifted_down(start),
+        _ => RangeSet::new(),
+    }
+}
+
 /// Format handler for MPEG-TS and M2TS.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct MpegTsFormat;
@@ -613,12 +723,17 @@ impl FileFormat for MpegTsFormat {
 
     fn measure(&self, src: &SharedSource, start: u64, limit: u64) -> Result<Option<Measured>> {
         let mut win = Window::new(&**src, start, limit);
-        let Some(a) = analyse(&mut win) else {
+        let holes = known_holes(&**src, start, win.avail());
+        let Some(a) = analyse(&mut win, &holes) else {
             return Ok(None);
         };
         let len = a.run.packets * a.stride as u64;
         let mut notes = Vec::new();
-        let (status, err_offset) = if let Some(f) = win.fault() {
+        notes.extend(a.run.holes_note());
+        // A read failure inside a hole the run was carried across is
+        // accounted for (head and tail reads may touch it again).
+        let fault = win.fault().filter(|f| !a.run.skipped(f.offset));
+        let (status, err_offset) = if let Some(f) = fault {
             notes.push(format!("read error near offset {}", f.offset));
             (ExtentStatus::Truncated, Some(f.offset.max(len)))
         } else if !a.run.sync_miss && win.limited() && len + a.stride as u64 > win.avail() {
@@ -665,13 +780,17 @@ impl FileFormat for MpegTsFormat {
     fn validate(&self, src: &SharedSource) -> Result<Validation> {
         let mut win = Window::new(&**src, 0, u64::MAX);
         let size = win.avail();
-        let Some(a) = analyse(&mut win) else {
+        let holes = known_holes(&**src, 0, size);
+        let Some(a) = analyse(&mut win, &holes) else {
             return Ok(Validation::invalid(
                 "not an MPEG transport stream (no run of 16 packets with a regular sync byte)",
             ));
         };
         let covered = a.run.packets * a.stride as u64;
         let mut problems = Vec::new();
+        if let Some(n) = a.run.holes_note() {
+            problems.push(n);
+        }
         if covered < size {
             if a.run.sync_miss {
                 problems.push(format!(
@@ -834,6 +953,160 @@ mod tests {
             std::sync::Arc::new(diskrescue_core::source::MemSource::new(vec![0x47; 20_000]));
         assert!(MpegTsFormat.measure(&src, 0, u64::MAX).unwrap().is_none());
         assert!(!MpegTsFormat.probe(&[0x47; 1200]));
+    }
+
+    /// Bytes with known-unreadable ranges that read as zeros, the way the
+    /// carver presents a rescued image (`ZeroFill` over a mapfile).
+    struct ZeroHoles {
+        data: Vec<u8>,
+        holes: RangeSet,
+    }
+
+    impl ZeroHoles {
+        fn source(mut data: Vec<u8>, holes: &[(u64, u64)]) -> SharedSource {
+            let mut set = RangeSet::new();
+            for &(at, n) in holes {
+                data[at as usize..(at + n) as usize].fill(0);
+                set.insert(Range::with_len(at, n));
+            }
+            std::sync::Arc::new(ZeroHoles { data, holes: set })
+        }
+    }
+
+    impl Source for ZeroHoles {
+        fn size(&self) -> u64 {
+            self.data.len() as u64
+        }
+        fn read_at(
+            &self,
+            offset: u64,
+            buf: &mut [u8],
+        ) -> std::result::Result<usize, diskrescue_core::ReadError> {
+            let src = self.data.get(offset as usize..).unwrap_or(&[]);
+            let n = src.len().min(buf.len());
+            buf[..n].copy_from_slice(&src[..n]);
+            Ok(n)
+        }
+        fn describe(&self) -> String {
+            "zero holes".into()
+        }
+        fn unreadable(&self) -> Option<RangeSet> {
+            Some(self.holes.clone())
+        }
+    }
+
+    /// The same, but reads of the holes fail (a `MemSource` with simulated
+    /// bad sectors).
+    fn failing_holes(data: Vec<u8>, holes: &[(u64, u64)]) -> SharedSource {
+        let mut set = RangeSet::new();
+        for &(at, n) in holes {
+            set.insert(Range::with_len(at, n));
+        }
+        std::sync::Arc::new(diskrescue_core::source::MemSource::new(data).with_unreadable(set))
+    }
+
+    fn with_junk(ts: &[u8]) -> Vec<u8> {
+        let mut d = ts.to_vec();
+        d.extend_from_slice(&[0x55; 3000]);
+        d
+    }
+
+    #[test]
+    fn a_known_hole_does_not_split_the_run() {
+        for stride in [188usize, 192] {
+            let ts = synthetic(600, stride);
+            let data = with_junk(&ts);
+            // A 4 KiB hole on a 4 KiB boundary in the middle, as left by
+            // ddrescue on a camera card.
+            let hole = (40_960u64, 4096u64);
+            for (kind, src) in [
+                ("zero-filled", ZeroHoles::source(data.clone(), &[hole])),
+                ("failing", failing_holes(data.clone(), &[hole])),
+            ] {
+                let m = MpegTsFormat.measure(&src, 0, u64::MAX).unwrap().unwrap();
+                assert_eq!(m.len, ts.len() as u64, "{kind} stride {stride}");
+                assert_eq!(m.status, ExtentStatus::UnknownLength, "{kind}");
+                assert_eq!(m.err_offset, None, "{kind}");
+                assert_eq!(m.confidence, Confidence::HIGH, "{kind}: {:?}", m.notes);
+                assert!(
+                    m.notes.iter().any(|n| n.contains(
+                        "packet sync resumed after 1 unreadable range(s) at file offsets 40960..45056"
+                    )),
+                    "{kind}: {:?}",
+                    m.notes
+                );
+                assert!(m.notes.iter().any(|n| n.contains("known-unreadable")));
+            }
+            // Without the mapfile the zeros are just a sync miss.
+            let mut zeroed = data.clone();
+            zeroed[40_960..45_056].fill(0);
+            let src: SharedSource =
+                std::sync::Arc::new(diskrescue_core::source::MemSource::new(zeroed));
+            let m = MpegTsFormat.measure(&src, 0, u64::MAX).unwrap().unwrap();
+            assert!(m.len < 45_056, "stride {stride}");
+        }
+    }
+
+    #[test]
+    fn several_holes_close_together_and_a_hole_measured_from_inside_the_stream() {
+        let ts = synthetic(1500, 188);
+        let data = with_junk(&ts);
+        // Two holes three packets apart, and one more later.
+        let holes = [(51_200u64, 512u64), (52_224, 512), (180_224, 8192)];
+        let src = ZeroHoles::source(data.clone(), &holes);
+        let m = MpegTsFormat.measure(&src, 0, u64::MAX).unwrap().unwrap();
+        assert_eq!(m.len, ts.len() as u64);
+        assert!(
+            m.notes
+                .iter()
+                .any(|n| n.contains("after 3 unreadable range(s)")),
+            "{:?}",
+            m.notes
+        );
+        // Measured from a later packet (a carver hit past the first holes).
+        let start = 188 * 400;
+        let m = MpegTsFormat
+            .measure(&src, start, u64::MAX)
+            .unwrap()
+            .unwrap();
+        assert_eq!(m.len, ts.len() as u64 - start);
+        assert!(m
+            .notes
+            .iter()
+            .any(|n| n.contains("after 1 unreadable range(s)")));
+    }
+
+    #[test]
+    fn a_hole_the_grid_does_not_survive_ends_the_run() {
+        let ts = synthetic(600, 188);
+        // The stream ends inside the hole: after it, other data.
+        let cut = 50_000usize;
+        let mut data = ts[..cut].to_vec();
+        data.extend_from_slice(&[0x47; 1]);
+        data.extend(std::iter::repeat_n(0x11u8, 20_000));
+        let hole = (49_152u64, 1024u64);
+        let src = ZeroHoles::source(data, &[hole]);
+        let m = MpegTsFormat.measure(&src, 0, u64::MAX).unwrap().unwrap();
+        // The packet the hole starts in still counts (its sync byte is read).
+        assert_eq!(m.len, (49_152 / 188 + 1) * 188);
+        assert_eq!(m.status, ExtentStatus::UnknownLength);
+        assert!(!m.notes.iter().any(|n| n.contains("packet sync resumed")));
+        // A sync miss next to, but not explained by, a hole also ends it.
+        let mut data = with_junk(&ts);
+        data[188 * 300] = 0x00;
+        let src = ZeroHoles::source(data, &[(188 * 300 + 100, 512)]);
+        let m = MpegTsFormat.measure(&src, 0, u64::MAX).unwrap().unwrap();
+        assert_eq!(m.len, 188 * 300);
+    }
+
+    #[test]
+    fn validate_reports_the_holes() {
+        let ts = synthetic(600, 192);
+        let src = ZeroHoles::source(ts.clone(), &[(40_960, 4096)]);
+        let v = MpegTsFormat.validate(&src).unwrap();
+        assert_eq!(v.status, ValidationStatus::Damaged);
+        assert!(v.problems.iter().any(|p| p.contains("unreadable range")));
+        assert!(!v.problems.iter().any(|p| p.contains("sync lost")));
     }
 
     #[test]
