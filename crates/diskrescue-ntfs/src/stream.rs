@@ -12,10 +12,23 @@
 //! Sizes come from the piece whose lowest VCN is 0. Bytes beyond the
 //! initialized size read as zeros (and are reported as holes); bytes beyond
 //! the mapped extents read as zeros and are reported as unreadable.
+//!
+//! Damaged headers are not trusted blindly:
+//!
+//! * a piece's run list must end at the piece's highest VCN + 1; runs that
+//!   reach past it come from a damaged run list and are dropped (their VCNs
+//!   become *missing*) instead of shadowing the next piece;
+//! * a data size larger than the allocated size is clamped to it;
+//! * an attribute that is neither sparse nor compressed cannot be larger
+//!   than the volume: such sizes are clamped to the mapped runs, so one
+//!   corrupt record cannot make a reader produce exabytes of zeros.
+//!
+//! Every clamp is reported in the stream's warnings and marks the stream
+//! as incomplete (`NonResStream::size_clamped`).
 
 use diskrescue_core::{Range, RangeSet};
 
-use crate::attr::{Attribute, AttributeBody, ATTR_COMPRESSION_MASK};
+use crate::attr::{Attribute, AttributeBody, ATTR_COMPRESSION_MASK, ATTR_SPARSE};
 use crate::io::Disk;
 use crate::Result;
 
@@ -56,6 +69,9 @@ pub(crate) struct NonResStream {
     pub complete: bool,
     /// The piece carrying the sizes (lowest VCN 0) was present.
     pub sizes_known: bool,
+    /// The header's sizes were impossible and were clamped (see the module
+    /// docs); the real size of the content is unknown.
+    pub size_clamped: bool,
 }
 
 impl NonResStream {
@@ -154,8 +170,14 @@ impl Stream {
 }
 
 /// Assemble the pieces of one attribute stream. `pieces` must all share
-/// type and name. Returns `None` for an empty slice.
-pub(crate) fn assemble(pieces: &[&Attribute], cluster: u64) -> Option<Stream> {
+/// type and name. `total_clusters` (the volume size, when known) bounds the
+/// size of attributes that are neither sparse nor compressed. Returns
+/// `None` for an empty slice.
+pub(crate) fn assemble(
+    pieces: &[&Attribute],
+    cluster: u64,
+    total_clusters: Option<u64>,
+) -> Option<Stream> {
     let first = pieces.first()?;
     let mut warnings = Vec::new();
     if let Some(res) = pieces.iter().find_map(|a| match &a.body {
@@ -211,8 +233,20 @@ pub(crate) fn assemble(pieces: &[&Attribute], cluster: u64) -> Option<Stream> {
             });
             cur = n.lowest_vcn;
         }
+        // The runs of a piece end at its highest VCN + 1. A highest VCN of
+        // 0 is treated as "not set" (ntfs-3g and Linux accept any run
+        // length then); u64::MAX marks an empty attribute.
+        let piece_end = match n.highest_vcn {
+            0 | u64::MAX => None,
+            h => Some(h + 1),
+        };
+        let mut overrun = false;
         for r in &n.runs {
             if r.vcn != cur {
+                break;
+            }
+            if piece_end.is_some_and(|pe| r.end_vcn() > pe) {
+                overrun = true;
                 break;
             }
             extents.push(Extent {
@@ -225,24 +259,32 @@ pub(crate) fn assemble(pieces: &[&Attribute], cluster: u64) -> Option<Stream> {
             });
             cur = r.end_vcn();
         }
+        if overrun {
+            complete = false;
+            warnings.push(format!(
+                "data runs of attribute \"{}\" in record {} reach past the piece's last VCN {}; the excess runs are ignored",
+                a.name, a.record, n.highest_vcn
+            ));
+        }
         if let Some(e) = &n.runs_error {
             warnings.push(format!(
                 "data runs of attribute \"{}\" in record {}: {e}",
                 a.name, a.record
             ));
         }
-        let piece_end = n.highest_vcn.wrapping_add(1);
-        if n.highest_vcn != u64::MAX && piece_end > cur {
-            complete = false;
-            extents.push(Extent {
-                vcn: cur,
-                len: piece_end - cur,
-                kind: ExtentKind::Missing,
-            });
-            cur = piece_end;
+        if let Some(pe) = piece_end {
+            if pe > cur {
+                complete = false;
+                extents.push(Extent {
+                    vcn: cur,
+                    len: pe - cur,
+                    kind: ExtentKind::Missing,
+                });
+                cur = pe;
+            }
         }
     }
-    let (data_size, mut initialized_size, allocated_size, compression_unit, sizes_known) =
+    let (mut data_size, mut initialized_size, mut allocated_size, compression_unit, sizes_known) =
         match head {
             Some(h) => (
                 h.data_size,
@@ -262,6 +304,41 @@ pub(crate) fn assemble(pieces: &[&Attribute], cluster: u64) -> Option<Stream> {
                 (bytes, bytes, bytes, cu, false)
             }
         };
+    let mut size_clamped = false;
+    if data_size > allocated_size {
+        warnings.push(format!(
+            "attribute \"{}\": data size {data_size} exceeds the allocated size {allocated_size}; clamped",
+            first.name
+        ));
+        data_size = allocated_size;
+        size_clamped = true;
+    }
+    // Without the sparse or compressed flag every VCN needs a cluster of
+    // its own, so the attribute cannot be larger than the volume.
+    let plain = flags & (ATTR_COMPRESSION_MASK | ATTR_SPARSE) == 0;
+    if let (true, Some(total)) = (plain, total_clusters) {
+        let volume = total.saturating_mul(cluster);
+        if data_size > volume || allocated_size > volume {
+            let mapped = extents
+                .iter()
+                .rev()
+                .find(|e| e.kind != ExtentKind::Missing)
+                .map(|e| e.end())
+                .unwrap_or(0)
+                .saturating_mul(cluster)
+                .min(volume);
+            warnings.push(format!(
+                "attribute \"{}\": size {data_size} (allocated {allocated_size}) is larger than the volume ({volume} bytes); clamped to the {mapped} mapped bytes",
+                first.name
+            ));
+            data_size = data_size.min(mapped);
+            allocated_size = allocated_size.min(volume).max(data_size);
+            size_clamped = true;
+        }
+    }
+    if size_clamped {
+        complete = false;
+    }
     // A tail of the allocation not described by any piece.
     let alloc_vcns = allocated_size.div_ceil(cluster.max(1));
     let needed_vcns = data_size.div_ceil(cluster.max(1));
@@ -288,6 +365,7 @@ pub(crate) fn assemble(pieces: &[&Attribute], cluster: u64) -> Option<Stream> {
             compression_unit,
             complete,
             sizes_known,
+            size_clamped,
         }),
         warnings,
     })
@@ -474,7 +552,7 @@ mod tests {
             (0, 0, 0),
             71,
         );
-        let s = assemble(&[&p2, &p0], 512).unwrap();
+        let s = assemble(&[&p2, &p0], 512, None).unwrap();
         let n = s.non_resident().unwrap();
         assert!(!n.complete);
         assert_eq!(n.extents.len(), 3);
@@ -518,7 +596,7 @@ mod tests {
             (6 * 512, 6 * 512, 5 * 512 + 10),
             1,
         );
-        let s = assemble(&[&p0], 512).unwrap();
+        let s = assemble(&[&p0], 512, None).unwrap();
         let n = s.non_resident().unwrap();
         let mut buf = vec![0xAAu8; 6 * 512];
         let mut ann = Annotations::default();

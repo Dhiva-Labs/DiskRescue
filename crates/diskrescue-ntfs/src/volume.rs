@@ -99,6 +99,8 @@ pub(crate) struct Folded {
     /// Some attributes came from extension records found by scanning the
     /// MFT rather than from the attribute list (a guess).
     pub guessed: bool,
+    /// An extension record that supplied attributes had a torn write.
+    pub torn: bool,
 }
 
 /// Everything the walker and reader need about one base record.
@@ -107,6 +109,9 @@ pub(crate) struct FileInfo {
     pub attrs: Vec<Attribute>,
     /// Attribute pieces were recovered without the attribute list.
     pub guessed: bool,
+    /// The base record or an extension record it uses had a torn write:
+    /// some of its bytes may be stale.
+    pub torn: bool,
     pub warnings: Vec<String>,
     pub si: Option<StandardInformation>,
     pub names: Vec<FileName>,
@@ -120,7 +125,32 @@ impl NtfsFs {
     pub(crate) fn open_impl(src: SharedSource, opts: &NtfsOptions) -> Result<NtfsFs> {
         let disk = Disk::new(src.clone());
         let mut warnings = Vec::new();
-        let boot = select_boot(&disk, opts, &mut warnings)?;
+        let (boot, mft) = select_boot_and_mft(&disk, opts, &mut warnings)?;
+        Self::finish_open(src, disk, boot, mft, opts, warnings)
+    }
+
+    /// Open with a boot sector supplied by the caller (for example one
+    /// reconstructed by [`crate::discover`] when both on-disk copies are
+    /// destroyed). The sectors of the source are not consulted for it.
+    pub(crate) fn open_with_boot_impl(
+        src: SharedSource,
+        boot: BootSector,
+        opts: &NtfsOptions,
+    ) -> Result<NtfsFs> {
+        let disk = Disk::new(src.clone());
+        let mut warnings = Vec::new();
+        let mft = bootstrap_mft(&disk, &boot, opts, &mut warnings, true)?;
+        Self::finish_open(src, disk, boot, mft, opts, warnings)
+    }
+
+    fn finish_open(
+        src: SharedSource,
+        disk: Disk,
+        boot: BootSector,
+        mft: NonResStream,
+        opts: &NtfsOptions,
+        mut warnings: Vec<String>,
+    ) -> Result<NtfsFs> {
         for w in &boot.warnings {
             warnings.push(format!("boot sector: {w}"));
         }
@@ -135,7 +165,6 @@ impl NtfsFs {
                 vol_size
             ));
         }
-        let mft = bootstrap_mft(&disk, &boot, opts, &mut warnings)?;
         let mut record_count = mft.data_size / rsize;
         // Records past the last real cluster of the MFT cannot be read; a
         // forged size must not make the walk iterate over them.
@@ -397,11 +426,18 @@ impl NtfsFs {
                 continue;
             }
             let (attrs, _) = ext.own_attributes(Some(self.total_clusters));
+            if !acts_as_extension(&ext, &attrs) {
+                continue;
+            }
+            let before = added;
             for a in attrs {
                 if f.taken.insert((a.record, a.offset)) {
                     f.attrs.push(a);
                     added += 1;
                 }
+            }
+            if added > before && ext.is_torn() {
+                f.torn = true;
             }
         }
         if added > 0 {
@@ -451,8 +487,7 @@ impl NtfsFs {
             }
             n += k;
         }
-        let _ = self.ext_map.set(map);
-        Ok(self.ext_map.get().expect("extension map was just set"))
+        Ok(self.ext_map.get_or_init(|| map))
     }
 
     /// Load a base record with everything the walker needs. `Ok(None)` when
@@ -470,7 +505,10 @@ impl NtfsFs {
             }
         };
         if rec.is_extension() {
-            return Ok(None);
+            let (own, _) = rec.own_attributes(Some(self.total_clusters));
+            if acts_as_extension(&rec, &own) {
+                return Ok(None);
+            }
         }
         Ok(Some(self.build_info(rec)))
     }
@@ -480,8 +518,10 @@ impl NtfsFs {
             attrs,
             mut warnings,
             guessed,
+            torn: ext_torn,
             ..
         } = self.fold(&rec, true);
+        let torn = ext_torn || rec.is_torn();
         warnings.extend(rec.warnings.iter().cloned());
         let mut si = None;
         let mut names = Vec::new();
@@ -523,7 +563,7 @@ impl NtfsFs {
         let mut data = None;
         let mut ads = Vec::new();
         for (name, pieces) in data_groups {
-            if let Some(mut s) = assemble(&pieces, self.cluster) {
+            if let Some(mut s) = assemble(&pieces, self.cluster, Some(self.total_clusters)) {
                 warnings.append(&mut s.warnings);
                 if name.is_empty() {
                     data = Some(s);
@@ -536,6 +576,7 @@ impl NtfsFs {
             record: rec,
             attrs,
             guessed,
+            torn,
             warnings,
             si,
             names,
@@ -568,8 +609,20 @@ impl NtfsFs {
             .iter()
             .filter(|a| a.type_code == t && a.name == name)
             .collect();
-        assemble(&pieces, self.cluster)
+        assemble(&pieces, self.cluster, Some(self.total_clusters))
     }
+}
+
+/// True when `rec` is to be treated as an extension record. Extension
+/// records never hold `$STANDARD_INFORMATION` (it always stays in the base
+/// record), so a record that names a base record but carries one is a base
+/// record whose base reference is damaged: it is treated as a file of its
+/// own instead of vanishing from the listing.
+pub(crate) fn acts_as_extension(rec: &MftRecord, attrs: &[Attribute]) -> bool {
+    rec.is_extension()
+        && !attrs
+            .iter()
+            .any(|a| a.type_code == types::STANDARD_INFORMATION)
 }
 
 /// True for errors that must abort the whole operation (device gone).
@@ -612,6 +665,7 @@ pub(crate) fn fold_with(
         list_damaged: false,
         visited: HashSet::new(),
         guessed: false,
+        torn: false,
     };
     let Some(list_attr) = f
         .attrs
@@ -622,7 +676,7 @@ pub(crate) fn fold_with(
         return f;
     };
     f.has_list = true;
-    let Some(list_stream) = assemble(&[&list_attr], cluster) else {
+    let Some(list_stream) = assemble(&[&list_attr], cluster, Some(total_clusters)) else {
         f.list_damaged = true;
         return f;
     };
@@ -653,6 +707,7 @@ pub(crate) fn fold_with(
     let mut loaded: HashMap<u64, Option<Vec<Attribute>>> = HashMap::new();
     let (attrs, warnings, taken) = (&mut f.attrs, &mut f.warnings, &mut f.taken);
     let mut damaged = false;
+    let mut ext_torn = false;
     for e in entries {
         let r = mref(e.reference);
         if r == rec.number {
@@ -674,10 +729,17 @@ pub(crate) fn fold_with(
                             rec.in_use(),
                             ext.base_sequence(),
                         );
-                    if base_ok {
-                        let (a, w) = ext.own_attributes(Some(total_clusters));
+                    let (a, w) = ext.own_attributes(Some(total_clusters));
+                    if base_ok && !acts_as_extension(&ext, &a) {
+                        warnings.push(format!(
+                            "record {}: record {r} holds $STANDARD_INFORMATION, so it is not an extension record; skipped",
+                            rec.number
+                        ));
+                        None
+                    } else if base_ok {
                         warnings.extend(w);
                         if ext.is_torn() {
+                            ext_torn = true;
                             warnings.push(format!(
                                 "extension record {r} of record {}: torn write",
                                 rec.number
@@ -736,11 +798,108 @@ pub(crate) fn fold_with(
         }
     }
     f.list_damaged |= damaged;
+    f.torn |= ext_torn;
     f.visited = loaded.into_keys().collect();
     f
 }
 
-fn select_boot(disk: &Disk, opts: &NtfsOptions, warnings: &mut Vec<String>) -> Result<BootSector> {
+/// Choose a boot sector and locate the MFT with it. Both copies of the
+/// boot sector are candidates (the backup first when asked for). A copy
+/// that validates can still carry a damaged MFT location, so the MFT is
+/// bootstrapped with each candidate in turn: first strictly (record 0 or
+/// its mirror copy must be found), and only when no candidate works that
+/// way with the contiguous-MFT probe as a last resort.
+fn select_boot_and_mft(
+    disk: &Disk,
+    opts: &NtfsOptions,
+    warnings: &mut Vec<String>,
+) -> Result<(BootSector, NonResStream)> {
+    let mut notes = Vec::new();
+    let order = if opts.use_backup_boot_sector {
+        [true, false]
+    } else {
+        [false, true]
+    };
+    let mut candidates: Vec<BootSector> = Vec::new();
+    for backup in order {
+        if let Some(bs) = read_boot_copy(disk, backup, &mut notes)? {
+            if let Some(other) = candidates.iter().find(|c| !same_geometry(c, &bs)) {
+                warnings.push(format!(
+                    "the primary and backup boot sectors disagree (MFT at cluster {} vs {})",
+                    other.mft_lcn, bs.mft_lcn
+                ));
+            }
+            if !candidates.iter().any(|c| same_geometry(c, &bs)) {
+                candidates.push(bs);
+            }
+        }
+    }
+    if candidates.is_empty() {
+        return Err(Error::corrupt(
+            "NTFS boot sector",
+            format!(
+                "no valid primary or backup boot sector ({})",
+                notes.join("; ")
+            ),
+        ));
+    }
+    let mut failures: Vec<String> = Vec::new();
+    for allow_probe in [false, true] {
+        for (i, boot) in candidates.iter().enumerate() {
+            let mut w = Vec::new();
+            match bootstrap_mft(disk, boot, opts, &mut w, allow_probe) {
+                Ok(mft) => {
+                    let which = if boot.is_backup { "backup" } else { "primary" };
+                    if boot.is_backup || i > 0 || !failures.is_empty() {
+                        warnings.append(&mut notes);
+                        warnings.append(&mut failures);
+                    }
+                    if boot.is_backup {
+                        warnings.push(format!(
+                            "using the backup boot sector at byte {} (sector 0 damaged or backup requested)",
+                            boot.offset
+                        ));
+                    } else if i > 0 {
+                        warnings.push(format!("using the {which} boot sector"));
+                    }
+                    warnings.append(&mut w);
+                    return Ok((boot.clone(), mft));
+                }
+                Err(e) if is_fatal(&e) => return Err(e),
+                Err(e) => {
+                    let which = if boot.is_backup { "backup" } else { "primary" };
+                    if allow_probe || candidates.len() > 1 {
+                        failures.extend(w);
+                        failures.push(format!("{which} boot sector: {e}"));
+                    }
+                    if allow_probe && i + 1 == candidates.len() {
+                        return Err(e);
+                    }
+                }
+            }
+        }
+    }
+    Err(Error::corrupt("$MFT", failures.join("; ")))
+}
+
+/// True when two boot sector copies describe the same geometry.
+fn same_geometry(a: &BootSector, b: &BootSector) -> bool {
+    a.bytes_per_sector == b.bytes_per_sector
+        && a.cluster_size == b.cluster_size
+        && a.total_sectors == b.total_sectors
+        && a.mft_lcn == b.mft_lcn
+        && a.mftmirr_lcn == b.mftmirr_lcn
+        && a.mft_record_size == b.mft_record_size
+        && a.index_record_size == b.index_record_size
+}
+
+/// Read and validate the primary (sector 0) or backup (last sector) boot
+/// sector. Problems become `notes`.
+fn read_boot_copy(
+    disk: &Disk,
+    backup: bool,
+    notes: &mut Vec<String>,
+) -> Result<Option<BootSector>> {
     let size = disk.size();
     let read_at = |off: u64| -> Result<Option<Vec<u8>>> {
         let mut b = vec![0u8; 512];
@@ -762,7 +921,7 @@ fn select_boot(disk: &Disk, opts: &NtfsOptions, warnings: &mut Vec<String>) -> R
             },
         }
     };
-    let backup = |w: &mut Vec<String>| -> Result<Option<BootSector>> {
+    let backup_copy = |w: &mut Vec<String>| -> Result<Option<BootSector>> {
         let mut tried = Vec::new();
         for ss in [512u64, 1024, 2048, 4096] {
             if size < ss * 2 {
@@ -784,36 +943,10 @@ fn select_boot(disk: &Disk, opts: &NtfsOptions, warnings: &mut Vec<String>) -> R
         w.push("no valid backup boot sector at the end of the volume".into());
         Ok(None)
     };
-    let mut notes = Vec::new();
-    let chosen = if opts.use_backup_boot_sector {
-        match backup(&mut notes)? {
-            Some(b) => Some(b),
-            None => primary(&mut notes)?,
-        }
+    if backup {
+        backup_copy(notes)
     } else {
-        match primary(&mut notes)? {
-            Some(b) => Some(b),
-            None => backup(&mut notes)?,
-        }
-    };
-    match chosen {
-        Some(b) => {
-            if b.is_backup {
-                warnings.extend(notes);
-                warnings.push(format!(
-                    "using the backup boot sector at byte {} (sector 0 damaged or backup requested)",
-                    b.offset
-                ));
-            }
-            Ok(b)
-        }
-        None => Err(Error::corrupt(
-            "NTFS boot sector",
-            format!(
-                "no valid primary or backup boot sector ({})",
-                notes.join("; ")
-            ),
-        )),
+        primary(notes)
     }
 }
 
@@ -822,6 +955,7 @@ fn bootstrap_mft(
     boot: &BootSector,
     opts: &NtfsOptions,
     warnings: &mut Vec<String>,
+    allow_probe: bool,
 ) -> Result<NonResStream> {
     let cluster = boot.cluster_size as u64;
     let rsize = boot.mft_record_size as u64;
@@ -837,6 +971,9 @@ fn bootstrap_mft(
             Err(e) => return Ok(Err(e.to_string())),
         };
         let (attrs, _) = rec.own_attributes(Some(total));
+        if !is_mft_record_zero(&rec, &attrs) {
+            return Ok(Err("the record there is not $MFT (record 0)".into()));
+        }
         let has_data = attrs.iter().any(|a| {
             a.type_code == types::DATA
                 && a.name.is_empty()
@@ -869,6 +1006,12 @@ fn bootstrap_mft(
         }
     };
     let Some(rec0) = rec0 else {
+        if !allow_probe {
+            return Err(Error::corrupt(
+                "$MFT",
+                "record 0 and its $MFTMirr copy are unusable",
+            ));
+        }
         return probe_contiguous_mft(disk, boot, opts, warnings);
     };
     if rec0.is_torn() {
@@ -882,7 +1025,7 @@ fn bootstrap_mft(
     let Some(Stream {
         data: StreamData::NonResident(mut mft),
         ..
-    }) = assemble(&pieces, cluster)
+    }) = assemble(&pieces, cluster, Some(total))
     else {
         return Err(Error::corrupt("$MFT", "record 0 has no non-resident $DATA"));
     };
@@ -915,7 +1058,7 @@ fn bootstrap_mft(
         if let Some(Stream {
             data: StreamData::NonResident(full),
             ..
-        }) = assemble(&pieces, cluster)
+        }) = assemble(&pieces, cluster, Some(total))
         {
             mft = full;
         }
@@ -942,6 +1085,27 @@ fn bootstrap_mft(
         ));
     }
     Ok(mft)
+}
+
+/// True when `rec` is a copy of MFT record 0: its self number (NTFS 3.1+)
+/// is 0 and its name, when one is readable, is `$MFT` in the root. Any
+/// other FILE record found where record 0 should be (a damaged MFT
+/// location) would map the MFT onto some file's data.
+pub(crate) fn is_mft_record_zero(rec: &MftRecord, attrs: &[Attribute]) -> bool {
+    if rec.self_number.is_some_and(|n| n != 0) || rec.is_extension() {
+        return false;
+    }
+    let names: Vec<FileName> = attrs
+        .iter()
+        .filter(|a| a.type_code == types::FILE_NAME)
+        .filter_map(|a| a.value().and_then(FileName::parse))
+        .collect();
+    if names.is_empty() {
+        return rec.self_number == Some(0);
+    }
+    names
+        .iter()
+        .any(|n| n.name == "$MFT" && n.parent_record() == crate::walk::ROOT)
 }
 
 /// Last resort when record 0 and its mirror are both lost: assume the MFT
@@ -1008,5 +1172,6 @@ fn probe_contiguous_mft(
         compression_unit: 0,
         complete: false,
         sizes_known: false,
+        size_clamped: false,
     })
 }

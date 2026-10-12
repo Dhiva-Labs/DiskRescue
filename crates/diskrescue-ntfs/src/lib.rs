@@ -10,8 +10,11 @@
 //! # How it reads a volume
 //!
 //! * **Boot sector** ([`boot`]): sector 0, or the backup in the volume's
-//!   last sector when sector 0 is damaged. Negative-encoded sectors per
-//!   cluster (clusters up to 2 MiB) and record sizes are decoded.
+//!   last sector when sector 0 is damaged or points at a damaged MFT.
+//!   Negative-encoded sectors per cluster (clusters up to 2 MiB) and
+//!   record sizes are decoded. When both copies are destroyed,
+//!   [`discover::find_volumes`] rebuilds the geometry from MFT record 0
+//!   and [`open_found`] / [`open_with_boot`] open the volume with it.
 //! * **MFT** ([`volume`]): record 0 (or its `$MFTMirr` copy) maps the MFT,
 //!   which is read through its run list because it is usually fragmented.
 //!   Every record has its update sequence array applied ([`fixup`]) before
@@ -65,6 +68,7 @@
 pub mod attr;
 pub mod bitmap;
 pub mod boot;
+pub mod discover;
 pub mod fixup;
 pub mod index;
 mod io;
@@ -76,6 +80,8 @@ mod stream;
 pub mod volume;
 pub mod walk;
 
+#[cfg(test)]
+mod review_tests;
 #[cfg(test)]
 mod synth_tests;
 
@@ -92,6 +98,7 @@ pub use attr::{
 };
 pub use bitmap::ClusterState;
 pub use boot::BootSector;
+pub use discover::{find_volumes, FoundVolume};
 pub use record::MftRecord;
 pub use runs::Run;
 pub use volume::NtfsFs;
@@ -140,6 +147,22 @@ pub fn probe(head: &[u8]) -> bool {
 /// Open the NTFS volume spanning `src`.
 pub fn open(src: SharedSource, opts: &NtfsOptions) -> Result<NtfsFs> {
     NtfsFs::open_impl(src, opts)
+}
+
+/// Open the NTFS volume spanning `src` with a boot sector supplied by the
+/// caller instead of the one on disk, typically [`FoundVolume::boot`] when
+/// both boot sector copies are destroyed. Everything else (MFT, mirror
+/// fallback, bitmap) works as in [`open`].
+pub fn open_with_boot(src: SharedSource, boot: BootSector, opts: &NtfsOptions) -> Result<NtfsFs> {
+    NtfsFs::open_with_boot_impl(src, boot, opts)
+}
+
+/// Open a volume found by [`find_volumes`] in `disk` (the source that was
+/// scanned): a window of `disk` starting at [`FoundVolume::start`] is
+/// opened with the reconstructed boot sector.
+pub fn open_found(disk: SharedSource, found: &FoundVolume, opts: &NtfsOptions) -> Result<NtfsFs> {
+    let window = diskrescue_core::source::SubSource::new(disk, found.start, found.size);
+    open_with_boot(std::sync::Arc::new(window), found.boot.clone(), opts)
 }
 
 impl FileSystem for NtfsFs {
