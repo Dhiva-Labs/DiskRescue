@@ -15,6 +15,7 @@ path = "src/main.rs"
 [dependencies]
 diskrescue-core.workspace = true
 diskrescue-app.workspace = true
+diskrescue-tui = { path = "../diskrescue-tui" }
 thiserror.workspace = true
 log.workspace = true
 serde.workspace = true

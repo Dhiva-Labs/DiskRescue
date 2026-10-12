@@ -200,37 +200,6 @@ pub fn truncate_middle(s: &str, max: usize) -> String {
     format!("{h}...{t}")
 }
 
-/// Break `text` into lines of at most `width` characters at spaces (words
-/// longer than a line are cut).
-pub fn wrap_words(text: &str, width: usize) -> Vec<String> {
-    let width = width.max(1);
-    let mut lines: Vec<String> = Vec::new();
-    let mut cur = String::new();
-    for word in text.split_whitespace() {
-        let mut word = word.to_string();
-        while word.chars().count() > width {
-            if !cur.is_empty() {
-                lines.push(std::mem::take(&mut cur));
-            }
-            let head: String = word.chars().take(width).collect();
-            word = word.chars().skip(width).collect();
-            lines.push(head);
-        }
-        let need = if cur.is_empty() { 0 } else { 1 } + word.chars().count();
-        if cur.chars().count() + need > width && !cur.is_empty() {
-            lines.push(std::mem::take(&mut cur));
-        }
-        if !cur.is_empty() {
-            cur.push(' ');
-        }
-        cur.push_str(&word);
-    }
-    if !cur.is_empty() || lines.is_empty() {
-        lines.push(cur);
-    }
-    lines
-}
-
 /// Column alignment.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Align {
@@ -384,21 +353,6 @@ mod tests {
             12
         );
         assert!(truncate_middle("abcdefghijklmnopqrstuvwxyz", 12).contains("..."));
-    }
-
-    #[test]
-    fn wrapping() {
-        assert_eq!(wrap_words("hello world", 20), vec!["hello world"]);
-        assert_eq!(wrap_words("hello world", 8), vec!["hello", "world"]);
-        assert_eq!(wrap_words("a b c d e", 3), vec!["a b", "c d", "e"]);
-        assert_eq!(wrap_words("abcdefghij", 4), vec!["abcd", "efgh", "ij"]);
-        assert_eq!(wrap_words("", 5), vec![""]);
-        for l in wrap_words(
-            "The device stopped responding at 4.00 KiB. Waiting for it to come back.",
-            20,
-        ) {
-            assert!(l.chars().count() <= 20, "{l}");
-        }
     }
 
     #[test]
