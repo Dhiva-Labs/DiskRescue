@@ -70,18 +70,82 @@ impl Signature {
     }
 }
 
-/// How confident a measurement is that the bytes form one real file.
+/// How confident a measurement is that the bytes form one real file, on a
+/// 0..=100 scale (see `docs/specs/carving-engine.md`, section 3.8).
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
 )]
-#[serde(rename_all = "snake_case")]
-pub enum Confidence {
+pub struct Confidence(pub u8);
+
+impl Confidence {
     /// Signature only; no structural check passed.
-    Low,
+    pub const LOW: Confidence = Confidence(25);
     /// Structure parsed; end found by walking the format.
-    Medium,
+    pub const MEDIUM: Confidence = Confidence(60);
     /// Structure parsed and the content validated (checksums, decode).
-    High,
+    pub const HIGH: Confidence = Confidence(90);
+    /// Fully decoded / verified.
+    pub const VERIFIED: Confidence = Confidence(100);
+
+    /// Clamp a raw score into range.
+    pub fn new(v: u8) -> Self {
+        Confidence(v.min(100))
+    }
+
+    /// Raw score.
+    pub fn value(self) -> u8 {
+        self.0
+    }
+
+    /// Lower the score by `by` points (saturating).
+    pub fn lowered(self, by: u8) -> Self {
+        Confidence(self.0.saturating_sub(by))
+    }
+}
+
+/// How a measurement ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExtentStatus {
+    /// The format's own end marker or size field was found and is consistent.
+    Complete,
+    /// The parser stopped early: damage, source end, bad sectors or another
+    /// header before the end marker. `err_offset` says where.
+    Truncated,
+    /// Measurement stopped at the size cap / read limit.
+    Capped,
+    /// The format has no end marker; `len` is a heuristic run length
+    /// (MPEG-TS packet run, raw streams).
+    UnknownLength,
+}
+
+/// Role of an embedded object inside a measured file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NestedRole {
+    /// EXIF/IFD1/MPF thumbnail.
+    Thumbnail,
+    /// Larger preview image (RAW previews, CR3 PRVW, HEIC thumbnails).
+    Preview,
+    /// Album art or cover image inside an audio/video container.
+    CoverArt,
+    /// A frame of a motion-JPEG style container.
+    Frame,
+    /// Data appended after the main object (motion-photo video trailer).
+    Trailer,
+    /// A nested container of a different format (TIFF inside CR2).
+    Container,
+}
+
+/// An embedded object the carver must not claim as a separate file.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Nested {
+    /// Range relative to the start of the enclosing file.
+    pub range: crate::ranges::Range,
+    /// Format id of the embedded object, when known (`jpeg`).
+    pub format: Option<String>,
+    /// What it is.
+    pub role: NestedRole,
 }
 
 /// The extent of a candidate file found at a signature hit.
@@ -89,17 +153,19 @@ pub enum Confidence {
 pub struct Measured {
     /// Length in bytes from the signature start.
     pub len: u64,
-    /// True when the format's own end marker/size was found; false when the
-    /// parser stopped at damage, at the source end, or at a size cap.
-    pub complete: bool,
+    /// How the measurement ended.
+    pub status: ExtentStatus,
     /// Confidence in this being a real, single file.
     pub confidence: Confidence,
+    /// File-relative offset of the first byte the parser could not accept,
+    /// when `status` is `Truncated`.
+    pub err_offset: Option<u64>,
     /// Metadata gathered on the way.
     pub meta: MediaMeta,
-    /// Byte ranges (relative to the file start) that another format should
-    /// not claim as separate files: embedded thumbnails, previews, nested
-    /// containers. The carver suppresses signature hits inside them.
-    pub nested: Vec<crate::ranges::Range>,
+    /// Embedded objects (thumbnails, previews, trailers). The carver
+    /// suppresses signature hits inside them and may promote them to
+    /// separate files when the parent is damaged.
+    pub nested: Vec<Nested>,
     /// Problems or observations ("no EOI marker, truncated at source end").
     pub notes: Vec<String>,
 }
@@ -109,24 +175,68 @@ impl Measured {
     pub fn complete(len: u64, confidence: Confidence) -> Self {
         Measured {
             len,
-            complete: true,
+            status: ExtentStatus::Complete,
             confidence,
+            err_offset: None,
             meta: MediaMeta::default(),
             nested: Vec::new(),
             notes: Vec::new(),
         }
     }
 
-    /// A file whose end could not be established.
-    pub fn truncated(len: u64, confidence: Confidence, note: impl Into<String>) -> Self {
+    /// A file whose end could not be established; `err_offset` is where the
+    /// parser gave up (file-relative).
+    pub fn truncated(
+        len: u64,
+        confidence: Confidence,
+        err_offset: u64,
+        note: impl Into<String>,
+    ) -> Self {
         Measured {
             len,
-            complete: false,
+            status: ExtentStatus::Truncated,
             confidence,
+            err_offset: Some(err_offset),
             meta: MediaMeta::default(),
             nested: Vec::new(),
             notes: vec![note.into()],
         }
+    }
+
+    /// A measurement that hit the size cap.
+    pub fn capped(len: u64, confidence: Confidence) -> Self {
+        Measured {
+            len,
+            status: ExtentStatus::Capped,
+            confidence,
+            err_offset: None,
+            meta: MediaMeta::default(),
+            nested: Vec::new(),
+            notes: vec!["stopped at size cap".into()],
+        }
+    }
+
+    /// True when the format's own end was found.
+    pub fn is_complete(&self) -> bool {
+        self.status == ExtentStatus::Complete
+    }
+
+    /// Builder: attach metadata.
+    pub fn with_meta(mut self, meta: MediaMeta) -> Self {
+        self.meta = meta;
+        self
+    }
+
+    /// Builder: add a nested object.
+    pub fn with_nested(mut self, n: Nested) -> Self {
+        self.nested.push(n);
+        self
+    }
+
+    /// Builder: add a note.
+    pub fn with_note(mut self, note: impl Into<String>) -> Self {
+        self.notes.push(note.into());
+        self
     }
 }
 
@@ -251,6 +361,21 @@ pub trait FileFormat: Send + Sync {
     /// wins (a container beats a format embedded in it).
     fn priority(&self) -> u8 {
         50
+    }
+
+    /// Cheap check on the first bytes of a candidate (the carver passes up
+    /// to 64 KiB, possibly less near the end of the source) to reject false
+    /// positives before any further I/O. Default: any signature matches.
+    fn probe(&self, head: &[u8]) -> bool {
+        self.signatures().iter().any(|s| s.matches(head))
+    }
+
+    /// Whether a file of this format may legitimately contain a file of
+    /// format `inner` (JPEG contains JPEG thumbnails, CR2 contains JPEG,
+    /// MP4 contains cover art). Drives the carver's nesting resolver.
+    fn may_contain(&self, inner: &str) -> bool {
+        let _ = inner;
+        false
     }
 
     /// Given a source positioned so that the file starts at `start`, walk the

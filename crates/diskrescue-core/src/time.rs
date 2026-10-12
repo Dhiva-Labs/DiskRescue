@@ -56,7 +56,12 @@ impl Timestamp {
         let sec2 = (time & 0x1F) as i64;
         let min = ((time >> 5) & 0x3F) as i64;
         let hour = ((time >> 11) & 0x1F) as i64;
-        if !(1..=12).contains(&month) || !(1..=31).contains(&day) || hour > 23 || min > 59 || sec2 > 29 {
+        if !(1..=12).contains(&month)
+            || !(1..=31).contains(&day)
+            || hour > 23
+            || min > 59
+            || sec2 > 29
+        {
             return None;
         }
         let days = days_from_civil(year, month as u32, day as u32);
