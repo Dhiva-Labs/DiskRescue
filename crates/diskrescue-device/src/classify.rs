@@ -734,4 +734,46 @@ mod tests {
         assert!(looks_like_hdd_model(Some("Expansion HDD")));
         assert!(!looks_like_hdd_model(None));
     }
+
+    #[test]
+    fn usb_media_that_lie_about_themselves() {
+        // Modern sticks often clear the removable bit; the name decides.
+        let mut i = usb("Ultra Fit", false, Some(true), 128 * GIB);
+        i.vendor = Some("SanDisk");
+        assert_eq!(classify(&i).kind, DeviceKind::UsbFlash);
+        // A Realtek NVMe enclosure (Realtek also makes card readers):
+        // non-removable and B1 says non-rotating -> USB SSD, no reader.
+        let mut i = usb("RTL9210B-CG", false, Some(false), 1000 * GIB);
+        i.usb_vendor_id = Some("0bda");
+        let c = classify(&i);
+        assert_eq!(c.kind, DeviceKind::UsbSsd);
+        assert!(!c.card_reader);
+        // The same enclosure behind a bridge that hides everything.
+        i.rotational = Some(true);
+        let c = classify(&i);
+        assert_eq!(
+            (c.kind, c.confidence),
+            (DeviceKind::UsbHdd, Confidence::Low)
+        );
+        // An old small disk in an enclosure that sets the removable bit is
+        // taken for flash (documented limit; the class can be overridden).
+        let i = usb("ST9320325AS", true, Some(true), 298 * GIB);
+        assert_eq!(classify(&i).kind, DeviceKind::UsbFlash);
+        // A large removable device is flash with low confidence.
+        let i = usb("Thing", true, Some(true), 2000 * GIB);
+        assert_eq!(classify(&i).confidence, Confidence::Low);
+        // VPD B1 says 7200 rpm even though the device claims removable.
+        let mut i = usb("Thing", true, Some(true), 2000 * GIB);
+        i.vpd_b1 = Some(VpdB1 {
+            rotation: Some(Rotation::Rpm(7200)),
+            product_type: 0,
+            form_factor: 2,
+            zoned: 0,
+        });
+        assert_eq!(classify(&i).kind, DeviceKind::UsbHdd);
+        // SMART rotation rate 0 on a non-removable bridge -> SSD.
+        let mut i = usb("Thing", false, Some(true), 500 * GIB);
+        i.smart_rotation_rate = Some(0);
+        assert_eq!(classify(&i).kind, DeviceKind::UsbSsd);
+    }
 }

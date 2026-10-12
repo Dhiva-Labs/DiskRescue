@@ -301,6 +301,64 @@ fn loop_mounted_image_is_refused_unless_allowed() {
 }
 
 #[test]
+fn random_reads_match_the_file_in_both_modes() {
+    // Offsets and lengths at every awkward place: 0, the last byte, past
+    // the end, u64::MAX, odd sizes (buffered) and 4 KiB multiples (direct,
+    // valid for 512 and 4096 alignment), against a size that is not a
+    // multiple of the sector size.
+    let dir = tempfile::tempdir().unwrap();
+    let size = 3 * 65_536 + 4_096 + 300;
+    let data = pattern(size);
+    let p = image(dir.path(), "rnd.img", &data);
+    let mut rng = common::XorShift(0x5EED_1234_ABCD_0001);
+    for direct in [false, true] {
+        let opts = OpenOptions {
+            direct,
+            ..buffered()
+        };
+        let src = open_device(&p, &opts).unwrap();
+        let aligned = src.requires_alignment();
+        let unit = if aligned { 4096u64 } else { 1 };
+        for round in 0..400u64 {
+            let (off, len) = match round % 8 {
+                0 => (0, unit),
+                1 => (size as u64 - 1, 1),
+                2 => (size as u64, unit),
+                3 => (u64::MAX - u64::MAX % unit.max(1), unit),
+                _ => {
+                    let off = rng.next() % (size as u64 + 8192);
+                    let len = 1 + rng.next() % 70_000;
+                    (off, len)
+                }
+            };
+            let (off, len) = if aligned {
+                (off - off % unit, len.div_ceil(unit) * unit)
+            } else {
+                (off, len)
+            };
+            let mut buf = vec![0xEEu8; len as usize];
+            match src.read_at(off, &mut buf) {
+                Ok(n) => {
+                    let expect = if off >= size as u64 {
+                        0
+                    } else {
+                        (size as u64 - off).min(len) as usize
+                    };
+                    assert_eq!(n, expect, "direct={direct} off={off} len={len}");
+                    if n > 0 {
+                        let o = off as usize;
+                        assert_eq!(&buf[..n], &data[o..o + n], "direct={direct} off={off}");
+                    }
+                    assert!(buf[n..].iter().all(|&b| b == 0xEE), "bytes past n written");
+                }
+                Err(e) => panic!("direct={direct} off={off} len={len}: {e}"),
+            }
+        }
+        assert_eq!(src.abandoned_workers(), 0);
+    }
+}
+
+#[test]
 fn concurrent_reopens_reattach_once() {
     let dir = tempfile::tempdir().unwrap();
     let data = pattern(16 * 1024);
