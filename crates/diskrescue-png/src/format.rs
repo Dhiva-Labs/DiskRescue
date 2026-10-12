@@ -332,6 +332,13 @@ impl FileFormat for PngFormat {
         MAX_SIZE
     }
 
+    /// An `eXIf` chunk holds an Exif block (a little TIFF file) that may
+    /// carry a JPEG thumbnail; neither is a file of its own (carving spec
+    /// 2.3).
+    fn may_contain(&self, inner: &str) -> bool {
+        matches!(inner, "tiff" | "jpeg")
+    }
+
     fn probe(&self, head: &[u8]) -> bool {
         sniff(head).is_some_and(|h| h.ihdr.is_plausible(MAX_PROBE_DIM))
     }

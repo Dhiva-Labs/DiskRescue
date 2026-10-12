@@ -384,6 +384,10 @@ fn exif_chunk_gives_date_make_model_orientation() {
     assert_eq!(m.meta.make.as_deref(), Some("DiskRescue"));
     assert_eq!(m.meta.model.as_deref(), Some("FixtureCam"));
     assert_eq!(m.meta.orientation, Some(6));
+    // The Exif block (and a thumbnail in it) is part of the PNG, not a file
+    // for the carver to report separately.
+    assert!(f.may_contain("tiff") && f.may_contain("jpeg"));
+    assert!(!f.may_contain("png") && !f.may_contain("mp4"));
 }
 
 #[test]
