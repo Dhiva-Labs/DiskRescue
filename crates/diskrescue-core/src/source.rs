@@ -88,21 +88,49 @@ impl ReadError {
         }
     }
 
-    /// Build a read error from an `std::io::Error`, classifying ENODEV/ENXIO
-    /// as [`ReadErrorKind::DeviceGone`], timeouts as
-    /// [`ReadErrorKind::Timeout`] and everything else as [`ReadErrorKind::Io`].
+    /// Build a read error from an `std::io::Error`.
+    ///
+    /// Classification matters: only [`ReadErrorKind::Io`] and
+    /// [`ReadErrorKind::Timeout`] mean "this sector is unreadable". Errors
+    /// that say nothing about the medium (permission denied, out of memory,
+    /// bad file handle) become [`ReadErrorKind::Unsupported`], which the
+    /// imaging engine treats as fatal: it stops and saves progress instead of
+    /// marking good sectors bad. An invalid-argument error, which is what a
+    /// misaligned direct read returns, becomes [`ReadErrorKind::Unaligned`].
     pub fn from_io(offset: u64, len: usize, err: &std::io::Error) -> Self {
         let os = err.raw_os_error();
         let kind = match (err.kind(), os) {
             (std::io::ErrorKind::TimedOut, _) => ReadErrorKind::Timeout,
-            // ENODEV = 19, ENXIO = 6 on Linux; ENOMEDIUM = 123.
+            // ENODEV 19, ENXIO 6, ENOMEDIUM 123, ENOENT 2 (node removed).
             #[cfg(target_os = "linux")]
-            (_, Some(19)) | (_, Some(6)) | (_, Some(123)) => ReadErrorKind::DeviceGone,
-            // Windows: ERROR_DEVICE_NOT_CONNECTED = 1167, ERROR_NO_SUCH_DEVICE = 433,
-            // ERROR_FILE_NOT_FOUND = 2, ERROR_NOT_READY = 21.
-            #[cfg(windows)]
-            (_, Some(1167)) | (_, Some(433)) | (_, Some(2)) | (_, Some(21)) => {
+            (_, Some(19)) | (_, Some(6)) | (_, Some(123)) | (_, Some(2)) => {
                 ReadErrorKind::DeviceGone
+            }
+            // EINVAL 22: misaligned O_DIRECT read.
+            #[cfg(target_os = "linux")]
+            (_, Some(22)) => ReadErrorKind::Unaligned,
+            // EPERM 1, EBADF 9, ENOMEM 12, EACCES 13, EFAULT 14.
+            #[cfg(target_os = "linux")]
+            (_, Some(1)) | (_, Some(9)) | (_, Some(12)) | (_, Some(13)) | (_, Some(14)) => {
+                ReadErrorKind::Unsupported
+            }
+            // Windows: ERROR_DEVICE_NOT_CONNECTED 1167, ERROR_NO_SUCH_DEVICE 433,
+            // ERROR_FILE_NOT_FOUND 2, ERROR_NOT_READY 21, ERROR_NO_MEDIA_IN_DRIVE 1112.
+            #[cfg(windows)]
+            (_, Some(1167)) | (_, Some(433)) | (_, Some(2)) | (_, Some(21)) | (_, Some(1112)) => {
+                ReadErrorKind::DeviceGone
+            }
+            // ERROR_INVALID_PARAMETER 87: misaligned unbuffered read.
+            #[cfg(windows)]
+            (_, Some(87)) => ReadErrorKind::Unaligned,
+            // ERROR_ACCESS_DENIED 5, ERROR_INVALID_HANDLE 6, ERROR_NOT_ENOUGH_MEMORY 8,
+            // ERROR_OUTOFMEMORY 14, ERROR_NO_SYSTEM_RESOURCES 1450.
+            #[cfg(windows)]
+            (_, Some(5)) | (_, Some(6)) | (_, Some(8)) | (_, Some(14)) | (_, Some(1450)) => {
+                ReadErrorKind::Unsupported
+            }
+            (std::io::ErrorKind::PermissionDenied, _) | (std::io::ErrorKind::OutOfMemory, _) => {
+                ReadErrorKind::Unsupported
             }
             _ => ReadErrorKind::Io,
         };
@@ -906,6 +934,28 @@ mod tests {
             cache.read_exact_vec(1600, 100).unwrap(),
             (1600..1700u32).map(|i| i as u8).collect::<Vec<_>>()
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn io_error_classification() {
+        let k =
+            |code: i32| ReadError::from_io(0, 512, &std::io::Error::from_raw_os_error(code)).kind;
+        assert_eq!(k(5), ReadErrorKind::Io); // EIO: a bad sector
+        assert_eq!(k(61), ReadErrorKind::Io); // ENODATA
+        assert_eq!(k(19), ReadErrorKind::DeviceGone);
+        assert_eq!(k(6), ReadErrorKind::DeviceGone);
+        assert_eq!(k(123), ReadErrorKind::DeviceGone);
+        assert_eq!(k(22), ReadErrorKind::Unaligned);
+        for code in [1, 9, 12, 13, 14] {
+            assert_eq!(
+                k(code),
+                ReadErrorKind::Unsupported,
+                "errno {code} must not look like a bad sector"
+            );
+        }
+        assert_eq!(k(110), ReadErrorKind::Timeout); // ETIMEDOUT
+        assert!(!ReadErrorKind::Unsupported.is_media_error());
     }
 
     #[test]
