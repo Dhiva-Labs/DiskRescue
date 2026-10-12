@@ -99,6 +99,8 @@ pub(crate) struct Folded {
     /// Some attributes came from extension records found by scanning the
     /// MFT rather than from the attribute list (a guess).
     pub guessed: bool,
+    /// An extension record that supplied attributes had a torn write.
+    pub torn: bool,
 }
 
 /// Everything the walker and reader need about one base record.
@@ -107,6 +109,9 @@ pub(crate) struct FileInfo {
     pub attrs: Vec<Attribute>,
     /// Attribute pieces were recovered without the attribute list.
     pub guessed: bool,
+    /// The base record or an extension record it uses had a torn write:
+    /// some of its bytes may be stale.
+    pub torn: bool,
     pub warnings: Vec<String>,
     pub si: Option<StandardInformation>,
     pub names: Vec<FileName>,
@@ -397,11 +402,15 @@ impl NtfsFs {
                 continue;
             }
             let (attrs, _) = ext.own_attributes(Some(self.total_clusters));
+            let before = added;
             for a in attrs {
                 if f.taken.insert((a.record, a.offset)) {
                     f.attrs.push(a);
                     added += 1;
                 }
+            }
+            if added > before && ext.is_torn() {
+                f.torn = true;
             }
         }
         if added > 0 {
@@ -480,8 +489,10 @@ impl NtfsFs {
             attrs,
             mut warnings,
             guessed,
+            torn: ext_torn,
             ..
         } = self.fold(&rec, true);
+        let torn = ext_torn || rec.is_torn();
         warnings.extend(rec.warnings.iter().cloned());
         let mut si = None;
         let mut names = Vec::new();
@@ -523,7 +534,7 @@ impl NtfsFs {
         let mut data = None;
         let mut ads = Vec::new();
         for (name, pieces) in data_groups {
-            if let Some(mut s) = assemble(&pieces, self.cluster) {
+            if let Some(mut s) = assemble(&pieces, self.cluster, Some(self.total_clusters)) {
                 warnings.append(&mut s.warnings);
                 if name.is_empty() {
                     data = Some(s);
@@ -536,6 +547,7 @@ impl NtfsFs {
             record: rec,
             attrs,
             guessed,
+            torn,
             warnings,
             si,
             names,
@@ -568,7 +580,7 @@ impl NtfsFs {
             .iter()
             .filter(|a| a.type_code == t && a.name == name)
             .collect();
-        assemble(&pieces, self.cluster)
+        assemble(&pieces, self.cluster, Some(self.total_clusters))
     }
 }
 
@@ -612,6 +624,7 @@ pub(crate) fn fold_with(
         list_damaged: false,
         visited: HashSet::new(),
         guessed: false,
+        torn: false,
     };
     let Some(list_attr) = f
         .attrs
@@ -622,7 +635,7 @@ pub(crate) fn fold_with(
         return f;
     };
     f.has_list = true;
-    let Some(list_stream) = assemble(&[&list_attr], cluster) else {
+    let Some(list_stream) = assemble(&[&list_attr], cluster, Some(total_clusters)) else {
         f.list_damaged = true;
         return f;
     };
@@ -653,6 +666,7 @@ pub(crate) fn fold_with(
     let mut loaded: HashMap<u64, Option<Vec<Attribute>>> = HashMap::new();
     let (attrs, warnings, taken) = (&mut f.attrs, &mut f.warnings, &mut f.taken);
     let mut damaged = false;
+    let mut ext_torn = false;
     for e in entries {
         let r = mref(e.reference);
         if r == rec.number {
@@ -678,6 +692,7 @@ pub(crate) fn fold_with(
                         let (a, w) = ext.own_attributes(Some(total_clusters));
                         warnings.extend(w);
                         if ext.is_torn() {
+                            ext_torn = true;
                             warnings.push(format!(
                                 "extension record {r} of record {}: torn write",
                                 rec.number
@@ -736,6 +751,7 @@ pub(crate) fn fold_with(
         }
     }
     f.list_damaged |= damaged;
+    f.torn |= ext_torn;
     f.visited = loaded.into_keys().collect();
     f
 }
@@ -882,7 +898,7 @@ fn bootstrap_mft(
     let Some(Stream {
         data: StreamData::NonResident(mut mft),
         ..
-    }) = assemble(&pieces, cluster)
+    }) = assemble(&pieces, cluster, Some(total))
     else {
         return Err(Error::corrupt("$MFT", "record 0 has no non-resident $DATA"));
     };
@@ -915,7 +931,7 @@ fn bootstrap_mft(
         if let Some(Stream {
             data: StreamData::NonResident(full),
             ..
-        }) = assemble(&pieces, cluster)
+        }) = assemble(&pieces, cluster, Some(total))
         {
             mft = full;
         }
@@ -1008,5 +1024,6 @@ fn probe_contiguous_mft(
         compression_unit: 0,
         complete: false,
         sizes_known: false,
+        size_clamped: false,
     })
 }

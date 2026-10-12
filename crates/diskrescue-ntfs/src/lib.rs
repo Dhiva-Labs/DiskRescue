@@ -77,6 +77,8 @@ pub mod volume;
 pub mod walk;
 
 #[cfg(test)]
+mod review_tests;
+#[cfg(test)]
 mod synth_tests;
 
 use std::io::Write;

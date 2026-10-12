@@ -125,6 +125,9 @@ pub mod flags {
     pub const VIRTUAL: &str = "virtual";
     /// Part of the data mapping is lost (missing attribute pieces).
     pub const INCOMPLETE: &str = "incomplete-runs";
+    /// The size in the record was impossible (larger than the allocation
+    /// or the volume) and was clamped to the mapped data.
+    pub const SIZE_CLAMPED: &str = "size-clamped";
     /// Attribute pieces were taken from extension records the attribute
     /// list no longer names (deleted file or damaged list): a guess.
     pub const PIECES_GUESSED: &str = "attribute-pieces-guessed";
@@ -494,11 +497,15 @@ impl NtfsFs {
                 } else {
                     n.data_size.div_ceil(self.cluster)
                 };
+                if n.size_clamped {
+                    fl.push(flags::SIZE_CLAMPED);
+                }
                 let missing = n
                     .extents
                     .iter()
                     .any(|e| e.kind == ExtentKind::Missing && e.vcn < needed_vcn)
-                    || n.vcn_end() < needed_vcn;
+                    || n.vcn_end() < needed_vcn
+                    || n.size_clamped;
                 if missing {
                     fl.push(flags::INCOMPLETE);
                 }
@@ -577,7 +584,7 @@ impl NtfsFs {
                 _ => {}
             }
         }
-        if rec.is_torn() {
+        if info.torn {
             base_flags.push(flags::TORN.into());
         }
         if info.guessed {
@@ -615,7 +622,7 @@ impl NtfsFs {
             self.describe_stream(info.data.as_ref(), deleted)?
         };
         main_flags.extend(desc.flags.iter().map(|s| s.to_string()));
-        let confidence = guessed_cap(desc.confidence, info.guessed);
+        let confidence = guessed_cap(desc.confidence, info.guessed || info.torn);
         let main = FileEntry {
             id: make_id(rec.number, sub),
             parent_id,
@@ -653,7 +660,7 @@ impl NtfsFs {
                     size: d.size,
                     is_dir: false,
                     deleted,
-                    confidence: guessed_cap(d.confidence, info.guessed),
+                    confidence: guessed_cap(d.confidence, info.guessed || info.torn),
                     created,
                     modified,
                     accessed,
@@ -681,7 +688,8 @@ pub fn safe_name(name: &str) -> String {
     out
 }
 
-/// A deleted entry whose attribute pieces were guessed is at best
+/// A deleted entry whose attribute pieces were guessed, or whose record
+/// had a torn write (its run list may be stale), is at best
 /// [`EntryConfidence::DeletedGuessed`].
 fn guessed_cap(c: EntryConfidence, guessed: bool) -> EntryConfidence {
     if guessed && c == EntryConfidence::DeletedIntact {
