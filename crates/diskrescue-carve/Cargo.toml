@@ -21,3 +21,11 @@ blake3.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+# Real formats and raw carving fixtures for the end-to-end carving tests
+# (tests/real_formats.rs). Dev-only: the carver itself knows no format.
+diskrescue-fixtures.workspace = true
+diskrescue-jpeg.workspace = true
+diskrescue-png.workspace = true
+diskrescue-stills.workspace = true
+diskrescue-isobmff.workspace = true
+diskrescue-video.workspace = true
