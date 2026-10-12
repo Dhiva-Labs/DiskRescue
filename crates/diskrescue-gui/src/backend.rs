@@ -1,0 +1,38 @@
+//! What the app asks of the system, behind a trait so that tests can show
+//! made-up drives and safety-check results without touching real devices.
+
+use std::path::Path;
+
+use diskrescue_app::plan::RecoverPlan;
+use diskrescue_app::preflight::{self, Preflight, ResolvedRecover};
+use diskrescue_core::device::DeviceInfo;
+
+/// Device listing, permission probe and safety checks.
+pub trait Backend: Send + Sync + 'static {
+    /// Disks, cards and USB drives (virtual devices left out).
+    fn list_devices(&self) -> Result<Vec<DeviceInfo>, String>;
+
+    /// True when this user cannot read `path` without administrator rights.
+    fn needs_privilege(&self, path: &Path) -> bool;
+
+    /// The safety checks of a recovery plan.
+    fn preflight_recover(&self, plan: &RecoverPlan) -> Preflight<ResolvedRecover>;
+}
+
+/// The real system.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct SystemBackend;
+
+impl Backend for SystemBackend {
+    fn list_devices(&self) -> Result<Vec<DeviceInfo>, String> {
+        diskrescue_app::devices::list(false).map_err(|e| e.message().to_string())
+    }
+
+    fn needs_privilege(&self, path: &Path) -> bool {
+        diskrescue_app::helper::needs_privilege(path)
+    }
+
+    fn preflight_recover(&self, plan: &RecoverPlan) -> Preflight<ResolvedRecover> {
+        preflight::preflight_recover(plan)
+    }
+}
