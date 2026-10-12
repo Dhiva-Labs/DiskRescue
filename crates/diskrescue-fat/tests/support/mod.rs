@@ -116,9 +116,10 @@ pub fn dump_exfat_free(path: &Path) -> Option<u64> {
     let (_, out) = run(&t, &[path.to_str().unwrap()]);
     // exfatprogs before 1.3 computes "Free Clusters" differently from the
     // allocation bitmap (Ubuntu 24.04 ships 1.2.2), so it is no oracle there.
-    let version = out
-        .lines()
-        .find_map(|l| l.split_once("exfatprogs version :").map(|(_, v)| v.trim().to_string()))?;
+    let version = out.lines().find_map(|l| {
+        l.split_once("exfatprogs version :")
+            .map(|(_, v)| v.trim().to_string())
+    })?;
     let mut parts = version.split('.').map(|p| p.parse::<u32>().unwrap_or(0));
     let (major, minor) = (parts.next().unwrap_or(0), parts.next().unwrap_or(0));
     if (major, minor) < (1, 3) {
