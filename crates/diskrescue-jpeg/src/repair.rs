@@ -362,6 +362,53 @@ fn write_splice(s: &Splice, out: &mut dyn Write) -> Result<u64> {
     Ok(pos)
 }
 
+/// Insert a COM segment with `text` right after the SOI marker that starts
+/// the first piece. Leaves the pieces unchanged when the first piece cannot
+/// be split there.
+fn with_comment_after_soi(mut pieces: Vec<Piece>, text: &[u8]) -> Vec<Piece> {
+    if pieces.is_empty() || text.len() > 0xFFFF - 2 {
+        return pieces;
+    }
+    let mut com = vec![0xFF, 0xFE];
+    com.extend_from_slice(&((text.len() + 2) as u16).to_be_bytes());
+    com.extend_from_slice(text);
+    let com = Piece::Bytes(Arc::new(com));
+    let first = pieces.remove(0);
+    let mut out = Vec::with_capacity(pieces.len() + 3);
+    match first {
+        Piece::Bytes(b) if b.len() >= 2 && b[0] == 0xFF && b[1] == 0xD8 => {
+            out.push(Piece::bytes(&b[..2]));
+            out.push(com);
+            if b.len() > 2 {
+                out.push(Piece::bytes(&b[2..]));
+            }
+        }
+        Piece::Src { from, len } if len >= 2 => {
+            out.push(Piece::Src { from, len: 2 });
+            out.push(com);
+            if len > 2 {
+                out.push(Piece::Src {
+                    from: from + 2,
+                    len: len - 2,
+                });
+            }
+        }
+        Piece::Donor { from, len } if len >= 2 => {
+            out.push(Piece::Donor { from, len: 2 });
+            out.push(com);
+            if len > 2 {
+                out.push(Piece::Donor {
+                    from: from + 2,
+                    len: len - 2,
+                });
+            }
+        }
+        other => out.push(other),
+    }
+    out.extend(pieces);
+    out
+}
+
 struct Built {
     pieces: Vec<Piece>,
     donor: Option<SharedSource>,
@@ -397,10 +444,22 @@ pub fn apply(
     ctx: &RepairContext,
 ) -> Result<RepairOutcome> {
     let _ = ctx;
-    let built = match build(src, strategies)? {
+    let mut built = match build(src, strategies)? {
         Build::Ok(b) => b,
         Build::Unrepairable(notes) => return Ok(unrepairable(notes)),
     };
+    if built.padded > 0 && built.scan_total > 0 {
+        // Record in the file itself which part is grey filler, so a later
+        // check (diskrescue verify, or any tool reading comments) does not
+        // take the repaired picture for an intact one.
+        let text = format!(
+            "{}{}/{}",
+            crate::validate::GREY_FILL_COMMENT,
+            built.padded.min(built.scan_total),
+            built.scan_total
+        );
+        built.pieces = with_comment_after_soi(std::mem::take(&mut built.pieces), text.as_bytes());
+    }
     let splice = Splice::new(built.pieces, src.clone(), built.donor);
     let detail = validate_source(&splice, true)?;
     let mut v = detail.validation;
@@ -428,7 +487,9 @@ pub fn apply(
             "{} of {} MCUs could not be recovered and are filled with grey blocks",
             built.padded, built.scan_total
         );
-        v.problems.push(text.clone());
+        if !v.problems.iter().any(|p| p.contains("grey filler")) {
+            v.problems.push(text.clone());
+        }
         notes.push(text);
         result = RepairResult::PartiallyRepaired;
     }

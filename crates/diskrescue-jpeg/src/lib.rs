@@ -64,7 +64,7 @@ pub use scan::{
     analyze, analyze_source, AnalyzeOptions, CutPoint, DamagedRange, ScanAnalysis, ScanError,
     ScanErrorKind,
 };
-pub use validate::{zune_check, ZuneCheck};
+pub use validate::{zune_check, ZuneCheck, GREY_FILL_COMMENT};
 
 /// Default largest JPEG the carver measures (128 MiB).
 pub const DEFAULT_MAX_SIZE: u64 = 128 << 20;

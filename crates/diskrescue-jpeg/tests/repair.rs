@@ -199,9 +199,19 @@ fn aggressive_truncation_cuts_at_clean_boundaries() {
     assert!(after.is_clean(), "{:?}", after.first_error);
     assert_eq!(after.mcus_decoded, before.mcus_total);
     assert_eq!(after.eoi_offset, Some(out.len() as u64 - 2));
+    // The repair records the grey fill in a COM segment right after SOI;
+    // everything else up to the last good MCU is the input, byte for byte.
+    assert_eq!(&out[..2], &cut[..2]);
+    assert_eq!(&out[2..4], &[0xFF, 0xFE]);
+    let com_len = 2 + u16::from_be_bytes([out[4], out[5]]) as usize;
+    let comment = std::str::from_utf8(&out[6..2 + com_len]).unwrap();
+    assert!(
+        comment.starts_with(diskrescue_jpeg::GREY_FILL_COMMENT),
+        "{comment}"
+    );
     assert_eq!(
-        &out[..kept.byte_offset as usize],
-        &cut[..kept.byte_offset as usize]
+        &out[2 + com_len..kept.byte_offset as usize + com_len],
+        &cut[2..kept.byte_offset as usize]
     );
     let frac = r.validation.unwrap().intact_fraction.unwrap();
     let want = before.mcus_decoded as f32 / before.mcus_total as f32;
@@ -238,6 +248,7 @@ fn aggressive_truncation_cuts_at_clean_boundaries() {
     let damaged = a.damaged_ranges.clone();
     assert!(!damaged.is_empty(), "{a:?}");
     let (r, out) = repair_with(&x, &aggressive());
+    let out = strip_grey_comment(&out);
     assert_eq!(r.result, RepairResult::PartiallyRepaired, "{r:?}");
     assert!(
         r.applied
@@ -277,6 +288,7 @@ fn aggressive_truncation_cuts_at_clean_boundaries() {
     )
     .unwrap();
     assert_eq!(r.result, RepairResult::PartiallyRepaired, "{r:?}");
+    let out = strip_grey_comment(&out);
     assert_eq!(&out[..restart_off as usize], &x[..restart_off as usize]);
     let after = analyze(&out).unwrap();
     assert!(after.is_clean());
@@ -430,4 +442,19 @@ fn plan_matches_the_damage() {
     );
     let (h, a) = analyze_source(&*mem(d.clone()), 0, u64::MAX, &AnalyzeOptions::default()).unwrap();
     assert!(plan(&h, &a, &aggressive()).is_empty());
+}
+
+/// Remove the grey-fill COM segment a repair puts right after SOI, so the
+/// rest can be compared byte for byte with the input.
+fn strip_grey_comment(out: &[u8]) -> Vec<u8> {
+    if out.len() > 6 && out[2..4] == [0xFF, 0xFE] {
+        let len = 2 + u16::from_be_bytes([out[4], out[5]]) as usize;
+        let body = &out[6..(2 + len).min(out.len())];
+        if body.starts_with(diskrescue_jpeg::GREY_FILL_COMMENT.as_bytes()) {
+            let mut v = out[..2].to_vec();
+            v.extend_from_slice(&out[2 + len..]);
+            return v;
+        }
+    }
+    out.to_vec()
 }

@@ -665,11 +665,22 @@ pub(crate) fn validate_source(src: &dyn Source, run_zune: bool) -> Result<Detail
     if extra_trailing > 0 {
         rep.push("strip_trailing_garbage".into());
     }
-    let status = if valid {
+    let mut status = if valid {
         ValidationStatus::Valid
     } else {
         ValidationStatus::Damaged
     };
+    let mut intact = intact;
+    // A file repaired earlier carries a comment saying how much of it is grey
+    // filler: it decodes, but that part of the picture is lost.
+    if let Some((padded, total)) = grey_fill_comment(src, soi, &h) {
+        status = ValidationStatus::Damaged;
+        intact = intact.min(1.0 - padded as f32 / total as f32);
+        problems.push(format!(
+            "partly recovered: {padded} of {total} blocks are grey filler written by an earlier repair \
+             (that part of the picture was lost)"
+        ));
+    }
     Ok(Detail {
         validation: Validation {
             status,
@@ -683,4 +694,35 @@ pub(crate) fn validate_source(src: &dyn Source, run_zune: bool) -> Result<Detail
         zune,
         extra_trailing,
     })
+}
+
+/// Comment written into a JPEG whose missing part a repair filled with grey
+/// blocks; followed by `<padded>/<total>` MCU counts.
+pub const GREY_FILL_COMMENT: &str = "DiskRescue repair: grey fill ";
+
+/// The `(padded, total)` MCU counts of a grey-fill comment, if the file has one.
+pub(crate) fn grey_fill_comment(src: &dyn Source, soi: u64, h: &Headers) -> Option<(u64, u64)> {
+    use diskrescue_core::source::SourceExt;
+    for seg in h.segments.iter().filter(|s| s.marker == 0xFE) {
+        let n = (seg.len as usize).saturating_sub(2).min(96);
+        let mut buf = vec![0u8; n];
+        if src.read_exact_at(soi + seg.data_offset, &mut buf).is_err() {
+            continue;
+        }
+        let Ok(text) = std::str::from_utf8(&buf) else {
+            continue;
+        };
+        let Some(rest) = text.strip_prefix(GREY_FILL_COMMENT) else {
+            continue;
+        };
+        let Some((a, b)) = rest.trim_end_matches('\0').trim().split_once('/') else {
+            continue;
+        };
+        if let (Ok(padded), Ok(total)) = (a.parse::<u64>(), b.parse::<u64>()) {
+            if total > 0 && padded <= total {
+                return Some((padded, total));
+            }
+        }
+    }
+    None
 }
