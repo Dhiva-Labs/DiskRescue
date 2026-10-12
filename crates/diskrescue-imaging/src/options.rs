@@ -68,6 +68,10 @@ pub struct ImagingOptions {
     /// Minimum time between two [`Event::Progress`] events (0 = after every
     /// read). Phase changes and the end always report progress.
     pub progress_interval: Duration,
+    /// When set, also emit [`Event::Map`] with a copy of the block-status map
+    /// at most this often (for live block-map displays). `None` (default)
+    /// emits no snapshots, so runs without a display pay nothing.
+    pub map_snapshot_interval: Option<Duration>,
 }
 
 impl Default for ImagingOptions {
@@ -89,6 +93,7 @@ impl Default for ImagingOptions {
             allow_existing_output: false,
             reattach_poll: Duration::from_secs(2),
             progress_interval: Duration::from_millis(100),
+            map_snapshot_interval: None,
         }
     }
 }
@@ -208,6 +213,9 @@ pub enum Event {
     },
     /// The engine sleeps for this long (pause on error, cooling pause).
     Paused(Duration),
+    /// A copy of the block-status map (only when
+    /// [`ImagingOptions::map_snapshot_interval`] is set).
+    Map(std::sync::Arc<crate::status::StatusMap>),
     /// The mapfile was saved.
     Saved,
     /// The run ended (also returned by [`crate::Imager::run`]).

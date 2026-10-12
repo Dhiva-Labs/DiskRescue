@@ -970,3 +970,36 @@ fn randomized_interrupt_and_resume() {
         assert_reads_sane(&src);
     }
 }
+
+/// Live block-map snapshots are emitted only when requested, and the last
+/// one matches the final map.
+#[test]
+fn map_snapshots_only_when_requested() {
+    let data = pattern(4 << 20, 77);
+    let src = Arc::new(
+        FaultySource::builder(data.clone())
+            .bad(Range::with_len(1 << 20, 4096))
+            .build(),
+    );
+    let (run, _dir) = image(&src, test_opts(test_profile()));
+    assert!(!run.events.iter().any(|e| matches!(e, Event::Map(_))));
+
+    let src = Arc::new(
+        FaultySource::builder(data)
+            .bad(Range::with_len(1 << 20, 4096))
+            .build(),
+    );
+    let mut opts = test_opts(test_profile());
+    opts.map_snapshot_interval = Some(std::time::Duration::ZERO);
+    let (run, _dir) = image(&src, opts);
+    let snaps: Vec<_> = run
+        .events
+        .iter()
+        .filter_map(|e| match e {
+            Event::Map(m) => Some(m.clone()),
+            _ => None,
+        })
+        .collect();
+    assert!(!snaps.is_empty());
+    assert_eq!(snaps.last().unwrap().as_ref(), &run.map.map);
+}

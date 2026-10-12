@@ -247,6 +247,7 @@ struct Ctx<'a> {
     last_save: Instant,
     last_fsync: Instant,
     last_progress: Option<Instant>,
+    last_map: Option<Instant>,
     rescued_run: u64,
     rate_samples: VecDeque<(Instant, u64)>,
     errors: u64,
@@ -287,6 +288,7 @@ impl<'a> Ctx<'a> {
             last_save: now,
             last_fsync: now,
             last_progress: None,
+            last_map: None,
             rescued_run: 0,
             rate_samples: VecDeque::new(),
             errors: 0,
@@ -1194,6 +1196,13 @@ impl Imager {
         ctx.last_progress = Some(now);
         let p = self.progress(ctx, now);
         ctx.emit(Event::Progress(p));
+        if let Some(every) = self.opts.map_snapshot_interval {
+            let due = force || ctx.last_map.is_none_or(|t| now.duration_since(t) >= every);
+            if due {
+                ctx.last_map = Some(now);
+                ctx.emit(Event::Map(std::sync::Arc::new(self.mf.map.clone())));
+            }
+        }
     }
 
     fn progress(&self, ctx: &Ctx, now: Instant) -> Progress {
