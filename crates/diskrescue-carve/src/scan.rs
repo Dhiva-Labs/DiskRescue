@@ -317,7 +317,7 @@ impl Carver {
             }
         }
         let formats: Vec<Arc<dyn FileFormat>> = opts.registry.all().to_vec();
-        let patterns = PatternSet::build(&formats)?;
+        let patterns = PatternSet::build(&formats, opts.alignment)?;
         let fmts: Vec<Fmt> = formats
             .iter()
             .map(|f| Fmt {
@@ -447,7 +447,6 @@ impl Carver {
                 min_confidence: self.opts.min_confidence,
                 promote_nested: self.opts.promote_nested,
             },
-            alignment: self.opts.alignment.max(1),
             zero_skip: self.opts.zero_skip && self.patterns.zero_safe(),
             resolver: Resolver::default(),
             res_tx,
@@ -549,7 +548,6 @@ struct ScanState<'a> {
     scan_set: RangeSet,
     env: Env,
     cfg: ResolverCfg,
-    alignment: u64,
     zero_skip: bool,
     resolver: Resolver,
     res_tx: mpsc::Sender<JobResult>,
@@ -722,7 +720,6 @@ impl ScanState<'_> {
                             buf_base: w.read.start,
                             own_start,
                             own_end: b,
-                            alignment: self.alignment,
                             zero_skip: self.zero_skip,
                         },
                         &mut hits,

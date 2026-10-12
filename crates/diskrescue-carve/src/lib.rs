@@ -18,14 +18,18 @@
 //!    prefilter) holds the primary bytes of every signature; the search
 //!    resumes one byte after each match and compares all patterns at a
 //!    matching position, so overlapping signatures and signatures at an
-//!    offset inside the file (`ftyp` at 4) are all seen. All-zero 4 KiB
-//!    blocks are skipped (with a margin so patterns straddling them are not
-//!    lost). Bytes the source reports as unreadable are zero-filled and
+//!    offset inside the file (`ftyp` at 4) are all seen. One- and two-byte
+//!    patterns (MPEG-TS sync, MP3 frame sync, `BM`) are compared directly at
+//!    each grid position instead, which keeps the automaton fast. All-zero
+//!    4 KiB blocks are skipped (with a margin so patterns straddling them are
+//!    not lost). Bytes the source reports as unreadable are zero-filled and
 //!    never searched; read errors are retried at sector granularity and the
 //!    failing sectors are skipped, so a bad sector never aborts the scan.
-//! 2. **Filter.** A candidate start must be a multiple of `alignment`, lie in
-//!    the scan area, match its full signature (including the `also`
-//!    pattern) and pass `FileFormat::probe` on the probe window.
+//! 2. **Filter.** A candidate start must be a multiple of `alignment` (and of
+//!    512 for weak signatures with fewer than three fixed bytes, whatever the
+//!    alignment: spec 3.1), lie in the scan area, match its full signature
+//!    (including the `also` pattern) and pass `FileFormat::probe` on the
+//!    probe window.
 //! 3. **Measure** (rayon pool of `workers` threads). One job per candidate
 //!    start measures the matching formats in priority order with a read
 //!    limit of `min(format max_size, max_file_size, bytes to source end)`;

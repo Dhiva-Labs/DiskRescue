@@ -65,7 +65,9 @@ pub struct CarveOptions {
     pub mode: CarveMode,
     /// Candidate file starts must be multiples of this (absolute source
     /// offsets). Default 512; 1 disables the filter ("deep" scan); 0 is
-    /// treated as 1.
+    /// treated as 1. Weak signatures (fewer than three fixed bytes: MPEG-TS,
+    /// M2TS, bare MP3 frames, BMP) are only accepted at multiples of 512 as
+    /// well, even in a deep scan (carving spec 3.1).
     pub alignment: u64,
     /// `(data_start, cluster_size)` of the filesystem, when known. Headers at
     /// `data_start + k * cluster_size` are preferred; others lose
