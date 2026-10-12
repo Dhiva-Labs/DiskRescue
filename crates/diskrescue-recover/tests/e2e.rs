@@ -434,3 +434,40 @@ fn assert_decodes(p: &Path) {
         p.display()
     );
 }
+
+/// A Windows disk whose NTFS boot sector and backup boot sector are both
+/// destroyed: the volume is rebuilt from its file table and files come back
+/// with their names.
+#[test]
+fn ntfs_without_boot_sectors_keeps_names() {
+    let dir = tempfile::tempdir().unwrap();
+    let Some(scn) = scenario(sets::ntfs_disk, &dir.path().join("scn")) else {
+        return;
+    };
+    let img = scn.disk_image.clone().unwrap();
+    let (start, size) = scn.partitions[0];
+    let mut data = std::fs::read(&img).unwrap();
+    // Primary boot sector (first sector) and backup (last sector of the volume).
+    for b in &mut data[start as usize..start as usize + 512] {
+        *b = 0;
+    }
+    let last = (start + size - 512) as usize;
+    for b in &mut data[last..last + 512] {
+        *b = 0;
+    }
+    let broken = dir.path().join("broken.img");
+    std::fs::write(&broken, &data).unwrap();
+    drop(data);
+
+    let out = dir.path().join("out");
+    let report = run(open(&broken), &out, |_| {});
+    assert!(
+        report
+            .volumes
+            .iter()
+            .any(|v| v.origin == "mft-scan" && v.error.is_none()),
+        "volume rebuilt from the MFT: {:?}",
+        report.volumes
+    );
+    assert_all_recovered(&report, &out, &scn);
+}

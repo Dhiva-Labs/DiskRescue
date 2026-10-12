@@ -283,6 +283,27 @@ pub fn discover(
 
     let mut records = Vec::new();
     let mut parsed = Vec::new();
+    // NTFS volumes whose boot sectors are destroyed: search for the MFT
+    // inside partitions the table marks as NTFS but where no filesystem was
+    // recognised, and over the whole source when nothing is readable at all.
+    let mut ntfs_search: Vec<Range> = vols
+        .iter()
+        .filter(|v| v.probe.is_none() && is_ntfs_partition_type(&v.entry.type_id))
+        .map(|v| Range::with_len(v.entry.start, v.entry.size))
+        .collect();
+    if vols.iter().all(|v| v.probe.is_none()) && scan_lost {
+        ntfs_search = vec![Range::new(0, src.size())];
+    }
+    let mut found_ntfs = Vec::new();
+    for range in ntfs_search {
+        if cancel.load(Ordering::Relaxed) {
+            break;
+        }
+        match diskrescue_ntfs::discover::find_volumes(src, range) {
+            Ok(found) => found_ntfs.extend(found),
+            Err(e) => warnings.push(format!("search for NTFS file tables failed: {e}")),
+        }
+    }
     for (i, vol) in vols.into_iter().enumerate() {
         let index = i as u32 + 1;
         let kind = vol.probe.as_ref().map(|p| p.kind).or(vol.entry.fs);
@@ -338,12 +359,74 @@ pub fn discover(
         obs.event(Event::Volume(rec.clone()));
         records.push(rec);
     }
+    for found in found_ntfs {
+        let range = Range::with_len(
+            found.start,
+            found.size.min(src.size().saturating_sub(found.start)),
+        );
+        let overlaps = parsed
+            .iter()
+            .any(|p: &ParsedVolume| Range::with_len(p.start, p.size).overlaps(range));
+        if overlaps {
+            continue;
+        }
+        let index = records.len() as u32 + 1;
+        let mut rec = VolumeRecord {
+            index,
+            start: range.start,
+            size: range.len(),
+            fs: Some(FsKind::Ntfs),
+            label: None,
+            origin: "mft-scan".into(),
+            files_listed: 0,
+            deleted_listed: 0,
+            warnings: vec![format!(
+                "boot sector missing; volume rebuilt from its file table ({})",
+                found.evidence.join("; ")
+            )],
+            error: None,
+        };
+        obs.event(Event::Stage(Stage::Listing {
+            volume: index,
+            fs: FsKind::Ntfs,
+        }));
+        match diskrescue_ntfs::open_found(
+            src.clone(),
+            &found,
+            &diskrescue_ntfs::NtfsOptions::default(),
+        ) {
+            Ok(fs) => {
+                let info = fs.info();
+                rec.label = info.label.clone();
+                rec.warnings.extend(info.warnings.iter().cloned());
+                let dir = OutputTree::volume_dir(index, Some(FsKind::Ntfs), rec.label.as_deref());
+                parsed.push(ParsedVolume {
+                    index,
+                    start: range.start,
+                    size: range.len(),
+                    dir,
+                    fs: Box::new(fs),
+                });
+            }
+            Err(e) => rec.error = Some(e.to_string()),
+        }
+        obs.event(Event::Volume(rec.clone()));
+        records.push(rec);
+    }
     Discovery {
         table,
         volumes: records,
         parsed,
         warnings,
     }
+}
+
+/// MBR types and GPT type GUIDs that hold NTFS volumes.
+fn is_ntfs_partition_type(type_id: &str) -> bool {
+    let t = type_id.trim().to_ascii_uppercase();
+    matches!(t.as_str(), "0X07" | "0X17" | "0X27")
+        || t == "EBD0A0A2-B9E5-4433-87C0-68B6B72699C7"
+        || t == "DE94BBA4-06D1-4D40-A16A-BFD50179D6AC"
 }
 
 /// A filesystem entry chosen for extraction.
