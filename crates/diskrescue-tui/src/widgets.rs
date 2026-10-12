@@ -142,7 +142,8 @@ impl Theme {
 }
 
 /// Wrap `text` to lines of at most `width` characters. Words longer than a
-/// line are split. Always returns at least one line.
+/// line are split, after a `/` when there is one (so paths break between
+/// folders). Always returns at least one line.
 pub fn wrap_words(text: &str, width: usize) -> Vec<String> {
     let width = width.max(1);
     let mut lines: Vec<String> = Vec::new();
@@ -153,8 +154,16 @@ pub fn wrap_words(text: &str, width: usize) -> Vec<String> {
             if !cur.is_empty() {
                 lines.push(std::mem::take(&mut cur));
             }
-            let head: String = word.chars().take(width).collect();
-            word = word.chars().skip(width).collect();
+            let chars: Vec<char> = word.chars().collect();
+            // Prefer a break after a folder separator.
+            let cut = chars[..width]
+                .iter()
+                .rposition(|c| *c == '/' || *c == '\\')
+                .map(|i| i + 1)
+                .filter(|i| *i > width / 3)
+                .unwrap_or(width);
+            let head: String = chars[..cut].iter().collect();
+            word = chars[cut..].iter().collect();
             lines.push(head);
         }
         let need = if cur.is_empty() { 0 } else { 1 } + word.chars().count();
@@ -388,6 +397,45 @@ pub fn render_list(
     off
 }
 
+/// Like [`render_list`], for rows of two lines each. Returns the index of
+/// the first visible row.
+pub fn render_items(
+    f: &mut Frame,
+    area: Rect,
+    rows: &[[Line<'static>; 2]],
+    nav: &ListNav,
+    theme: &Theme,
+    focused: bool,
+) -> usize {
+    let per_page = (area.height / 2) as usize;
+    let off = nav.window(per_page, rows.len());
+    let sel_style = if focused {
+        theme.selected()
+    } else {
+        theme.selected_inactive()
+    };
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    for (i, pair) in rows.iter().enumerate().skip(off).take(per_page) {
+        for l in pair {
+            if i == nav.sel {
+                let mut spans = l.spans.clone();
+                let used: usize = spans.iter().map(|s| s.content.chars().count()).sum();
+                if used < area.width as usize {
+                    spans.push(Span::raw(" ".repeat(area.width as usize - used)));
+                }
+                for s in &mut spans {
+                    s.style = sel_style;
+                }
+                lines.push(Line::from(spans));
+            } else {
+                lines.push(l.clone());
+            }
+        }
+    }
+    f.render_widget(Paragraph::new(lines), area);
+    off
+}
+
 /// A line of `key  description` pairs for the footer.
 pub fn key_hints(theme: &Theme, pairs: &[(&str, &str)]) -> Line<'static> {
     let mut spans: Vec<Span<'static>> = Vec::new();
@@ -408,6 +456,10 @@ mod tests {
         assert_eq!(wrap_words("hello world", 8), vec!["hello", "world"]);
         assert_eq!(wrap_words("a b c d e", 3), vec!["a b", "c d", "e"]);
         assert_eq!(wrap_words("abcdefghij", 4), vec!["abcd", "efgh", "ij"]);
+        assert_eq!(
+            wrap_words("/home/me/photos/card.img", 14),
+            vec!["/home/me/", "photos/", "card.img"]
+        );
         assert_eq!(wrap_words("", 5), vec![""]);
         for l in wrap_words(
             "The device stopped responding at 4.00 KiB. Waiting for it to come back.",

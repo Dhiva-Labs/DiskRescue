@@ -1,3 +1,3 @@
 fn main() {
-    println!("diskrescue-tui (placeholder)");
+    std::process::exit(diskrescue_tui::runtime::main());
 }
