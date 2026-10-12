@@ -940,7 +940,9 @@ impl Emitter<'_, '_> {
         info: &FileInfo,
         child_names: &HashSet<String>,
     ) -> Result<Vec<Item>> {
-        let nodes = self.nodes.expect("whole-MFT mode");
+        let Some(nodes) = self.nodes else {
+            return Ok(Vec::new());
+        };
         let dir = info.record.number;
         let cands = self.fs.index_candidates(dir, &info.attrs, true)?;
         let mut groups: BTreeMap<u64, Vec<crate::index::IndexCandidate>> = BTreeMap::new();
