@@ -1,7 +1,6 @@
 //! The results browser: every file of a report, with filters, sorting and
 //! a detail pane; and the chooser of a reference file for a repair.
 
-use std::cmp::Ordering;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -16,7 +15,9 @@ use ratatui::widgets::Paragraph;
 use ratatui::Frame;
 
 use crate::model::plain_words;
-use crate::widgets::{ellipsize_start, fit, fit_right, render_list, wrap_words, ListNav, Theme};
+use crate::widgets::{
+    ellipsize_start, fit, fit_right, render_list, render_list_lazy, wrap_words, ListNav, Theme,
+};
 
 /// A report and its files ready to show.
 #[derive(Debug)]
@@ -212,6 +213,7 @@ pub struct ResultsScreen {
     pub nav: ListNav,
     /// Scroll of the detail pane.
     pub detail_scroll: u16,
+    counts: [usize; 6],
 }
 
 impl ResultsScreen {
@@ -226,50 +228,44 @@ impl ResultsScreen {
             view: Vec::new(),
             nav: ListNav::new(),
             detail_scroll: 0,
+            counts: [0; 6],
         };
-        // Problems first is the useful default when there are any.
+        for (n, f) in FILTERS.iter().enumerate() {
+            s.counts[n] = s.data.items.iter().filter(|i| f.matches(i)).count();
+        }
         s.refresh();
         s
     }
 
     /// Number of files that pass `f`.
     pub fn count(&self, f: Filter) -> usize {
-        self.data.items.iter().filter(|i| f.matches(i)).count()
+        FILTERS
+            .iter()
+            .position(|x| *x == f)
+            .map_or(0, |n| self.counts[n])
     }
 
     fn refresh(&mut self) {
-        let items = &self.data.items;
+        let data = self.data.clone();
+        let items = &data.items;
         let mut v: Vec<usize> = (0..items.len())
             .filter(|i| self.filter.matches(&items[*i]))
             .collect();
-        let sort = self.sort;
-        v.sort_by(|a, b| {
-            let (x, y) = (&items[*a], &items[*b]);
-            let name = |i: &ResultItem| {
-                // Files that were not written (duplicates) come last.
-                i.path
-                    .as_ref()
-                    .map(|p| format!("0{}", p.display().to_string().to_lowercase()))
-                    .unwrap_or_else(|| "1".to_string())
-            };
-            let o = match sort {
-                Sort::Name => name(x).cmp(&name(y)),
-                Sort::Size => y.size.cmp(&x.size),
-                Sort::Date => x
-                    .captured
-                    .map(|t| t.to_rfc3339())
-                    .cmp(&y.captured.map(|t| t.to_rfc3339()))
-                    .then_with(|| name(x).cmp(&name(y))),
-                Sort::Result => badness(x.outcome)
-                    .cmp(&badness(y.outcome))
-                    .then_with(|| name(x).cmp(&name(y))),
-            };
-            if o == Ordering::Equal {
-                a.cmp(b)
-            } else {
-                o
+        // Files that were not written (duplicates) come last by name.
+        let name = |i: usize| -> String {
+            match display_name(&data, i) {
+                n if n == NOT_WRITTEN => "1".to_string(),
+                n => format!("0{}", n.to_lowercase()),
             }
-        });
+        };
+        match self.sort {
+            Sort::Name => v.sort_by_cached_key(|&i| name(i)),
+            Sort::Size => v.sort_by_cached_key(|&i| (std::cmp::Reverse(items[i].size), name(i))),
+            Sort::Date => {
+                v.sort_by_cached_key(|&i| (items[i].captured.map(|t| t.to_rfc3339()), name(i)))
+            }
+            Sort::Result => v.sort_by_cached_key(|&i| (badness(items[i].outcome), name(i))),
+        }
         if self.reversed {
             v.reverse();
         }
@@ -454,7 +450,7 @@ impl ResultsScreen {
                 width: w,
                 height: 1,
             });
-            x += w + 1;
+            x += w;
             spans.push(Span::styled(
                 text,
                 if fl == self.filter {
@@ -463,7 +459,6 @@ impl ResultsScreen {
                     theme.dim()
                 },
             ));
-            spans.push(Span::raw(" "));
         }
         f.render_widget(Paragraph::new(Line::from(spans)), tabs);
 
@@ -498,12 +493,7 @@ impl ResultsScreen {
             ))),
             colhead,
         );
-        let rows: Vec<Line<'static>> = self
-            .view
-            .iter()
-            .map(|&i| item_row(&self.data, i, w, theme))
-            .collect();
-        let off = if rows.is_empty() {
+        let off = if self.view.is_empty() {
             let msg = if self.data.items.is_empty() {
                 "No files were recovered."
             } else {
@@ -512,7 +502,15 @@ impl ResultsScreen {
             f.render_widget(Paragraph::new(Span::styled(msg, theme.dim())), rows_area);
             0
         } else {
-            render_list(f, rows_area, &rows, &self.nav, theme, true)
+            render_list_lazy(
+                f,
+                rows_area,
+                self.view.len(),
+                |n| item_row(&self.data, self.view[n], w, theme),
+                &self.nav,
+                theme,
+                true,
+            )
         };
         // The details.
         let block = theme.block(" Details ");
@@ -567,10 +565,12 @@ fn display_name(data: &ResultsData, i: usize) -> String {
             // A file that needed no repair, or could not be repaired, stays
             // where it is.
             Some(p) if data.is_input[i] => p.display().to_string(),
-            _ => "(not written)".to_string(),
+            _ => NOT_WRITTEN.to_string(),
         },
     }
 }
+
+const NOT_WRITTEN: &str = "(not written)";
 
 /// The outcome in few letters, for the table.
 fn short_outcome(o: Outcome) -> &'static str {
@@ -761,14 +761,22 @@ pub fn detail_lines(
             Some(theme.warn()),
         ));
     }
-    for (n, note) in it.notes.iter().enumerate() {
-        v.extend(kv(
-            if n == 0 { "Notes" } else { "" },
-            note,
-            width,
-            theme,
-            None,
-        ));
+    // Repair steps, the reference that was used, and other notes.
+    let mut first = [true; 3];
+    for note in &it.notes {
+        let (slot, label, text) = if let Some(t) = note.strip_prefix("repair: ") {
+            (0, "Repair steps", t.to_string())
+        } else if note.starts_with("used ") && note.contains(" as the reference") {
+            (1, "Reference", plain_words(note))
+        } else {
+            (2, "Notes", plain_words(note))
+        };
+        let label = if std::mem::take(&mut first[slot]) {
+            label
+        } else {
+            ""
+        };
+        v.extend(kv(label, &text, width, theme, None));
     }
     v
 }
@@ -987,5 +995,196 @@ impl DonorScreen {
         )));
         let off = render_list(f, list, &rows, &self.nav, theme, true);
         (list, off)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use diskrescue_core::media::MediaMeta;
+    use diskrescue_recover::report::{FileRecord, Origin};
+
+    fn record(
+        report: &mut Report,
+        name: &str,
+        format: &str,
+        category: MediaCategory,
+        outcome: Outcome,
+        model: Option<&str>,
+        dims: Option<(u32, u32)>,
+    ) {
+        let mut f = FileRecord::new(
+            Origin::Filesystem {
+                volume: 1,
+                fs: diskrescue_core::fs::FsKind::Fat32,
+                path: name.to_string(),
+                deleted: false,
+                confidence: diskrescue_core::fs::EntryConfidence::Allocated,
+            },
+            category,
+            100,
+        );
+        // A duplicate is not written again.
+        f.output = (outcome != Outcome::Duplicate).then(|| PathBuf::from(format!("files/{name}")));
+        f.format = Some(format.to_string());
+        f.outcome = outcome;
+        f.meta = MediaMeta {
+            make: model.map(|_| "Canon".to_string()),
+            model: model.map(str::to_string),
+            width: dims.map(|d| d.0),
+            height: dims.map(|d| d.1),
+            ..MediaMeta::default()
+        };
+        report.add_file(f);
+    }
+
+    fn data() -> ResultsData {
+        let mut r = Report::new(None);
+        record(
+            &mut r,
+            "broken.jpg",
+            "jpeg",
+            MediaCategory::Photo,
+            Outcome::Damaged,
+            Some("EOS 80D"),
+            Some((640, 480)),
+        );
+        record(
+            &mut r,
+            "clip.mp4",
+            "mp4",
+            MediaCategory::Video,
+            Outcome::Recovered,
+            None,
+            None,
+        );
+        record(
+            &mut r,
+            "other_cam.jpg",
+            "jpeg",
+            MediaCategory::Photo,
+            Outcome::Recovered,
+            Some("Pixel"),
+            Some((640, 480)),
+        );
+        record(
+            &mut r,
+            "same_cam.jpg",
+            "jpeg",
+            MediaCategory::Photo,
+            Outcome::Recovered,
+            Some("EOS 80D"),
+            Some((640, 480)),
+        );
+        record(
+            &mut r,
+            "also_broken.jpg",
+            "jpeg",
+            MediaCategory::Photo,
+            Outcome::Damaged,
+            Some("EOS 80D"),
+            Some((640, 480)),
+        );
+        record(
+            &mut r,
+            "dup.jpg",
+            "jpeg",
+            MediaCategory::Photo,
+            Outcome::Duplicate,
+            Some("EOS 80D"),
+            Some((640, 480)),
+        );
+        ResultsData::new(PathBuf::from("/out"), Arc::new(r))
+    }
+
+    #[test]
+    fn references_are_ranked_by_format_then_camera_then_size() {
+        let d = data();
+        let ranked = rank_donors(&d, 0);
+        let names: Vec<String> = ranked
+            .iter()
+            .map(|x| x.path.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        // Only healthy files qualify; the same camera comes first, the
+        // video of another format last.
+        assert_eq!(names, vec!["same_cam.jpg", "other_cam.jpg", "clip.mp4"]);
+        assert!(ranked[0].same_format && ranked[1].same_format && !ranked[2].same_format);
+        assert!(ranked[0].note.contains("same camera"), "{}", ranked[0].note);
+        assert!(ranked[0].note.contains("same picture size"));
+        assert!(ranked[2].note.contains("different format (mp4)"));
+        // A video asks for videos first.
+        let ranked = rank_donors(&d, 1);
+        assert!(ranked
+            .iter()
+            .all(|x| x.path.extension().is_some_and(|e| e == "jpg")));
+    }
+
+    #[test]
+    fn filters_and_sorting_work_on_the_items() {
+        let d = Arc::new(data());
+        let mut s = ResultsScreen::new(d, "/out");
+        assert_eq!(s.count(Filter::All), 6);
+        assert_eq!(s.count(Filter::Damaged), 2);
+        assert_eq!(s.count(Filter::Photos), 5);
+        assert_eq!(s.count(Filter::Videos), 1);
+        assert_eq!(s.count(Filter::Deleted), 0);
+        // Files that were not written (duplicates) come last by name.
+        let last = *s.view.last().unwrap();
+        assert_eq!(s.data.items[last].outcome, Outcome::Duplicate);
+        s.set_filter(Filter::Damaged);
+        assert_eq!(s.view.len(), 2);
+        s.set_filter(Filter::All);
+        // Problems first.
+        s.sort = Sort::Result;
+        s.refresh();
+        assert_eq!(s.data.items[s.view[0]].outcome, Outcome::Damaged);
+        assert_eq!(
+            s.data.items[*s.view.last().unwrap()].outcome,
+            Outcome::Duplicate
+        );
+        s.reversed = true;
+        s.refresh();
+        assert_eq!(s.data.items[s.view[0]].outcome, Outcome::Duplicate);
+    }
+
+    #[test]
+    fn a_huge_report_stays_responsive() {
+        let mut r = Report::new(None);
+        for n in 0..60_000 {
+            record(
+                &mut r,
+                &format!("img_{n:06}.jpg"),
+                "jpeg",
+                MediaCategory::Photo,
+                if n % 10 == 0 {
+                    Outcome::Damaged
+                } else {
+                    Outcome::Recovered
+                },
+                Some("EOS 80D"),
+                Some((640, 480)),
+            );
+        }
+        let start = std::time::Instant::now();
+        let data = Arc::new(ResultsData::new(PathBuf::from("/out"), Arc::new(r)));
+        let mut s = ResultsScreen::new(data, "/out");
+        assert_eq!(s.view.len(), 60_000);
+        s.sort = Sort::Date;
+        s.refresh();
+        s.set_filter(Filter::Damaged);
+        assert_eq!(s.view.len(), 6_000);
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 30)).unwrap();
+        for _ in 0..20 {
+            s.nav.move_by(7, s.view.len());
+            term.draw(|f| {
+                s.draw(f, f.area(), &Theme::new(true));
+            })
+            .unwrap();
+        }
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(20),
+            "{:?}",
+            start.elapsed()
+        );
     }
 }

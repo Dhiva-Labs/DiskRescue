@@ -29,8 +29,16 @@ impl Theme {
     /// Colours unless `NO_COLOR` is set (to anything non-empty) or the
     /// terminal is `dumb`.
     pub fn from_env() -> Self {
-        let no_color = std::env::var_os("NO_COLOR").is_some_and(|v| !v.is_empty());
-        let dumb = std::env::var("TERM").is_ok_and(|t| t == "dumb");
+        Theme::from_vars(
+            std::env::var("NO_COLOR").ok().as_deref(),
+            std::env::var("TERM").ok().as_deref(),
+        )
+    }
+
+    /// The theme for these values of `NO_COLOR` and `TERM` (`None`: not set).
+    pub fn from_vars(no_color: Option<&str>, term: Option<&str>) -> Self {
+        let no_color = no_color.is_some_and(|v| !v.is_empty());
+        let dumb = term.is_some_and(|t| t == "dumb");
         Theme::new(!(no_color || dumb))
     }
 
@@ -364,22 +372,41 @@ pub fn render_list(
     theme: &Theme,
     focused: bool,
 ) -> usize {
+    render_list_lazy(
+        f,
+        area,
+        rows.len(),
+        |i| rows[i].clone(),
+        nav,
+        theme,
+        focused,
+    )
+}
+
+/// Like [`render_list`], for lists that may be very long: `row` is only
+/// called for the rows that are visible.
+pub fn render_list_lazy(
+    f: &mut Frame,
+    area: Rect,
+    len: usize,
+    row: impl Fn(usize) -> Line<'static>,
+    nav: &ListNav,
+    theme: &Theme,
+    focused: bool,
+) -> usize {
     let height = area.height as usize;
-    let off = nav.window(height, rows.len());
+    let off = nav.window(height, len);
     let sel_style = if focused {
         theme.selected()
     } else {
         theme.selected_inactive()
     };
-    let visible: Vec<Line<'static>> = rows
-        .iter()
-        .enumerate()
-        .skip(off)
-        .take(height)
-        .map(|(i, l)| {
+    let visible: Vec<Line<'static>> = (off..len.min(off + height))
+        .map(|i| {
+            let l = row(i);
             if i == nav.sel {
                 // Fill the whole row so the highlight is a bar.
-                let mut spans = l.spans.clone();
+                let mut spans = l.spans;
                 let used: usize = spans.iter().map(|s| s.content.chars().count()).sum();
                 if used < area.width as usize {
                     spans.push(Span::raw(" ".repeat(area.width as usize - used)));
@@ -389,7 +416,7 @@ pub fn render_list(
                 }
                 Line::from(spans)
             } else {
-                l.clone()
+                l
             }
         })
         .collect();
@@ -492,6 +519,17 @@ mod tests {
         assert_eq!(nav.sel, 3);
         nav.clamp(2);
         assert_eq!(nav.sel, 1);
+    }
+
+    #[test]
+    fn no_color_and_dumb_terminals_turn_colours_off() {
+        assert!(Theme::from_vars(None, Some("xterm-256color")).color);
+        assert!(Theme::from_vars(None, None).color);
+        assert!(!Theme::from_vars(Some("1"), Some("xterm")).color);
+        assert!(!Theme::from_vars(Some("anything"), None).color);
+        // The convention: an empty NO_COLOR does not count.
+        assert!(Theme::from_vars(Some(""), Some("xterm")).color);
+        assert!(!Theme::from_vars(None, Some("dumb")).color);
     }
 
     #[test]

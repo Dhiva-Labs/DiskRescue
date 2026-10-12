@@ -55,6 +55,7 @@ pub fn keys_for(id: ScreenId) -> Vec<(&'static str, &'static str)> {
             ("Up Down  j k", "move through the list"),
             ("Enter", "open the selection"),
             ("r", "look for devices again"),
+            ("d", "read the partition table and health of the drive"),
             ("i", "open an image file"),
             ("f", "repair or check files"),
             ("p", "open previous results"),

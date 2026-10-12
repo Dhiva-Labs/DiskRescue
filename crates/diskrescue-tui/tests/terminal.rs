@@ -42,6 +42,7 @@ struct Session {
     child: std::process::Child,
     output: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
     master: std::fs::File,
+    _home: tempfile::TempDir,
 }
 
 fn start(hooks: &str, cols: u16, rows: u16) -> Session {
@@ -58,7 +59,6 @@ fn start(hooks: &str, cols: u16, rows: u16) -> Session {
         .stderr(dup(&pty.slave))
         .spawn()
         .expect("cannot run diskrescue-tui");
-    std::mem::forget(home);
     drop(pty.slave);
     let output = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     let sink = output.clone();
@@ -76,6 +76,7 @@ fn start(hooks: &str, cols: u16, rows: u16) -> Session {
         child,
         output,
         master: pty.master,
+        _home: home,
     }
 }
 

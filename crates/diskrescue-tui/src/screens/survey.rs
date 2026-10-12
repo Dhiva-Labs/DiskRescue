@@ -14,7 +14,9 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use ratatui::Frame;
 
-use crate::widgets::{ellipsize_start, fit, fit_right, render_list, wrap_words, ListNav, Theme};
+use crate::widgets::{
+    ellipsize_start, fit, fit_right, render_list_lazy, wrap_words, ListNav, Theme,
+};
 
 /// What the screen wants the app to do.
 #[derive(Debug, Clone)]
@@ -193,51 +195,44 @@ impl ScanScreen {
             tabs,
         );
         let w = list.width as usize;
-        let rows: Vec<Line<'static>> = if self.tab == 0 {
-            self.sorted
-                .iter()
-                .map(|&i| {
-                    let f = &s.files[i];
-                    let state = entry_state_label(f.confidence, f.deleted);
-                    Line::from(vec![
-                        Span::styled(
-                            format!("{} ", fit(state, 17)),
-                            if f.deleted {
-                                theme.warn()
-                            } else {
-                                theme.good()
-                            },
-                        ),
-                        Span::raw(format!(
-                            "{} {} ",
-                            fit_right(&bytes(f.size), 9),
-                            fit(&date_text(f.modified), 16)
-                        )),
-                        Span::raw(ellipsize_start(
-                            &format!("vol{}:/{}", f.volume, f.path),
-                            w.saturating_sub(46),
-                        )),
-                    ])
-                })
-                .collect()
-        } else {
-            s.carved
-                .iter()
-                .map(|c| {
-                    Line::from(vec![
-                        Span::raw(format!(
-                            "{} {} {} {} ",
-                            fit(&c.format, 8),
-                            fit_right(&bytes(c.len), 9),
-                            fit(extent_label(c.status), 14),
-                            fit(&date_text(c.created), 16)
-                        )),
-                        Span::styled(format!("at offset {:#x}", c.offset), theme.dim()),
-                    ])
-                })
-                .collect()
+        let row_count = self.len();
+        let fs_row = |n: usize| -> Line<'static> {
+            let f = &s.files[self.sorted[n]];
+            let state = entry_state_label(f.confidence, f.deleted);
+            Line::from(vec![
+                Span::styled(
+                    format!("{} ", fit(state, 17)),
+                    if f.deleted {
+                        theme.warn()
+                    } else {
+                        theme.good()
+                    },
+                ),
+                Span::raw(format!(
+                    "{} {} ",
+                    fit_right(&bytes(f.size), 9),
+                    fit(&date_text(f.modified), 16)
+                )),
+                Span::raw(ellipsize_start(
+                    &format!("vol{}:/{}", f.volume, f.path),
+                    w.saturating_sub(46),
+                )),
+            ])
         };
-        let off = if rows.is_empty() {
+        let raw_row = |n: usize| -> Line<'static> {
+            let c = &s.carved[n];
+            Line::from(vec![
+                Span::raw(format!(
+                    "{} {} {} {} ",
+                    fit(&c.format, 8),
+                    fit_right(&bytes(c.len), 9),
+                    fit(extent_label(c.status), 14),
+                    fit(&date_text(c.created), 16)
+                )),
+                Span::styled(format!("at offset {:#x}", c.offset), theme.dim()),
+            ])
+        };
+        let off = if row_count == 0 {
             let msg = if self.tab == 1 {
                 "The raw data was not searched, or nothing was found there. Choose 'Search the raw data' under More options to look."
             } else {
@@ -254,7 +249,11 @@ impl ScanScreen {
             );
             0
         } else {
-            render_list(f, list, &rows, &self.nav, theme, true)
+            if self.tab == 0 {
+                render_list_lazy(f, list, row_count, fs_row, &self.nav, theme, true)
+            } else {
+                render_list_lazy(f, list, row_count, raw_row, &self.nav, theme, true)
+            }
         };
         (list, off)
     }
@@ -363,33 +362,30 @@ impl VerifyScreen {
             head,
         );
         let w = list.width as usize;
-        let rows: Vec<Line<'static>> = self
-            .results
-            .iter()
-            .map(|r| {
-                let (verdict, bad) = verify_verdict(r);
-                let st = if bad { theme.bad() } else { theme.good() };
-                Line::from(vec![
-                    Span::styled(
-                        format!(
-                            "{} {} ",
-                            theme.tone_mark(if bad {
-                                text::Tone::Bad
-                            } else {
-                                text::Tone::Good
-                            }),
-                            fit(verdict, 12)
-                        ),
-                        st,
+        let row = |n: usize| -> Line<'static> {
+            let r = &self.results[n];
+            let (verdict, bad) = verify_verdict(r);
+            let st = if bad { theme.bad() } else { theme.good() };
+            Line::from(vec![
+                Span::styled(
+                    format!(
+                        "{} {} ",
+                        theme.tone_mark(if bad {
+                            text::Tone::Bad
+                        } else {
+                            text::Tone::Good
+                        }),
+                        fit(verdict, 12)
                     ),
-                    Span::raw(ellipsize_start(
-                        &r.path.display().to_string(),
-                        w.saturating_sub(16),
-                    )),
-                ])
-            })
-            .collect();
-        let off = render_list(f, list, &rows, &self.nav, theme, true);
+                    st,
+                ),
+                Span::raw(ellipsize_start(
+                    &r.path.display().to_string(),
+                    w.saturating_sub(16),
+                )),
+            ])
+        };
+        let off = render_list_lazy(f, list, self.results.len(), row, &self.nav, theme, true);
         let mut lines: Vec<Line<'static>> = Vec::new();
         if let Some(r) = self.results.get(self.nav.sel) {
             if let Some(e) = &r.error {

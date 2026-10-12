@@ -1051,11 +1051,15 @@ impl Form {
         if let Some(t) = &self.target {
             head.push(Line::from(vec![
                 Span::styled("Source: ", theme.dim()),
-                Span::raw(format!(
-                    "{} - {}",
-                    t.info.path.display(),
-                    diskrescue_app::devices::device_label(&t.info)
-                )),
+                Span::raw(if t.is_image() {
+                    ellipsize_start(&t.info.path.display().to_string(), width.saturating_sub(9))
+                } else {
+                    format!(
+                        "{} - {}",
+                        t.info.path.display(),
+                        diskrescue_app::devices::device_label(&t.info)
+                    )
+                }),
             ]));
         } else if !self.files.is_empty() {
             head.push(Line::from(vec![

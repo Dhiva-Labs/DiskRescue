@@ -115,7 +115,7 @@ fn an_output_that_is_the_source_is_refused_with_advice() {
     assert!(app.run().is_none());
     press(&mut app, KeyCode::Esc);
     assert_eq!(app.screen_id(), ScreenId::Form);
-    contains_all(&render(&app, 100, 30), &[&img.display().to_string()[..20]]);
+    contains_all(&render(&app, 100, 30), &["sd_card.img"]);
 }
 
 #[test]

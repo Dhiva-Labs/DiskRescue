@@ -3,7 +3,6 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::time::{Duration, Instant};
 
 use crossterm::event::{KeyCode, KeyEvent};
 use diskrescue_app::devices::{self, DeviceDetails};
@@ -77,13 +76,10 @@ pub struct Home {
     /// What is known about each device.
     pub details: HashMap<PathBuf, Detail>,
     jobs: Vec<(PathBuf, Pending<Result<DeviceDetails, String>>)>,
-    wanted: Option<(PathBuf, Instant)>,
     /// Scroll of the detail pane.
     pub detail_scroll: u16,
     fixed: bool,
 }
-
-const DETAIL_DELAY: Duration = Duration::from_millis(300);
 
 impl Home {
     /// The home screen; the list of devices is read in the background.
@@ -95,7 +91,6 @@ impl Home {
             nav: ListNav::new(),
             details: HashMap::new(),
             jobs: Vec::new(),
-            wanted: None,
             detail_scroll: 0,
             fixed: matches!(cfg.devices, DeviceSource::Fixed(_)),
         };
@@ -107,7 +102,6 @@ impl Home {
     pub fn refresh(&mut self, cfg: &Config) {
         self.details.clear();
         self.jobs.clear();
-        self.wanted = None;
         match &cfg.devices {
             DeviceSource::Fixed(list) => {
                 self.entries = list
@@ -191,7 +185,14 @@ impl Home {
         for (i, path, r) in done.into_iter().rev() {
             self.jobs.remove(i);
             let d = match r {
-                Ok(Ok(d)) => Detail::Ready(Box::new(d)),
+                Ok(Ok(d)) => {
+                    // What the drive says about itself may change how it is described.
+                    if let Some(e) = self.entries.iter_mut().find(|e| e.info.path == path) {
+                        e.info.health = d.health.clone();
+                        e.failing = crate::model::is_failing(&e.info);
+                    }
+                    Detail::Ready(Box::new(d))
+                }
                 Ok(Err(e)) | Err(e) => Detail::Failed(e),
             };
             self.details.insert(path, d);
@@ -199,47 +200,51 @@ impl Home {
         self.load_wanted(cfg, false);
     }
 
-    fn load_wanted(&mut self, cfg: &Config, now: bool) {
+    /// With a fixed list (tests) every device is described from what is
+    /// already known; nothing is opened.
+    fn load_wanted(&mut self, _cfg: &Config, _now: bool) {
+        if !self.fixed {
+            return;
+        }
         let Some(entry) = self.selected_device().cloned() else {
-            self.wanted = None;
             return;
         };
         let path = entry.info.path.clone();
         if self.details.contains_key(&path) {
             return;
         }
-        if self.fixed {
-            // Tests never open a device: describe it from what is known.
-            let d = DeviceDetails {
-                health: entry.info.health.clone(),
-                mapfile: None,
-                map_stats: None,
-                table: None,
-                volumes: Vec::new(),
-                notes: Vec::new(),
-                open_error: None,
-                profile: diskrescue_core::profile::ImagingProfile::for_kind(entry.info.kind),
-                info: entry.info,
-            };
-            self.details.insert(path, Detail::Ready(Box::new(d)));
-            return;
+        let d = DeviceDetails {
+            health: entry.info.health.clone(),
+            mapfile: None,
+            map_stats: None,
+            table: None,
+            volumes: Vec::new(),
+            notes: Vec::new(),
+            open_error: None,
+            profile: diskrescue_core::profile::ImagingProfile::for_kind(entry.info.kind),
+            info: entry.info,
+        };
+        self.details.insert(path, Detail::Ready(Box::new(d)));
+    }
+
+    /// Read the partition table of the selected device and ask it for its
+    /// health. Only on request: a failing drive should not be read more
+    /// than it has to be.
+    pub fn look_closer(&mut self) -> bool {
+        let Some(entry) = self.selected_device() else {
+            return false;
+        };
+        let path = entry.info.path.clone();
+        if self.fixed || self.details.contains_key(&path) {
+            return false;
         }
-        match &self.wanted {
-            Some((p, _)) if *p == path => {}
-            _ => self.wanted = Some((path.clone(), Instant::now())),
-        }
-        let waited = self.wanted.as_ref().map(|(_, t)| t.elapsed());
-        if now || waited.is_some_and(|w| w >= DETAIL_DELAY) {
-            self.details.insert(path.clone(), Detail::Loading);
-            let p = path.clone();
-            self.jobs.push((
-                path,
-                Pending::spawn(move || {
-                    devices::details(&p, None).map_err(|e| e.message().to_string())
-                }),
-            ));
-        }
-        let _ = cfg;
+        self.details.insert(path.clone(), Detail::Loading);
+        let p = path.clone();
+        self.jobs.push((
+            path,
+            Pending::spawn(move || devices::details(&p, None).map_err(|e| e.message().to_string())),
+        ));
+        true
     }
 
     /// Handle a key.
@@ -278,6 +283,15 @@ impl Home {
             KeyCode::Char('r') => {
                 self.refresh(cfg);
                 return HomeAction::Status("Looking for devices again...".into());
+            }
+            KeyCode::Char('d') => {
+                return if self.look_closer() {
+                    HomeAction::Status(
+                        "Reading the partition table and asking the drive for its health...".into(),
+                    )
+                } else {
+                    HomeAction::None
+                };
             }
             KeyCode::Char('i') => return HomeAction::Open(HomeItem::OpenImage),
             KeyCode::Char('f') => return HomeAction::Open(HomeItem::RepairFiles),
@@ -654,7 +668,16 @@ impl Home {
                     }
                 }
             }
-            None => {}
+            None => {
+                if !self.fixed {
+                    for l in wrap_words(
+                        "Not read yet. Press d to read its partition table and ask the drive for its health. Skip this for a drive that clicks or is very slow: Rescue reads it as gently as possible.",
+                        w.saturating_sub(2),
+                    ) {
+                        v.push(Line::from(Span::styled(format!("  {l}"), theme.dim())));
+                    }
+                }
+            }
         }
     }
 }

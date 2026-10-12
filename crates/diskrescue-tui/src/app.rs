@@ -1191,7 +1191,7 @@ impl App {
     fn title(&self) -> String {
         match &self.screen {
             Screen::Home => "Home".into(),
-            Screen::Menu(m) => format!("{}", m.target.info.path.display()),
+            Screen::Menu(m) => crate::model::short_path(&m.target.info.path),
             Screen::Form(f) => f.kind.title().to_string(),
             Screen::Pick(_) => "Choose".into(),
             Screen::Preflight(_) => "Safety check".into(),
@@ -1209,19 +1209,22 @@ impl App {
 
     fn draw_header(&self, f: &mut Frame, area: Rect, theme: &Theme) {
         let right = if self.cfg.is_root {
-            "running as administrator"
+            "running as administrator "
         } else {
-            "normal user"
+            "normal user "
         };
-        let left = format!(" DiskRescue  >  {}", self.title());
-        let pad =
-            (area.width as usize).saturating_sub(left.chars().count() + right.chars().count() + 2);
+        let title = crate::widgets::ellipsize_end(
+            &self.title(),
+            (area.width as usize).saturating_sub(right.chars().count() + 14),
+        );
+        let left_len = " DiskRescue ".chars().count() + 1 + title.chars().count();
+        let pad = (area.width as usize).saturating_sub(left_len + right.chars().count());
         let line = Line::from(vec![
             Span::styled(" DiskRescue ", theme.key()),
-            Span::styled(format!(" {}", self.title()), theme.bold()),
-            Span::raw(" ".repeat(pad.saturating_sub(10))),
+            Span::styled(format!(" {title}"), theme.bold()),
+            Span::raw(" ".repeat(pad)),
             Span::styled(
-                format!("{right} "),
+                right,
                 if self.cfg.is_root {
                     theme.warn()
                 } else {

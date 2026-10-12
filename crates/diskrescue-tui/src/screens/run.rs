@@ -108,6 +108,8 @@ pub struct Run {
     pub privileged: bool,
     /// When it started.
     pub started: Instant,
+    /// How long it took, once it has ended.
+    pub ended: Option<Duration>,
     /// The person asked to stop.
     pub stop_requested: bool,
     /// Step 1 ended; the same job continues as step 2.
@@ -203,6 +205,7 @@ impl Run {
             output,
             privileged,
             started: Instant::now(),
+            ended: None,
             stop_requested: false,
             notice: None,
             carve,
@@ -301,6 +304,7 @@ impl Run {
             return;
         }
         self.outcome = outcome;
+        self.ended = Some(self.started.elapsed());
     }
 
     /// Where Enter leads once the job has ended.
@@ -683,7 +687,6 @@ impl Run {
     fn draw_progress(&self, f: &mut Frame, area: Rect, theme: &Theme, v: ProgressView<'_>) {
         let width = area.width as usize;
         let steps = v.steps(self.carve, self.repair);
-        let steps_h = steps.len() as u16 + 2;
         let volumes: Vec<String> = v
             .pipeline
             .volumes
@@ -696,21 +699,18 @@ impl Run {
                     .to_string()
             })
             .collect();
-        let vol_h = if volumes.is_empty() {
-            0
-        } else {
-            (volumes.len().min(3) + 2) as u16
-        };
+        let vol_rows = volumes.len().min(2) as u16;
+        let carve_row = u16::from(v.pipeline.carve.is_some() && !v.finished);
         let [head, steps_a, counts, vols, recent] = Layout::vertical([
             Constraint::Length(2),
-            Constraint::Length(steps_h.min(area.height.saturating_sub(8))),
-            Constraint::Length(3),
-            Constraint::Length(vol_h),
-            Constraint::Min(2),
+            Constraint::Length(steps.len() as u16),
+            Constraint::Length(1 + carve_row),
+            Constraint::Length(vol_rows),
+            Constraint::Min(3),
         ])
         .areas(area);
-        // Heading: what and for how long.
-        let elapsed = duration(self.started.elapsed());
+        // Heading: what, and for how long.
+        let elapsed = duration(self.ended.unwrap_or_else(|| self.started.elapsed()));
         f.render_widget(
             Paragraph::new(vec![
                 Line::from(vec![
@@ -725,67 +725,68 @@ impl Run {
             head,
         );
         // The steps as a checklist; the current one has a bar.
-        let block = theme.block(" Steps ");
-        let inner = block.inner(steps_a);
-        f.render_widget(block, steps_a);
         for (i, st) in steps.iter().enumerate() {
-            if i as u16 >= inner.height {
+            if i as u16 >= steps_a.height {
                 break;
             }
             let row = Rect {
-                y: inner.y + i as u16,
+                y: steps_a.y + i as u16,
                 height: 1,
-                ..inner
+                ..steps_a
             };
             draw_step(f, row, st, theme);
         }
         // Counters.
         let c = &v.pipeline.counts;
-        let counters = vec![
-            Line::from(vec![
-                Span::styled("recovered ", theme.dim()),
-                Span::styled(
-                    format!("{}", c.recovered + c.recovered_unverified),
-                    theme.good(),
-                ),
-                Span::styled("   damaged ", theme.dim()),
-                Span::styled(format!("{}", c.damaged + c.failed), theme.bad()),
-                Span::styled("   repaired ", theme.dim()),
-                Span::styled(
-                    format!("{}", c.repaired + c.partially_repaired),
-                    theme.good(),
-                ),
-                Span::styled("   duplicates ", theme.dim()),
-                Span::raw(format!("{}", c.duplicate)),
-            ]),
-            Line::from(match &v.pipeline.carve {
-                Some(cv) => Span::styled(
+        let mut counters = vec![Line::from(vec![
+            Span::styled(" found so far:  recovered ", theme.dim()),
+            Span::styled(
+                format!("{}", c.recovered + c.recovered_unverified),
+                theme.good(),
+            ),
+            Span::styled("   damaged ", theme.dim()),
+            Span::styled(format!("{}", c.damaged + c.failed), theme.bad()),
+            Span::styled("   repaired ", theme.dim()),
+            Span::styled(
+                format!("{}", c.repaired + c.partially_repaired),
+                theme.good(),
+            ),
+            Span::styled("   duplicates ", theme.dim()),
+            Span::raw(format!("{}", c.duplicate)),
+        ])];
+        if carve_row > 0 {
+            if let Some(cv) = &v.pipeline.carve {
+                counters.push(Line::from(Span::styled(
                     format!(
-                        "raw data search: {} of {} read, {} found",
+                        " raw data search: {} of {} read, {} found",
                         bytes(cv.scanned),
                         bytes(cv.total),
                         plural(cv.files, "file", "files")
                     ),
                     theme.dim(),
-                ),
-                None => Span::styled("", theme.dim()),
-            }),
-        ];
-        let cb = theme.block(" Found so far ");
-        let ci = cb.inner(counts);
-        f.render_widget(cb, counts);
-        f.render_widget(Paragraph::new(counters), ci);
+                )));
+            }
+        }
+        f.render_widget(Paragraph::new(counters), counts);
         // Volumes.
-        if vol_h > 0 {
-            let vb = theme.block(format!(" Volumes found ({}) ", volumes.len()));
-            let vi = vb.inner(vols);
-            f.render_widget(vb, vols);
-            let lines: Vec<Line<'static>> = volumes
+        if vol_rows > 0 {
+            let mut lines: Vec<Line<'static>> = volumes
                 .iter()
-                .take(3)
-                .map(|l| Line::raw(ellipsize_start(l, vi.width as usize)))
+                .take(2)
+                .map(|l| {
+                    Line::from(Span::styled(
+                        format!(" {}", ellipsize_start(l, width.saturating_sub(2))),
+                        theme.dim(),
+                    ))
+                })
                 .collect();
-            f.render_widget(Paragraph::new(lines), vi);
+            if volumes.len() > 2 {
+                lines[1] = Line::from(Span::styled(
+                    format!(" ... and {} more volumes", volumes.len() - 1),
+                    theme.dim(),
+                ));
+            }
+            f.render_widget(Paragraph::new(lines), vols);
         }
         // Recent files, newest at the bottom.
         let rb = theme.block(" Latest files ");
@@ -879,11 +880,9 @@ fn draw_step(f: &mut Frame, row: Rect, st: &StepRow, theme: &Theme) {
         StepState::Skipped => ("[-]", theme.dim()),
     };
     let w = row.width as usize;
-    let label_w = (w * 55 / 100).max(20).min(w.saturating_sub(10));
-    let label = fit(
-        &ellipsize_end_str(&st.label, label_w.saturating_sub(5)),
-        label_w.saturating_sub(5),
-    );
+    // Room for " [x] ", the label and up to 30 characters of progress.
+    let label_w = w.saturating_sub(35).clamp(24, 46);
+    let label = fit(&ellipsize_end_str(&st.label, label_w), label_w);
     let mut spans = vec![
         Span::styled(format!(" {mark} "), style),
         Span::styled(label, style),
@@ -905,7 +904,7 @@ fn draw_step(f: &mut Frame, row: Rect, st: &StepRow, theme: &Theme) {
                 .map(|s| s.content.chars().count())
                 .sum::<usize>();
             let rest = w.saturating_sub(used);
-            let bar_w = rest.saturating_sub(note.chars().count() + 2).clamp(4, 24);
+            let bar_w = rest.saturating_sub(note.chars().count() + 4).clamp(4, 24);
             let r = ratio.unwrap_or(0.0);
             let filled = ((bar_w as f64) * r).round() as usize;
             let bar = format!(
@@ -994,8 +993,8 @@ fn slot_label(slot: Slot) -> &'static str {
         Slot::Imaging => "Copy the device to an image",
         Slot::Partitions => "Read the partition table",
         Slot::Listing => "Read the file lists",
-        Slot::Extracting => "Copy the files found through the filesystem",
-        Slot::Carving => "Search the raw data for photos and videos",
+        Slot::Extracting => "Copy the files found by name",
+        Slot::Carving => "Search the raw data for lost files",
         Slot::Validating => "Check the files",
         Slot::Repairing => "Repair damaged files",
         Slot::Report => "Write the report",
@@ -1070,7 +1069,12 @@ impl<'a> ProgressView<'a> {
         for &slot in self.slots {
             let latest = stages.iter().rev().find(|s| slot_of(&s.stage) == slot);
             let label = match (slot, latest) {
-                (Slot::Listing, Some(s)) => s.label.clone(),
+                (Slot::Listing, Some(s)) => match &s.stage {
+                    Stage::Listing { volume, fs } => {
+                        format!("Read the file list of volume {volume} ({})", fs.name())
+                    }
+                    _ => slot_label(slot).to_string(),
+                },
                 (Slot::Partitions, Some(s)) if s.total > 0 || s.done > 0 => {
                     stage_progress_label(&s.stage)
                 }

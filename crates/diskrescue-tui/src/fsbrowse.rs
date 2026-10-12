@@ -13,7 +13,7 @@ use ratatui::Frame;
 use diskrescue_app::text::bytes;
 
 use crate::input::{Edit, TextInput};
-use crate::widgets::{ellipsize_start, fit, fit_right, render_list, ListNav, Theme};
+use crate::widgets::{ellipsize_end, ellipsize_start, fit, fit_right, render_list, ListNav, Theme};
 
 /// One entry of a folder.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -565,9 +565,21 @@ impl Picker {
         match r {
             Row::Action => {
                 let ok = self.mode == PickMode::Folder || !self.chosen.is_empty();
-                let label = format!("  >> {}", self.action_label());
+                let label = match self.mode {
+                    PickMode::Folder => {
+                        let lead = "  >> Use this folder: ";
+                        format!(
+                            "{lead}{}",
+                            ellipsize_start(
+                                &self.dir.display().to_string(),
+                                width.saturating_sub(lead.chars().count())
+                            )
+                        )
+                    }
+                    _ => format!("  >> {}", self.action_label()),
+                };
                 Line::from(Span::styled(
-                    ellipsize_start(&label, width),
+                    ellipsize_end(&label, width),
                     if ok { theme.good() } else { theme.dim() },
                 ))
             }
