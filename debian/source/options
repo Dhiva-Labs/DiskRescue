@@ -1,0 +1,11 @@
+# Keep build output, screenshots and VCS data out of the source package;
+# packaging/vendor/ (toolchain + crates) must stay in.
+tar-ignore = "target"
+tar-ignore = "target-*"
+tar-ignore = "docs/screenshots"
+tar-ignore = ".git"
+tar-ignore = ".github"
+tar-ignore = ".claude"
+tar-ignore = "debian/.rust"
+tar-ignore = "debian/.cargo"
+tar-ignore = "debian/.home"

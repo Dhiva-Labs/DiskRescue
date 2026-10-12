@@ -1,0 +1,42 @@
+Source: diskrescue
+Section: utils
+Priority: optional
+Maintainer: Dhiva Labs <dhivakar1010@gmail.com>
+Build-Depends: debhelper-compat (= 13),
+               gcc,
+               libc6-dev,
+               xz-utils
+Standards-Version: 4.6.2
+Homepage: https://github.com/Dhiva-Labs/DiskRescue
+Vcs-Browser: https://github.com/Dhiva-Labs/DiskRescue
+Vcs-Git: https://github.com/Dhiva-Labs/DiskRescue.git
+Rules-Requires-Root: no
+
+Package: diskrescue
+Architecture: amd64
+Depends: ${shlibs:Depends},
+         ${misc:Depends},
+         libgl1,
+         libegl1,
+         libxkbcommon0,
+         libwayland-client0,
+         libwayland-cursor0,
+         libx11-6,
+         libxcursor1,
+         libxrandr2,
+         libxi6,
+         libxkbcommon-x11-0
+Recommends: pkexec | policykit-1,
+            xdg-desktop-portal
+Suggests: smartmontools
+Description: Recover photos and videos from failing drives and repair them
+ DiskRescue gets photos and videos back from hard disks, SSDs, USB drives
+ and SD cards that are failing, have failed, were reformatted or had files
+ deleted. It copies failing drives carefully (resumable, ddrescue
+ compatible), recovers files by name from FAT, exFAT, NTFS and ext4,
+ carves photos and videos from raw space, and repairs damaged JPEG, PNG,
+ MP4/MOV and AVI files, including videos whose index was lost when a
+ camera or phone died while recording.
+ .
+ Three programs share one engine: diskrescue-gui (desktop app),
+ diskrescue-tui (terminal app) and diskrescue (command line).

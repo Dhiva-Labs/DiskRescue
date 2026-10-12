@@ -1,0 +1,23 @@
+Vendored build inputs for the Ubuntu PPA source package
+========================================================
+
+Launchpad's PPA builders have no network access, and the rustc in the Ubuntu
+archive is older than this code needs, so the source package carries:
+
+rustc / cargo / rust-std 1.97.1 (x86_64-unknown-linux-gnu)
+    The official standalone component tarballs from
+    https://static.rust-lang.org/dist/, unmodified. debian/rules runs each
+    one's install.sh into debian/.rust.
+
+crates-<version>.tar.xz
+    `cargo vendor --locked --versioned-dirs vendor` for this workspace, with
+    every crate the Linux build of diskrescue, diskrescue-tui and
+    diskrescue-gui does not use replaced by a stub (its Cargo.toml, an empty
+    src/lib.rs and a .cargo-checksum.json with an empty file list but the
+    original package checksum). Cargo still resolves the whole lockfile, but
+    Windows/macOS/wasm-only crates and dev-dependencies are not shipped.
+
+Regenerate both with packaging/vendor/make-vendor.sh whenever Cargo.lock or
+the toolchain changes. SHA256SUMS lists all four files; debian/rules
+verifies it before building. The tarballs are gitignored but included in the
+source package.

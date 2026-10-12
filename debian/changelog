@@ -1,0 +1,13 @@
+diskrescue (0.1.0~noble1) noble; urgency=medium
+
+  * Initial release.
+  * Careful, resumable copies of failing hard disks, SSDs, USB drives and SD
+    cards with a strategy per device type and ddrescue compatible mapfiles.
+  * Recovery by name of existing and deleted files from FAT, exFAT, NTFS and
+    ext4, including volumes whose boot sectors are destroyed.
+  * Carving of photo, RAW, video and audio formats from raw space.
+  * Repair of JPEG, PNG, MP4/MOV (moov rebuild from a reference clip) and AVI.
+  * Desktop app (diskrescue-gui), terminal app (diskrescue-tui) and command
+    line (diskrescue).
+
+ -- Dhiva Labs <dhivakar1010@gmail.com>  Mon, 12 Oct 2026 21:54:22 +0000

@@ -5,3 +5,16 @@
 /out/
 /*.map
 /.claude/
+
+# PPA build inputs (see packaging/vendor/README)
+packaging/vendor/*.tar.xz
+packaging/vendor/SHA256SUMS
+/vendor
+/debian/.rust
+/debian/.cargo
+/debian/.home
+/debian/diskrescue/
+/debian/files
+/debian/*.substvars
+/debian/*.debhelper*
+/debian/debhelper-build-stamp

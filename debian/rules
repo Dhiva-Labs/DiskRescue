@@ -1,0 +1,59 @@
+#!/usr/bin/make -f
+
+# Launchpad's PPA builders have no network access and Ubuntu's own rustc is
+# older than this code needs, so a pinned Rust toolchain and every crate
+# Cargo.lock resolves to are vendored under packaging/vendor/ (see
+# packaging/vendor/README) and unpacked into build-scoped directories.
+RUST_VERSION := 1.97.1
+RUST_TRIPLE := x86_64-unknown-linux-gnu
+VENDOR := $(CURDIR)/packaging/vendor
+RUST_ROOT := $(CURDIR)/debian/.rust
+VERSION := $(shell sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+
+export HOME := $(CURDIR)/debian/.home
+export CARGO_HOME := $(CURDIR)/debian/.cargo
+export CARGO_TARGET_DIR := $(CURDIR)/target
+export PATH := $(RUST_ROOT)/bin:$(PATH)
+export CARGO_TERM_COLOR := never
+# Reproducible paths in panics/debug info.
+export RUSTFLAGS := --remap-path-prefix=$(CURDIR)=/build/diskrescue
+
+%:
+	dh $@
+
+override_dh_auto_configure:
+	mkdir -p $(HOME) $(CARGO_HOME)
+	cd $(VENDOR) && sha256sum -c SHA256SUMS
+	if [ ! -x "$(RUST_ROOT)/bin/cargo" ]; then \
+		set -e; tmp=$$(mktemp -d); \
+		for c in rustc cargo rust-std; do \
+			tar --no-same-owner -xJf $(VENDOR)/$$c-$(RUST_VERSION)-$(RUST_TRIPLE).tar.xz -C $$tmp; \
+			$$tmp/$$c-$(RUST_VERSION)-$(RUST_TRIPLE)/install.sh \
+				--prefix=$(RUST_ROOT) --disable-ldconfig --without=rust-docs >/dev/null; \
+		done; \
+		rm -rf $$tmp; \
+	fi
+	if [ ! -d "$(CURDIR)/vendor" ]; then \
+		tar --no-same-owner -xJf $(VENDOR)/crates-$(VERSION).tar.xz -C $(CURDIR); \
+	fi
+	printf '[source.crates-io]\nreplace-with = "vendored"\n[source.vendored]\ndirectory = "%s/vendor"\n[net]\noffline = true\n' \
+		"$(CURDIR)" > $(CARGO_HOME)/config.toml
+
+override_dh_auto_build:
+	cargo build --release --frozen --offline -p diskrescue -p diskrescue-tui -p diskrescue-gui
+
+# The test suite runs in upstream CI; it needs system tools (mkfs.*, ffmpeg,
+# Pillow) and dev-dependencies that are not vendored.
+override_dh_auto_test:
+
+override_dh_auto_install:
+	install -Dm755 target/release/diskrescue debian/diskrescue/usr/bin/diskrescue
+	install -Dm755 target/release/diskrescue-tui debian/diskrescue/usr/bin/diskrescue-tui
+	install -Dm755 target/release/diskrescue-gui debian/diskrescue/usr/bin/diskrescue-gui
+	install -Dm644 packaging/linux/diskrescue.desktop \
+		debian/diskrescue/usr/share/applications/diskrescue.desktop
+	install -Dm644 packaging/linux/diskrescue.svg \
+		debian/diskrescue/usr/share/icons/hicolor/scalable/apps/diskrescue.svg
+
+override_dh_auto_clean:
+	rm -rf target vendor debian/.rust debian/.cargo debian/.home

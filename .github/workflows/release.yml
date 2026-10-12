@@ -9,39 +9,45 @@ permissions:
 
 jobs:
   release:
-    name: build static binary + GitHub release
-    runs-on: ubuntu-latest
+    name: build binaries + .deb + GitHub release
+    # The desktop app links against the system glibc: build on the oldest
+    # Ubuntu the packages support.
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - name: Install toolchain (rust-toolchain.toml)
         run: rustup show
-      - name: musl tools
-        run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - name: build dependencies
+        run: sudo apt-get update && sudo apt-get install -y musl-tools libxkbcommon-dev libgtk-3-dev libwayland-dev dpkg-dev
       - uses: Swatinem/rust-cache@v2
         with:
-          key: musl-release
-      - name: GUI build dependencies
-        run: sudo apt-get install -y libxkbcommon-dev libgtk-3-dev libwayland-dev
+          key: release
       - name: build
         run: |
           cargo build --release --target x86_64-unknown-linux-musl -p diskrescue -p diskrescue-tui
           cargo build --release -p diskrescue-gui
       - name: package
         run: |
-          BIN=target/x86_64-unknown-linux-musl/release/diskrescue
-          ldd "$BIN" 2>&1 | grep -qE "statically linked|not a dynamic executable" || { echo "binary is not static"; exit 1; }
+          VERSION=${GITHUB_REF_NAME#v}
+          CLI=target/x86_64-unknown-linux-musl/release/diskrescue
+          TUI=target/x86_64-unknown-linux-musl/release/diskrescue-tui
+          GUI=target/release/diskrescue-gui
+          for b in "$CLI" "$TUI"; do
+            # ldd wording differs: "not a dynamic executable" vs "statically linked".
+            ldd "$b" 2>&1 | grep -qE "statically linked|not a dynamic executable" || { echo "$b is not static"; exit 1; }
+          done
           NAME=diskrescue-${GITHUB_REF_NAME}-x86_64-linux
           mkdir "$NAME"
-          cp "$BIN" target/x86_64-unknown-linux-musl/release/diskrescue-tui \
-            target/release/diskrescue-gui packaging/linux/diskrescue.desktop \
-            packaging/linux/diskrescue.svg LICENSE README.md docs/USAGE.md "$NAME/"
+          cp "$CLI" "$TUI" "$GUI" packaging/linux/diskrescue.desktop packaging/linux/diskrescue.svg \
+            LICENSE README.md docs/USAGE.md "$NAME/"
           tar czf "$NAME.tar.gz" "$NAME"
-          sha256sum "$NAME.tar.gz" > "$NAME.tar.gz.sha256"
+          packaging/deb/build-deb.sh "$VERSION" "$CLI" "$TUI" "$GUI" .
+          sha256sum "$NAME.tar.gz" "diskrescue_${VERSION}_amd64.deb" > SHA256SUMS
       - name: release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "$GITHUB_REF_NAME" \
-            --title "DiskRescue $GITHUB_REF_NAME" \
-            --generate-notes \
-            diskrescue-*.tar.gz diskrescue-*.tar.gz.sha256
+          NOTES=".github/release-notes/${GITHUB_REF_NAME}.md"
+          if [ -f "$NOTES" ]; then set -- --notes-file "$NOTES"; else set -- --generate-notes; fi
+          gh release create "$GITHUB_REF_NAME" --title "DiskRescue $GITHUB_REF_NAME" "$@" \
+            diskrescue-*.tar.gz diskrescue_*_amd64.deb SHA256SUMS
