@@ -11,7 +11,10 @@ env:
 jobs:
   lint-test:
     name: fmt + clippy + test
-    runs-on: ubuntu-latest
+    # The test suite builds fixtures with the system's own tools and checks
+    # them against those tools (exfatprogs >= 1.2.3, ffmpeg with HEIF, recent
+    # Pillow), which Ubuntu 26.04 provides.
+    runs-on: ubuntu-26.04
     steps:
       - uses: actions/checkout@v4
       - name: Install toolchain (rust-toolchain.toml)
@@ -21,6 +24,9 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y dosfstools exfatprogs ntfs-3g e2fsprogs ffmpeg python3-pil \
             libxkbcommon-dev libgtk-3-dev libwayland-dev mesa-vulkan-drivers
+          # Tests mount NTFS images as a normal user (create/delete files
+          # through ntfs-3g), which needs the setuid helper.
+          sudo chmod u+s "$(command -v ntfs-3g)"
       - uses: Swatinem/rust-cache@v2
       - name: rustfmt
         run: cargo fmt --all -- --check

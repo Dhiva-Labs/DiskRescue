@@ -412,7 +412,7 @@ pub(crate) fn build(spec: &FsSpec, out: &Path) -> Result<BuildReport> {
     drop(f);
     let path = out.to_string_lossy().into_owned();
     let cs;
-    let mut args = vec!["-q", "-s", "512"];
+    let mut args: Vec<&str> = Vec::new();
     if let Some(c) = spec.cluster_size {
         if c < 512 || !c.is_power_of_two() || c > 32 << 20 {
             return Err(FixtureError::invalid(format!("bad exFAT cluster size {c}")));
@@ -433,7 +433,17 @@ pub(crate) fn build(spec: &FsSpec, out: &Path) -> Result<BuildReport> {
         args.push(&lab);
     }
     args.push(&path);
-    tools::run("mkfs.exfat", &args)?;
+    // `-q` and `-s` (sector size) appeared in exfatprogs 1.2.3; 512-byte
+    // sectors are the default, so older versions get the same volume without
+    // them.
+    let mut with_sector = vec!["-q", "-s", "512"];
+    with_sector.extend(args.iter().copied());
+    if let Err(e) = tools::run("mkfs.exfat", &with_sector) {
+        if !format!("{e:?}").contains("Usage") {
+            return Err(e);
+        }
+        tools::run("mkfs.exfat", &args)?;
+    }
 
     f = std::fs::OpenOptions::new()
         .read(true)
