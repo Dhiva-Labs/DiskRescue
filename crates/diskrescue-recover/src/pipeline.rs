@@ -897,7 +897,20 @@ fn extract_fs_entry(ctx: &Ctx<'_>, pv: &ParsedVolume, c: &Candidate) -> FileReco
                     diskrescue_core::util::human::bytes(rr.reused.total_len())
                 ));
             }
-            rec.notes.extend(rr.notes);
+            // Filesystem notes the pipeline already explains in plain words.
+            let explained: &[&str] = match (&c.restored_name, e.confidence) {
+                (Some(_), EntryConfidence::DeletedGuessed) => {
+                    &["first character lost", "extents guessed"]
+                }
+                (Some(_), _) => &["first character lost"],
+                (None, EntryConfidence::DeletedGuessed) => &["extents guessed"],
+                _ => &[],
+            };
+            rec.notes.extend(rr.notes.into_iter().filter(|n| {
+                !explained
+                    .iter()
+                    .any(|x| n.to_ascii_lowercase().starts_with(x))
+            }));
             rec.outcome = Outcome::RecoveredUnverified;
         }
         Err(err) => {

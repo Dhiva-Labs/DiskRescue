@@ -3,10 +3,22 @@
 **Get your photos and videos back from a dying drive, and repair the files
 that came back broken.**
 
-DiskRescue is a single static binary for Linux (Windows support is
-compile-tested only) that recovers photos and videos from hard disks, SSDs,
-USB pen drives and SD cards that are failing, have failed, were reformatted
-or had files deleted, and repairs damaged JPEG, PNG, MP4/MOV and AVI files.
+DiskRescue recovers photos and videos from hard disks, SSDs, USB pen drives
+and SD cards that are failing, have failed, were reformatted or had files
+deleted, and repairs damaged JPEG, PNG, MP4/MOV and AVI files. It comes in
+three forms that share one engine:
+
+| Program | For |
+|---|---|
+| `diskrescue-gui` | the desktop app: pick the drive, press Rescue, browse your photos |
+| `diskrescue-tui` | the same flow inside a terminal (servers, rescue USB sticks, SSH) |
+| `diskrescue` | the command line, for scripts and experts |
+
+![Choosing the drive to rescue](docs/screenshots/drives.png)
+
+![Copying a failing card: the live block map](docs/screenshots/progress.png)
+
+![Recovered photos, including deleted ones](docs/screenshots/results.png)
 
 ```
 diskrescue image /dev/sdb card.img          # careful, resumable copy of a failing device
@@ -78,15 +90,20 @@ zero-filled, never invented), what was repaired and how.
 
 ## Install
 
-Download the static binary from the releases page, or build it:
+Download the binaries from the releases page, or build them:
 
 ```
-cargo build --release -p diskrescue
+cargo build --release -p diskrescue -p diskrescue-tui -p diskrescue-gui
 ```
 
-The binary is `target/release/diskrescue`. Reading raw devices needs root
-(`sudo diskrescue ...`) or membership in the `disk` group; image files need no
-special rights.
+They land in `target/release/`. Keep `diskrescue` next to `diskrescue-gui`:
+the desktop app uses it to copy drives with administrator rights.
+
+Reading raw devices needs administrator rights. The desktop app asks for them
+when it needs them (a system password prompt through pkexec); in a terminal
+run `sudo diskrescue-tui` or `sudo diskrescue ...`, or add yourself to the
+`disk` group. Image files and repairs need no special rights. On Linux,
+`packaging/linux/diskrescue.desktop` adds the app to your applications menu.
 
 ## Documentation
 
@@ -101,6 +118,8 @@ special rights.
 - Tested extensively on synthetic images, simulated failing devices and
   generated media; not yet on real failing hardware or real camera RAW files.
 - Windows device access compiles but has not been run on Windows.
+- The desktop app has been tested offscreen (every page is driven by
+  automated UI tests and rendered headless) but not yet on many real desktops.
 - Deleted files on SSDs are usually erased by TRIM within minutes; recovering
   them rarely works. Existing files on a failing SSD can be recovered.
 - A device that reports 0 bytes or a few MB has a failed controller; software

@@ -23,6 +23,22 @@ shows half grey) go straight to `diskrescue repair`.
 - **Run as root** (`sudo diskrescue ...`) or as a member of the `disk` group
   to read raw devices. Image files need no special rights.
 
+## Three ways to use it
+
+- **Desktop app** (`diskrescue-gui`): choose the drive, press **Rescue**,
+  answer three questions (what to recover, where to save, review), and watch
+  the copy and the recovery. When the drive needs administrator rights, choose
+  **Copy with administrator rights** and enter your password. The Results page
+  shows your photos and videos as thumbnails, with filters for damaged,
+  repaired and deleted files and a **Repair with a reference file** button.
+  **Repair photos & videos** fixes files you already have: drag them onto the
+  window.
+- **Terminal app** (`sudo diskrescue-tui`): the same flow with the keyboard.
+  Arrow keys move, Enter chooses, `?` shows the keys for the current screen,
+  `q` quits. While a drive is being copied, `p` pauses and `s` stops and saves
+  (run the same rescue again to continue).
+- **Command line** (`diskrescue`): described below.
+
 ## Commands
 
 ```

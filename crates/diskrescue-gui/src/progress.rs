@@ -578,7 +578,10 @@ fn imaging_panel(ui: &mut Ui, img: &ImageState, snap: &Snapshot, cache: &mut Map
                     .fill(theme::map_colors(ui.visuals()).rescued),
             );
             let prog = img.progress.as_ref();
-            let bad = st.errsize;
+            // Only sectors that failed every attempt are unreadable; areas
+            // still waiting for a closer look are counted separately.
+            let bad = st.bad_sectors;
+            let retrying = st.non_trimmed + st.non_scraped;
             let mut items = vec![
                 widgets::Stat::new(
                     format!("copied, of {}", text::bytes(st.total())),
@@ -591,6 +594,13 @@ fn imaging_panel(ui: &mut Ui, img: &ImageState, snap: &Snapshot, cache: &mut Map
                     Some(if bad > 0 { Kind::Bad } else { Kind::Good }),
                 ),
             ];
+            if retrying > 0 {
+                items.push(widgets::Stat::new(
+                    "still being retried",
+                    text::bytes(retrying),
+                    Some(Kind::Warn),
+                ));
+            }
             if let Some(p) = prog {
                 let left = p
                     .eta

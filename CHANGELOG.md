@@ -16,3 +16,10 @@ First version.
 - JPEG, PNG, MP4/MOV (moov rebuild) and AVI repair.
 - `diskrescue` CLI: list, info, image, scan, recover, carve, repair, verify,
   map.
+- `diskrescue-tui`: interactive terminal app (drive list, rescue wizard with
+  safety checks, live block map, recovery progress, results browser, repairs).
+- `diskrescue-gui`: desktop app (drive cards, three-step rescue wizard,
+  administrator copy through pkexec, live block map, thumbnail results,
+  drag-and-drop repairs).
+- Repaired photos with grey-filled areas carry a marker so later checks report
+  them as partly recovered.
