@@ -37,8 +37,14 @@ pub const PENALTY_ALLOCATED: u8 = 20;
 pub const PENALTY_OFF_CLUSTER: u8 = 20;
 
 /// Confidence points removed from a complete file that the resolver had to
-/// cut short because a much stronger file starts inside it.
+/// cut short because a much stronger file starts inside it, or a confident
+/// file starts inside it and runs past its end.
 pub const PENALTY_SPLIT: u8 = 30;
+
+/// Confidence points removed from a complete file whose extent holds a
+/// confident file of a format it cannot contain (reported separately as a
+/// child with `parent` set): its length field probably overran its real end.
+pub const PENALTY_CONFLICT: u8 = 20;
 
 /// Which part of the source the carver scans for file headers.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -82,8 +88,12 @@ pub struct CarveOptions {
     /// Threads measuring candidates in parallel. 0 means
     /// `std::thread::available_parallelism()`.
     pub workers: usize,
-    /// Results whose final confidence is below this are dropped
-    /// (default [`Confidence::LOW`]).
+    /// Measurements whose confidence, as the format reports it, is below
+    /// this are rejected (default [`Confidence::LOW`]). The carver's own
+    /// adjustments (unreadable bytes, allocated space, off-grid header,
+    /// splits, conflicts) lower the reported [`CarvedFile::confidence`],
+    /// possibly below this value, but never drop a file the format accepted:
+    /// a damaged file is still a file.
     pub min_confidence: Confidence,
     /// Global size cap; overrides a format's `max_size` when smaller.
     pub max_file_size: Option<u64>,

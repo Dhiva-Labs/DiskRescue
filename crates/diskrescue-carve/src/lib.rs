@@ -41,20 +41,27 @@
 //!    objects become `nested`, a new aligned header ends a weak-length file
 //!    (truncated, capped or unknown length), a much stronger aligned header
 //!    splits a file, and a partial overlap goes to the more confident file.
-//!    Each byte is attributed to at most one top-level file.
+//!    A complete file's length field is not trusted over a confident header
+//!    on the grid inside it: such a file that runs past the outer file's end
+//!    cuts it, and one of a format the outer file cannot contain becomes a
+//!    *conflict child* (see the `resolve` module), so a deleted file whose
+//!    size field overruns newer files does not swallow them. Each byte is
+//!    attributed to at most one top-level file.
 //! 5. **Emit.** Confidence is lowered for unreadable bytes inside the file
 //!    ([`PENALTY_UNREADABLE`]), for extending into allocated space
-//!    ([`PENALTY_ALLOCATED`]) and for a header off the cluster grid
-//!    ([`PENALTY_OFF_CLUSTER`]). Valid still images nested in a truncated or
-//!    capped parent (or every nested object with `promote_nested`) are
-//!    emitted as files of their own right after their parent, with `parent`
-//!    set.
+//!    ([`PENALTY_ALLOCATED`]), for a header off the cluster grid
+//!    ([`PENALTY_OFF_CLUSTER`]) and for holding a conflict child
+//!    ([`PENALTY_CONFLICT`]). Conflict children, valid still images nested in
+//!    a truncated or capped parent (or every nested object with
+//!    `promote_nested`) are emitted as files of their own right after their
+//!    parent, with `parent` set.
 //!
-//! Candidates that start inside a file already known to be complete and
-//! highly confident are dropped before measuring, and the scanner skips the
-//! rest of such a file (no search, and no read once the planner knows);
-//! the resolver rules guarantee this shortcut gives the same output as
-//! measuring them, so results never depend on thread timing.
+//! Candidates that start inside a complete, highly confident file off the
+//! allocation grid (or inside one of its reported nested objects) are
+//! dropped before measuring; the resolver rules guarantee this shortcut
+//! gives the same output as measuring them, so results never depend on
+//! thread timing. The scanner still searches such files, because a header on
+//! the grid inside them can matter.
 //!
 //! # Limits
 //!
@@ -89,5 +96,5 @@ pub use scan::Carver;
 pub use types::{
     CarveMode, CarveOptions, CarvedFile, ExtractReport, ScanProgress, ScanSummary,
     DEFAULT_ALIGNMENT, DEFAULT_CHUNK_SIZE, DEFAULT_PROBE_WINDOW, MIN_CHUNK_SIZE, PENALTY_ALLOCATED,
-    PENALTY_OFF_CLUSTER, PENALTY_SPLIT, PENALTY_UNREADABLE, ZERO_BLOCK,
+    PENALTY_CONFLICT, PENALTY_OFF_CLUSTER, PENALTY_SPLIT, PENALTY_UNREADABLE, ZERO_BLOCK,
 };
