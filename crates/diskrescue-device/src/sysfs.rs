@@ -61,7 +61,9 @@ use crate::classify::{
     classify, is_emmc_hw_partition, is_virtual_name, looks_like_ssd_model, Classification,
     ClassifyInput, Confidence,
 };
-use crate::device_source::{resolve_selection, select_candidate, Ctx, DeviceSource, OpenOptions};
+use crate::device_source::{
+    resolve_selection, select_candidate, Ctx, DeviceSource, Lost, OpenOptions,
+};
 use crate::fingerprint::{is_generic_serial, Fingerprint};
 use crate::parse::{
     csd_structure, decode_udev_enc, normalize_lexically, parse_hex_u32, parse_majmin,
@@ -1263,19 +1265,8 @@ fn loop_mounts(ctx: &ScanCtx<'_>, path: &Path) -> Vec<PathBuf> {
         return Vec::new();
     };
     let mut out = Vec::new();
-    for e in list_dir(&ctx.roots.sysfs.join("block")) {
-        let Some(n) = entry_name(&e) else { continue };
-        if !n.starts_with("loop") {
-            continue;
-        }
-        let Some(backing) = read_text(&e.path().join("loop/backing_file")) else {
-            continue;
-        };
-        let backing = backing.trim_end_matches(" (deleted)");
-        if Path::new(backing) != canon {
-            continue;
-        }
-        let set = ctx.device_set(&e.path(), &n);
+    for (dir, n) in loops_backed_by(ctx, &canon) {
+        let set = ctx.device_set(&dir, &n);
         for m in ctx.mounts_for(&set) {
             if !out.contains(&m) {
                 out.push(m);
@@ -1366,8 +1357,31 @@ pub fn find_by_fingerprint_with(roots: &Roots, fp: &Fingerprint) -> Result<Optio
     for d in &disks {
         cands.extend(partition_views_with(roots, d));
     }
-    let sel = select_candidate(fp, "", &cands, true);
+    let sel = select_candidate(fp, &Lost::default(), &cands, true, &|_| false);
     Ok(resolve_selection(sel, fp))
+}
+
+/// `diskseq` of a disk by kernel name, or of a partition's disk: a number
+/// the kernel increments on every attach and media change (Linux >= 5.15).
+pub(crate) fn diskseq_of(roots: &Roots, name: &str) -> Option<u64> {
+    if !valid_name(name) {
+        return None;
+    }
+    let disk = roots.sysfs.join("block").join(name);
+    if disk.exists() {
+        return read_u64(&disk.join("diskseq"));
+    }
+    let ctx = ScanCtx {
+        roots,
+        sys_canon: roots.sysfs.clone(),
+        dev_norm: normalize_lexically(&roots.dev),
+        mounts: Vec::new(),
+        mount_names: Vec::new(),
+        swap_names: Vec::new(),
+        by_id: BTreeMap::new(),
+    };
+    let parent = parent_disk_of(&ctx, name)?;
+    read_u64(&roots.sysfs.join("block").join(parent).join("diskseq"))
 }
 
 /// The disk directory and name a [`DeviceInfo`] refers to (the parent disk
@@ -1449,99 +1463,345 @@ fn mount_members(ctx: &ScanCtx<'_>, info: &DeviceInfo) -> Vec<Member> {
     source_members(ctx, info)
 }
 
-fn nearest_existing(path: &Path) -> Result<(PathBuf, PathBuf)> {
+/// Symbolic links followed while resolving an output path (the kernel's
+/// own limit for one path walk is 40).
+const MAX_SYMLINKS: usize = 40;
+
+/// Resolve `path` the way the kernel will when the output is created: every
+/// symbolic link is followed, including a *dangling* one (creating a file
+/// through it creates the link target), and `..` is applied after links
+/// were resolved. Components that do not exist yet are kept as a lexical
+/// tail. Returns `(nearest existing directory or file, full resolved path)`.
+pub(crate) fn resolve_output_path(path: &Path) -> Result<(PathBuf, PathBuf)> {
+    use std::ffi::OsString;
+    use std::path::Component;
+
     let abs = std::path::absolute(path).map_err(Error::Io)?;
-    let mut cur = abs.clone();
-    let mut rest: Vec<std::ffi::OsString> = Vec::new();
-    loop {
-        match fs::metadata(&cur) {
-            Ok(_) => break,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                let Some(name) = cur.file_name() else {
-                    return Err(Error::NotFound(format!(
-                        "no existing ancestor of {}",
+    // Components still to walk, last one first.
+    let mut pending: Vec<OsString> = Vec::new();
+    let push_components = |pending: &mut Vec<OsString>, p: &Path| {
+        let comps: Vec<OsString> = p
+            .components()
+            .filter_map(|c| match c {
+                Component::Normal(n) => Some(n.to_os_string()),
+                Component::ParentDir => Some(OsString::from("..")),
+                Component::CurDir | Component::RootDir | Component::Prefix(_) => None,
+            })
+            .collect();
+        pending.extend(comps.into_iter().rev());
+    };
+    push_components(&mut pending, &abs);
+    let mut cur = PathBuf::from("/");
+    let mut missing: Vec<OsString> = Vec::new();
+    let mut links = 0usize;
+    while let Some(c) = pending.pop() {
+        if c == ".." {
+            if missing.pop().is_none() {
+                cur.pop();
+            }
+            continue;
+        }
+        if !missing.is_empty() {
+            missing.push(c);
+            continue;
+        }
+        let cand = cur.join(&c);
+        match fs::symlink_metadata(&cand) {
+            Ok(m) if m.file_type().is_symlink() => {
+                links += 1;
+                if links > MAX_SYMLINKS {
+                    return Err(Error::InvalidArgument(format!(
+                        "{}: too many levels of symbolic links",
                         path.display()
                     )));
-                };
-                rest.push(name.to_os_string());
-                let Some(parent) = cur.parent() else {
-                    return Err(Error::NotFound(format!(
-                        "no existing ancestor of {}",
-                        path.display()
-                    )));
-                };
-                cur = parent.to_path_buf();
+                }
+                let target = fs::read_link(&cand).map_err(Error::Io)?;
+                if target.is_absolute() {
+                    cur = PathBuf::from("/");
+                }
+                push_components(&mut pending, &target);
+            }
+            Ok(_) => cur = cand,
+            // Not there yet, below a file, or below a directory we may not
+            // search (then nothing can be created there by us either): the
+            // rest is judged by the deepest directory we could reach.
+            Err(e)
+                if e.kind() == std::io::ErrorKind::NotFound
+                    || e.kind() == std::io::ErrorKind::PermissionDenied
+                    || e.raw_os_error() == Some(libc::ENOTDIR) =>
+            {
+                missing.push(c)
             }
             Err(e) => return Err(Error::Io(e)),
         }
     }
-    let mut canon = fs::canonicalize(&cur).map_err(Error::Io)?;
-    for r in rest.iter().rev() {
-        canon.push(r);
+    let mut full = cur.clone();
+    for m in &missing {
+        full.push(m);
     }
-    Ok((cur, canon))
+    Ok((cur, full))
 }
 
-fn slaves_reach(ctx: &ScanCtx<'_>, name: &str, targets: &BTreeSet<String>, depth: usize) -> bool {
-    if depth > MAX_DEPTH {
+/// Whether `name` (a disk, partition or stacked volume) is built on one of
+/// `targets`: its parent disk (for a partition) or its `slaves/`,
+/// recursively. `seen` keeps shared lower devices from being walked twice.
+fn lower_reaches(
+    ctx: &ScanCtx<'_>,
+    name: &str,
+    targets: &BTreeSet<String>,
+    seen: &mut BTreeSet<String>,
+    depth: usize,
+) -> bool {
+    if depth > MAX_DEPTH || seen.len() > MAX_MEMBERS || !seen.insert(name.to_string()) {
         return false;
     }
     let Some(dir) = ctx.block_dir(name) else {
         return false;
     };
-    for e in list_dir(&dir.join("slaves")) {
-        let Some(s) = entry_name(&e) else { continue };
-        if targets.contains(&s) || slaves_reach(ctx, &s, targets, depth + 1) {
+    let mut lower: Vec<String> = list_dir(&dir.join("slaves"))
+        .iter()
+        .filter_map(entry_name)
+        .collect();
+    if dir.join("partition").is_file() {
+        // A partition of a stacked device (md0p1, a dm partition): what
+        // its disk is built on counts too.
+        if let Some(parent) = fs::canonicalize(&dir)
+            .ok()
+            .and_then(|r| r.parent().and_then(|p| p.file_name()).map(|n| n.to_owned()))
+        {
+            lower.push(parent.to_string_lossy().into_owned());
+        }
+    }
+    for s in lower {
+        if targets.contains(&s) || lower_reaches(ctx, &s, targets, seen, depth + 1) {
             return true;
         }
     }
     false
 }
 
-/// Whether `path` (or, if it does not exist yet, its nearest existing
-/// ancestor) lives on the device described by `info`: same `st_dev` as the
-/// disk, one of its partitions or anything stacked on them; or the
-/// filesystem's device is a dm/md volume built (through `slaves/`) on
-/// them; or, for filesystems with anonymous device numbers (btrfs, fuse,
-/// ntfs-3g), the mount's source resolves to one of them. Image files never
-/// count (writing next to an image is fine).
-pub fn path_is_on_device_with(roots: &Roots, path: &Path, info: &DeviceInfo) -> Result<bool> {
-    if info.kind == DeviceKind::ImageFile {
-        return Ok(false);
+/// The physical disks a stacked source (dm, md) is built on, following
+/// `slaves/` down and mapping partitions to their disks.
+fn lower_disks(ctx: &ScanCtx<'_>, name: &str, out: &mut BTreeSet<String>, depth: usize) {
+    if depth > MAX_DEPTH || out.len() > MAX_MEMBERS {
+        return;
     }
-    let (existing, canon) = nearest_existing(path)?;
+    let Some(dir) = ctx.block_dir(name) else {
+        return;
+    };
+    for e in list_dir(&dir.join("slaves")) {
+        let Some(s) = entry_name(&e) else { continue };
+        let disk = if ctx.roots.sysfs.join("block").join(&s).exists() {
+            Some(s.clone())
+        } else {
+            parent_disk_of(ctx, &s)
+        };
+        if let Some(d) = disk {
+            if out.insert(d.clone()) {
+                lower_disks(ctx, &d, out, depth + 1);
+            }
+        }
+    }
+}
+
+/// Loop devices whose backing file is `file` (canonical path).
+fn loops_backed_by(ctx: &ScanCtx<'_>, file: &Path) -> Vec<(PathBuf, String)> {
+    let mut out = Vec::new();
+    for e in list_dir(&ctx.roots.sysfs.join("block")) {
+        let Some(n) = entry_name(&e) else { continue };
+        if !n.starts_with("loop") {
+            continue;
+        }
+        let Some(backing) = read_text(&e.path().join("loop/backing_file")) else {
+            continue;
+        };
+        let backing = backing.trim_end_matches(" (deleted)");
+        let same = Path::new(backing) == file
+            || fs::canonicalize(backing).is_ok_and(|c| c.as_path() == file);
+        if same {
+            out.push((e.path(), n));
+        }
+    }
+    out
+}
+
+/// What the output guard compares against.
+struct GuardSet {
+    devts: BTreeSet<(u32, u32)>,
+    names: BTreeSet<String>,
+}
+
+impl GuardSet {
+    fn add(&mut self, members: Vec<Member>) {
+        for m in members {
+            if let Some(d) = m.devt {
+                self.devts.insert(d);
+            }
+            self.names.insert(m.name);
+        }
+    }
+}
+
+/// Everything writing to which would land on the source: the disk (the
+/// parent disk for a partition), its partitions and everything stacked on
+/// them; for a dm/md source also the disks it is built on (writing there
+/// wears the same failing medium and, for thin or snapshot volumes, can
+/// overwrite the source's data); for an image file the loop devices backed
+/// by it.
+fn guard_set(ctx: &ScanCtx<'_>, info: &DeviceInfo) -> GuardSet {
+    let mut set = GuardSet {
+        devts: BTreeSet::new(),
+        names: BTreeSet::new(),
+    };
+    if info.kind == DeviceKind::ImageFile {
+        if let Ok(canon) = fs::canonicalize(&info.path) {
+            for (dir, name) in loops_backed_by(ctx, &canon) {
+                set.add(ctx.device_set(&dir, &name));
+            }
+        }
+        return set;
+    }
+    set.add(source_members(ctx, info));
+    if let Some((_, disk)) = disk_of(ctx, info) {
+        let mut lower = BTreeSet::new();
+        lower_disks(ctx, &disk, &mut lower, 0);
+        for d in lower {
+            let dir = ctx.roots.sysfs.join("block").join(&d);
+            set.add(ctx.device_set(&dir, &d));
+        }
+    }
+    set
+}
+
+/// The mount that owns `canon` (longest matching mount point; for stacked
+/// mounts on the same point the last, visible one).
+fn owner_mount<'c>(
+    ctx: &'c ScanCtx<'_>,
+    canon: &Path,
+) -> Option<(&'c MountEntry, Option<&'c str>)> {
+    ctx.mounts
+        .iter()
+        .zip(&ctx.mount_names)
+        .filter(|(m, _)| canon.starts_with(&m.mount_point))
+        .max_by_key(|(m, _)| m.mount_point.components().count())
+        .map(|(m, n)| (m, n.as_deref()))
+}
+
+/// Devices of the btrfs filesystem that `member` belongs to
+/// (`/sys/fs/btrfs/<uuid>/devices/`).
+fn btrfs_devices(ctx: &ScanCtx<'_>, member: &str) -> Vec<String> {
+    for fsdir in list_dir(&ctx.roots.sysfs.join("fs/btrfs")) {
+        let devs = fsdir.path().join("devices");
+        if !devs.join(member).exists() {
+            continue;
+        }
+        return list_dir(&devs).iter().filter_map(entry_name).collect();
+    }
+    Vec::new()
+}
+
+/// Whether a device by kernel name is (built on) a member of the set, or
+/// is a loop device whose backing file is on the source.
+fn name_on_source(ctx: &ScanCtx<'_>, name: &str, set: &GuardSet, depth: usize) -> bool {
+    if set.names.contains(name) {
+        return true;
+    }
+    let mut seen = BTreeSet::new();
+    if lower_reaches(ctx, name, &set.names, &mut seen, 0) {
+        return true;
+    }
+    // A loop device (or anything built on one) passes writes to its
+    // backing file: follow it to the filesystem that holds the file.
+    seen.insert(name.to_string());
+    for n in seen {
+        if !n.starts_with("loop") || depth >= 4 {
+            continue;
+        }
+        let Some(dir) = ctx.block_dir(&n) else {
+            continue;
+        };
+        let Some(backing) = read_text(&dir.join("loop/backing_file")) else {
+            continue;
+        };
+        let backing = PathBuf::from(backing.trim_end_matches(" (deleted)"));
+        if let Ok(on) = path_on_set(ctx, &backing, set, depth + 1) {
+            if on {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Whether `path` (resolved as for creation) is stored on the set.
+fn path_on_set(ctx: &ScanCtx<'_>, path: &Path, set: &GuardSet, depth: usize) -> Result<bool> {
+    let (existing, canon) = resolve_output_path(path)?;
     let meta = fs::metadata(&existing).map_err(Error::Io)?;
     let devt = st_dev_of(&meta);
+    if set.devts.contains(&devt) {
+        return Ok(true);
+    }
+    if let Some(out_dev) = name_for_devt(ctx, devt) {
+        if name_on_source(ctx, &out_dev, set, depth) {
+            return Ok(true);
+        }
+    }
+    // Anonymous device numbers (btrfs, fuse/ntfs-3g, ...): look at the
+    // mount that owns the path.
+    if let Some((m, Some(src))) = owner_mount(ctx, &canon) {
+        if name_on_source(ctx, src, set, depth) {
+            return Ok(true);
+        }
+        if m.fs_type == "btrfs" {
+            for d in btrfs_devices(ctx, src) {
+                if name_on_source(ctx, &d, set, depth) {
+                    return Ok(true);
+                }
+            }
+        }
+    }
+    Ok(false)
+}
+
+/// Whether `path` lives on the device described by `info` (the output
+/// guard). The path is resolved as the kernel will resolve it when the
+/// output is created: symbolic links anywhere in it are followed (a
+/// dangling link at the end points at where a new file would really be
+/// created) and, for the part that does not exist yet, the nearest existing
+/// ancestor is examined. It is on the device when its filesystem's device
+/// is:
+///
+/// * the disk (the parent disk when `info` is a partition), one of its
+///   partitions or anything stacked on them (LVM, dm-crypt, md: found
+///   through `holders/`, and through `slaves/` of the output's device);
+/// * for a dm/md source, any disk the source is built on;
+/// * a loop device whose backing file is itself on the device;
+/// * for filesystems with anonymous device numbers (btrfs, fuse, ntfs-3g),
+///   the mount's source device, or any device of a multi-device btrfs.
+///
+/// For an image file, it is "on the device" when it is the image itself or
+/// inside a filesystem mounted from a loop device backed by the image;
+/// writing next to an image is fine.
+pub fn path_is_on_device_with(roots: &Roots, path: &Path, info: &DeviceInfo) -> Result<bool> {
     let ctx = ScanCtx::new(roots);
-    let members = source_members(&ctx, info);
-    if members.is_empty() {
+    let set = guard_set(&ctx, info);
+    if info.kind == DeviceKind::ImageFile {
+        let (_, canon) = resolve_output_path(path)?;
+        if fs::canonicalize(&info.path).is_ok_and(|img| img == canon) {
+            return Ok(true);
+        }
+        if set.names.is_empty() {
+            return Ok(false);
+        }
+        return path_on_set(&ctx, path, &set, 0);
+    }
+    if set.devts.is_empty() && set.names.is_empty() {
         return Err(Error::NotFound(format!(
             "cannot determine the device numbers of {}",
             info.path.display()
         )));
     }
-    if members.iter().any(|m| m.devt == Some(devt)) {
-        return Ok(true);
-    }
-    let names: BTreeSet<String> = members.iter().map(|m| m.name.clone()).collect();
-    if let Some(out_dev) = name_for_devt(&ctx, devt) {
-        if names.contains(&out_dev) || slaves_reach(&ctx, &out_dev, &names, 0) {
-            return Ok(true);
-        }
-    }
-    // Anonymous device numbers: look at the mount that owns the path.
-    let owner = ctx
-        .mounts
-        .iter()
-        .zip(&ctx.mount_names)
-        .filter(|(m, _)| canon.starts_with(&m.mount_point))
-        .max_by_key(|(m, _)| m.mount_point.components().count());
-    if let Some((_, Some(src))) = owner {
-        if names.contains(src) || slaves_reach(&ctx, src, &names, 0) {
-            return Ok(true);
-        }
-    }
-    Ok(false)
+    path_on_set(&ctx, path, &set, 0)
 }
 
 /// Open a device or image file read-only, describing it through `roots`.

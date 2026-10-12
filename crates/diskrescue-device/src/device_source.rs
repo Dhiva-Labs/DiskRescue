@@ -37,13 +37,26 @@
 //! [`Source::reopen`] releases the handle (a worker still blocked in the
 //! kernel keeps its own reference until it returns), then polls every
 //! 500 ms, up to the deadline set with
-//! [`DeviceSource::set_reattach_deadline`], for a device whose
-//! [`Fingerprint`] matches: exact on a unique serial number, or confirmed
-//! by the BLAKE3 hash of LBA 0 for devices without a usable serial. It
+//! [`DeviceSource::set_reattach_deadline`], for the same medium. The BLAKE3
+//! hash of LBA 0 is recorded when the source is opened. A candidate is
+//! accepted when:
+//!
+//! * it is still the very attach the source was opened on (Linux: same
+//!   `diskseq`; the kernel bumps it on every re-attach and media change),
+//!   e.g. a re-open after errors; or
+//! * it is the only device with our unique serial number, size and sector
+//!   size, and its first sector does not read back differently (a card
+//!   reader keeps its serial number when another card is inserted); or
+//! * its first sector has the recorded hash (several devices with the
+//!   same serial number, or no usable serial number at all).
+//!
+//! Weak identities without a recorded hash are never guessed. A partition
+//! source only matches the same partition number and start offset (sibling
+//! partitions share the disk's serial number and may have equal sizes). It
 //! refuses to resume (with `DeviceGone` and an explanation) when the same
-//! serial number comes back with a different size or sector size, or when
-//! a re-opened image file changed. The new device must have exactly the
-//! original size and sector size.
+//! serial number comes back with a different size or sector size or a
+//! different first sector, or when a re-opened image file changed. The new
+//! device must have exactly the original size and sector size.
 //!
 //! [`Source::path`] stays the path the source was opened from;
 //! [`DeviceSource::current_path`] and [`Source::describe`] show where the
@@ -273,7 +286,19 @@ impl ReadBackend for DeviceBackend {
                 let tail = &mut buf[rel..];
                 let at = offset + rel as u64;
                 let narrowed = narrow_first_failure(
-                    |o, b| self.read_span(o, b),
+                    |o, b| {
+                        // The caller gave up on this read: stop hitting the
+                        // device for a result nobody will use.
+                        if crate::worker::current_read_abandoned() {
+                            return Err(ReadError::new(
+                                o,
+                                b.len(),
+                                ReadErrorKind::Timeout,
+                                "read abandoned by its caller",
+                            ));
+                        }
+                        self.read_span(o, b)
+                    },
                     at,
                     tail,
                     self.opened.sector as usize,
@@ -320,6 +345,21 @@ impl Ctx {
         Ctx {
             #[cfg(target_os = "linux")]
             roots: crate::sysfs::Roots::system(),
+        }
+    }
+
+    /// Per-attach sequence number of a device by kernel name (the parent
+    /// disk's for a partition): changes whenever the device is re-attached
+    /// or its medium changes. `None` where unknown.
+    fn attach_seq(&self, name: &str) -> Option<u64> {
+        #[cfg(target_os = "linux")]
+        {
+            crate::sysfs::diskseq_of(&self.roots, name)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = name;
+            None
         }
     }
 
@@ -377,12 +417,40 @@ impl Ctx {
 pub(crate) enum Selection {
     /// This device is ours.
     Found(Box<DeviceInfo>),
-    /// These devices could be ours; compare their first sector.
+    /// These devices could be ours; accept the one whose first sector has
+    /// the recorded hash (and nothing else).
     Verify(Vec<DeviceInfo>),
+    /// This device carries our unique serial number; refuse it when its
+    /// first sector reads back with a different hash (a different medium
+    /// behind the same reader or bridge), accept it otherwise.
+    Confirm(Box<DeviceInfo>),
     /// A device came back in a state we must not resume on.
     Refuse(String),
     /// Nothing yet; keep waiting (with a note for the final message).
     Wait(Option<String>),
+}
+
+/// What is known about the lost source besides its [`Fingerprint`].
+#[derive(Debug, Clone, Default)]
+pub(crate) struct Lost {
+    /// Kernel name it had (`""` when unknown).
+    pub name: String,
+    /// For a partition source: its partition number and start offset on
+    /// the disk. Sibling partitions share the disk's serial number and may
+    /// have the same size, so these must match too.
+    pub partition: Option<(u32, u64)>,
+}
+
+impl Lost {
+    /// The lost source as described by `info`.
+    pub(crate) fn of(info: &DeviceInfo) -> Self {
+        Lost {
+            name: info.name.clone(),
+            partition: crate::is_partition_view(info)
+                .then(|| info.partitions.first().map(|p| (p.number, p.start)))
+                .flatten(),
+        }
+    }
 }
 
 fn serial_eq(fp: &Fingerprint, info: &DeviceInfo) -> bool {
@@ -394,20 +462,48 @@ fn serial_eq(fp: &Fingerprint, info: &DeviceInfo) -> bool {
     a.is_some() && a == b
 }
 
-/// Decide which candidate (if any) is the lost device. Pure; see the module
-/// docs for the rules. `partition_level` disables the "same serial, other
-/// size" refusal, which is normal for sibling partitions.
+/// Decide which candidate (if any) is the lost device. Pure apart from
+/// `same_attach`, which says whether a candidate is still the very attach
+/// the source was opened on (Linux: the same `diskseq`), i.e. the device
+/// never went away. Rules:
+///
+/// * a candidate that is a different partition slot than a lost partition
+///   is never considered;
+/// * one exact match (unique serial, size, sector size) is taken when it
+///   never went away, otherwise it must be confirmed by its first sector
+///   when a hash was recorded ([`Selection::Confirm`]);
+/// * several exact matches (cloned serial numbers) need the first-sector
+///   hash to tell them apart;
+/// * weak matches (no or generic serial) are taken only when the device
+///   never went away or the first-sector hash confirms them; without a
+///   hash they are never guessed;
+/// * the same unique serial with another size or sector size is refused
+///   (not for partitions: siblings have other sizes).
 pub(crate) fn select_candidate(
     fp: &Fingerprint,
-    original_name: &str,
+    lost: &Lost,
     candidates: &[DeviceInfo],
     partition_level: bool,
+    same_attach: &dyn Fn(&DeviceInfo) -> bool,
 ) -> Selection {
+    let original_name = lost.name.as_str();
     let mut exact: Vec<&DeviceInfo> = Vec::new();
     let mut probable: Vec<&DeviceInfo> = Vec::new();
     let mut refuse: Option<String> = None;
     let mut note: Option<String> = None;
     for c in candidates {
+        if let Some(slot) = lost.partition {
+            let theirs = c.partitions.first().map(|p| (p.number, p.start));
+            if !crate::is_partition_view(c) || theirs != Some(slot) {
+                if c.name == original_name {
+                    note = Some(format!(
+                        "{} is now a different partition (number/start changed)",
+                        c.path.display()
+                    ));
+                }
+                continue;
+            }
+        }
         match fp.matches(c) {
             Match::Exact => exact.push(c),
             Match::Probable(reason) => {
@@ -435,29 +531,42 @@ pub(crate) fn select_candidate(
             }
         }
     }
+    let has_hash = fp.first_sector_hash.is_some();
     if !exact.is_empty() {
-        let pick = exact
-            .iter()
-            .find(|c| c.name == original_name)
-            .unwrap_or(&exact[0]);
-        return Selection::Found(Box::new((*pick).clone()));
+        let unchanged: Vec<&&DeviceInfo> = exact.iter().filter(|c| same_attach(c)).collect();
+        if unchanged.len() == 1 {
+            return Selection::Found(Box::new((*unchanged[0]).clone()));
+        }
+        if exact.len() == 1 {
+            return if has_hash {
+                Selection::Confirm(Box::new(exact[0].clone()))
+            } else {
+                Selection::Found(Box::new(exact[0].clone()))
+            };
+        }
+        if has_hash {
+            return Selection::Verify(exact.into_iter().cloned().collect());
+        }
+        return Selection::Wait(Some(format!(
+            "{} devices carry the same serial number and size and no first-sector hash was recorded to tell them apart",
+            exact.len()
+        )));
     }
     if let Some(r) = refuse {
         return Selection::Refuse(r);
     }
     if !probable.is_empty() {
-        if fp.first_sector_hash.is_some() {
+        let unchanged: Vec<&&DeviceInfo> = probable.iter().filter(|c| same_attach(c)).collect();
+        if unchanged.len() == 1 {
+            return Selection::Found(Box::new((*unchanged[0]).clone()));
+        }
+        if has_hash {
             return Selection::Verify(probable.into_iter().cloned().collect());
         }
-        if probable.len() == 1 {
-            log::warn!(
-                "re-attaching to {} without a unique serial number or first-sector hash to confirm it",
-                probable[0].path.display()
-            );
-            return Selection::Found(Box::new(probable[0].clone()));
-        }
         return Selection::Wait(Some(format!(
-            "{} devices look like the lost one but cannot be told apart (no unique serial number, no first-sector hash)",
+            "{} device(s) look like the lost one, but without a unique serial number or a readable first \
+             sector the identity cannot be confirmed; check the device and restart (the mapfile keeps the \
+             progress)",
             probable.len()
         )));
     }
@@ -482,11 +591,16 @@ pub(crate) fn read_first_sector(
         want
     };
     let align = PAGE.max(opened.sector as usize);
+    // Probe pools are short-lived; they share one hung-read counter so that
+    // candidates whose first sector never answers cannot pile up threads
+    // while a re-attach waits (possibly forever).
     let pool = WorkerPool::new(
         "probe",
         Arc::new(DeviceBackend::new(opened, path.display().to_string())),
         align,
-    );
+    )
+    .with_shared_hung_counter(probe_hung_counter())
+    .with_max_hung(MAX_HUNG_PROBES);
     let mut buf = vec![0u8; want];
     match pool.read(0, job, &mut buf, timeout) {
         Ok(n) if n == want => Some(buf),
@@ -494,19 +608,50 @@ pub(crate) fn read_first_sector(
     }
 }
 
+/// Probe reads (first sectors of re-attach candidates) that may be hung in
+/// the kernel at the same time, process-wide.
+const MAX_HUNG_PROBES: u64 = 4;
+
+fn probe_hung_counter() -> Arc<AtomicU64> {
+    static COUNTER: std::sync::OnceLock<Arc<AtomicU64>> = std::sync::OnceLock::new();
+    COUNTER.get_or_init(|| Arc::new(AtomicU64::new(0))).clone()
+}
+
+/// What reading a candidate's first sector said about it.
+enum Probe {
+    /// The hash matches the recorded one.
+    Same,
+    /// The first sector reads back differently.
+    Different,
+    /// It could not be read (or no hash was recorded).
+    Unknown,
+}
+
+fn probe(c: &DeviceInfo, fp: &Fingerprint) -> Probe {
+    let Some(want) = fp.first_sector_hash.as_deref() else {
+        return Probe::Unknown;
+    };
+    match read_first_sector(&c.path, fp.logical_sector, true, FIRST_SECTOR_TIMEOUT) {
+        Some(b) if hash_first_sector(&b, fp.logical_sector as usize) == want => Probe::Same,
+        Some(_) => Probe::Different,
+        None => Probe::Unknown,
+    }
+}
+
 /// Resolve a [`Selection`] into a device (reading first sectors for
-/// [`Selection::Verify`]). Refusals and waits yield `None`.
+/// [`Selection::Verify`] and [`Selection::Confirm`]). Refusals and waits
+/// yield `None`.
 pub(crate) fn resolve_selection(sel: Selection, fp: &Fingerprint) -> Option<DeviceInfo> {
     match sel {
         Selection::Found(i) => Some(*i),
-        Selection::Verify(list) => {
-            let want = fp.first_sector_hash.as_deref()?;
-            list.into_iter().take(8).find(|c| {
-                read_first_sector(&c.path, fp.logical_sector, true, FIRST_SECTOR_TIMEOUT)
-                    .map(|b| hash_first_sector(&b, fp.logical_sector as usize) == want)
-                    .unwrap_or(false)
-            })
-        }
+        Selection::Verify(list) => list
+            .into_iter()
+            .take(8)
+            .find(|c| matches!(probe(c, fp), Probe::Same)),
+        Selection::Confirm(c) => match probe(&c, fp) {
+            Probe::Different => None,
+            Probe::Same | Probe::Unknown => Some(*c),
+        },
         Selection::Refuse(_) | Selection::Wait(_) => None,
     }
 }
@@ -515,12 +660,41 @@ struct State {
     info: DeviceInfo,
     fingerprint: Fingerprint,
     current_path: PathBuf,
+    /// Attach sequence number (`diskseq`) of the device the handle is open
+    /// on, when the platform has one.
+    attach_seq: Option<u64>,
 }
 
 enum Attempt {
     Found(Box<(Opened, DeviceInfo, PathBuf)>),
     Wait(Option<String>),
     Refuse(String),
+}
+
+/// Identity of the node a path resolves to: `(st_dev, st_ino, st_rdev)`.
+#[cfg(unix)]
+fn node_id(path: &Path) -> Option<(u64, u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::metadata(path)
+        .ok()
+        .map(|m| (m.dev(), m.ino(), m.rdev()))
+}
+
+#[cfg(not(unix))]
+fn node_id(_path: &Path) -> Option<(u64, u64, u64)> {
+    None
+}
+
+/// Identity of an open handle, comparable with [`node_id`].
+#[cfg(unix)]
+fn file_node_id(file: &std::fs::File) -> Option<(u64, u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    file.metadata().ok().map(|m| (m.dev(), m.ino(), m.rdev()))
+}
+
+#[cfg(not(unix))]
+fn file_node_id(_file: &std::fs::File) -> Option<(u64, u64, u64)> {
+    None
 }
 
 fn open_error(path: &Path, e: std::io::Error) -> Error {
@@ -578,6 +752,7 @@ impl std::fmt::Debug for DeviceSource {
 impl DeviceSource {
     /// Open with an explicit description context (sysfs roots on Linux).
     pub(crate) fn open_with_ctx(path: &Path, opts: &OpenOptions, ctx: Ctx) -> Result<Self> {
+        let node_before = node_id(path);
         let mut info = ctx.describe(path)?;
         if info.is_mounted() && !opts.allow_mounted {
             let list: Vec<String> = info
@@ -594,6 +769,15 @@ impl DeviceSource {
         }
         let opened = platform::open_for_read(path, opts.direct, opts.fallback_buffered)
             .map_err(|e| open_error(path, e))?;
+        // The description must be of the device actually opened: a
+        // `/dev/disk/by-id` link can be re-pointed by udev in between (USB
+        // re-enumeration).
+        if node_before.is_some() && node_before != file_node_id(&opened.file) {
+            return Err(Error::Other(format!(
+                "{} changed while it was being opened (the device was re-attached?); try again",
+                path.display()
+            )));
+        }
         if opened.is_block {
             if opened.size == 0 {
                 return Err(Error::NotFound(format!(
@@ -636,6 +820,11 @@ impl DeviceSource {
             align,
         );
         let fingerprint = Fingerprint::of(&info, None);
+        let attach_seq = if is_block {
+            ctx.attach_seq(&info.name)
+        } else {
+            None
+        };
         let src = DeviceSource {
             opened_path: path.to_path_buf(),
             ctx,
@@ -650,6 +839,7 @@ impl DeviceSource {
                 current_path: path.to_path_buf(),
                 info,
                 fingerprint,
+                attach_seq,
             }),
             gone: AtomicBool::new(false),
             reattach_wait: Mutex::new(Some(DEFAULT_REATTACH_WAIT)),
@@ -657,12 +847,16 @@ impl DeviceSource {
             reattaches: AtomicU64::new(0),
             reopen_lock: Mutex::new(()),
         };
-        let weak = !src.fingerprint().has_strong_serial();
-        if weak && size > 0 {
+        // The first-sector hash confirms the medium after a re-attach: it
+        // tells apart devices without a unique serial number, and a
+        // different card behind the same reader (whose serial number is the
+        // reader's).
+        if size > 0 {
             let t = src.opts.default_timeout.min(FIRST_SECTOR_TIMEOUT);
             if src.capture_first_sector(t).is_none() {
                 log::warn!(
-                    "{}: LBA 0 could not be read; re-identification after a reset will rely on model and size",
+                    "{}: LBA 0 could not be read; after a reset the device can only be re-identified by a \
+                     unique serial number",
                     path.display()
                 );
             }
@@ -849,13 +1043,21 @@ impl DeviceSource {
             Ok(c) => c,
             Err(e) => return Attempt::Wait(Some(format!("device scan failed: {e}"))),
         };
-        let sel = select_candidate(fp, &original.name, &candidates, self.partition_view);
+        let lost = Lost::of(original);
+        let attach = self
+            .state
+            .lock()
+            .map(|s| s.attach_seq)
+            .unwrap_or_else(|p| p.into_inner().attach_seq);
+        let same_attach =
+            |c: &DeviceInfo| attach.is_some() && self.ctx.attach_seq(&c.name) == attach;
+        let sel = select_candidate(fp, &lost, &candidates, self.partition_view, &same_attach);
         let found = match sel {
             Selection::Refuse(msg) => return Attempt::Refuse(msg),
             Selection::Wait(note) => return Attempt::Wait(note),
             Selection::Verify(list) => {
                 let note = format!(
-                    "{} device(s) with the same model and size have a different first sector",
+                    "{} candidate device(s) have a different (or unreadable) first sector",
                     list.len()
                 );
                 match resolve_selection(Selection::Verify(list), fp) {
@@ -863,6 +1065,26 @@ impl DeviceSource {
                     None => return Attempt::Wait(Some(note)),
                 }
             }
+            Selection::Confirm(c) => match probe(&c, fp) {
+                Probe::Different => {
+                    return Attempt::Refuse(format!(
+                        "{} carries the serial number of {} but its first sector is different: a different \
+                         medium (another card in the same reader?) or a controller returning wrong data; \
+                         refusing to resume on it. Check the device and restart imaging: the mapfile keeps \
+                         the progress",
+                        c.path.display(),
+                        self.opened_path.display()
+                    ))
+                }
+                Probe::Same => *c,
+                Probe::Unknown => {
+                    log::warn!(
+                        "{}: re-attaching by serial number; its first sector could not be read to confirm",
+                        c.path.display()
+                    );
+                    *c
+                }
+            },
             Selection::Found(i) => *i,
         };
         let opened = match platform::open_for_read(
@@ -891,9 +1113,15 @@ impl DeviceSource {
         self.pool
             .attach(Arc::new(DeviceBackend::new(opened, label)));
         self.direct.store(direct, Ordering::SeqCst);
+        let attach_seq = if self.is_block {
+            self.ctx.attach_seq(&info.name)
+        } else {
+            None
+        };
         if let Ok(mut s) = self.state.lock() {
             s.info = info;
             s.current_path = path.clone();
+            s.attach_seq = attach_seq;
         }
         self.gone.store(false, Ordering::SeqCst);
         self.reattaches.fetch_add(1, Ordering::SeqCst);
@@ -1230,52 +1458,329 @@ mod tests {
         );
     }
 
+    fn lost(name: &str) -> Lost {
+        Lost {
+            name: name.into(),
+            partition: None,
+        }
+    }
+
+    fn never(_: &DeviceInfo) -> bool {
+        false
+    }
+
+    fn sel(fp: &Fingerprint, c: &[DeviceInfo], part: bool) -> Selection {
+        select_candidate(fp, &lost("sdb"), c, part, &never)
+    }
+
     #[test]
     fn selection_rules() {
         let orig = dev("sdb", Some("4C530001231012345678"), "Cruzer Blade", 1 << 30);
         let fp = Fingerprint::of(&orig, None);
         let moved = dev("sdc", Some("4C530001231012345678"), "Cruzer Blade", 1 << 30);
         let other = dev("sdb", Some("ZZZZ0001231012345678"), "Cruzer Blade", 1 << 30);
-        match select_candidate(&fp, "sdb", &[other.clone(), moved.clone()], false) {
+        match sel(&fp, &[other.clone(), moved.clone()], false) {
             Selection::Found(i) => assert_eq!(i.name, "sdc"),
             s => panic!("{s:?}"),
         }
-        match select_candidate(&fp, "sdb", std::slice::from_ref(&other), false) {
+        match sel(&fp, std::slice::from_ref(&other), false) {
             Selection::Wait(Some(n)) => assert!(n.contains("different device"), "{n}"),
             s => panic!("{s:?}"),
         }
         let shrunk = dev("sdc", Some("4C530001231012345678"), "Cruzer Blade", 0);
-        match select_candidate(&fp, "sdb", std::slice::from_ref(&shrunk), false) {
+        match sel(&fp, std::slice::from_ref(&shrunk), false) {
             Selection::Refuse(m) => assert!(m.contains("size changed"), "{m}"),
             s => panic!("{s:?}"),
         }
         // Sibling partitions have other sizes: no refusal there.
+        assert!(matches!(sel(&fp, &[shrunk], true), Selection::Wait(_)));
+        // With a recorded first sector, a unique serial is still confirmed
+        // (another card behind the same reader has the reader's serial).
+        let mut fph = fp.clone();
+        fph.first_sector_hash = Some("abc".into());
         assert!(matches!(
-            select_candidate(&fp, "sdb", &[shrunk], true),
-            Selection::Wait(_)
+            sel(&fph, std::slice::from_ref(&moved), false),
+            Selection::Confirm(_)
         ));
-        // Weak identity: one probable candidate is accepted without a hash,
-        // two are ambiguous, and with a hash they must be verified.
+        // ...unless it is still the very same attach.
+        let same = |c: &DeviceInfo| c.name == "sdc";
+        assert!(matches!(
+            select_candidate(
+                &fph,
+                &lost("sdb"),
+                std::slice::from_ref(&moved),
+                false,
+                &same
+            ),
+            Selection::Found(_)
+        ));
+        // Two devices with the same serial and size: never a guess.
+        let twin = dev("sdd", Some("4C530001231012345678"), "Cruzer Blade", 1 << 30);
+        match sel(&fp, &[moved.clone(), twin.clone()], false) {
+            Selection::Wait(Some(n)) => assert!(n.contains("same serial"), "{n}"),
+            s => panic!("{s:?}"),
+        }
+        match sel(&fph, &[moved.clone(), twin.clone()], false) {
+            Selection::Verify(v) => assert_eq!(v.len(), 2),
+            s => panic!("{s:?}"),
+        }
+        // Weak identity: without a hash nothing is guessed, not even a
+        // single candidate; with a hash candidates are verified; a device
+        // that never went away is taken as is.
         let weak = dev("sdb", None, "USB DISK", 8 << 30);
         let mut fp = Fingerprint::of(&weak, None);
         let c1 = dev("sdd", None, "USB DISK", 8 << 30);
         let c2 = dev("sde", None, "USB DISK", 8 << 30);
         assert!(matches!(
-            select_candidate(&fp, "sdb", std::slice::from_ref(&c1), false),
-            Selection::Found(_)
-        ));
-        assert!(matches!(
-            select_candidate(&fp, "sdb", &[c1.clone(), c2.clone()], false),
+            sel(&fp, std::slice::from_ref(&c1), false),
             Selection::Wait(Some(_))
         ));
+        assert!(matches!(
+            sel(&fp, &[c1.clone(), c2.clone()], false),
+            Selection::Wait(Some(_))
+        ));
+        let unchanged = |c: &DeviceInfo| c.name == "sdd";
+        assert!(matches!(
+            select_candidate(&fp, &lost("sdb"), &[c1.clone(), c2.clone()], false, &unchanged),
+            Selection::Found(i) if i.name == "sdd"
+        ));
         fp.first_sector_hash = Some("abc".into());
-        match select_candidate(&fp, "sdb", &[c1, c2], false) {
+        match sel(&fp, &[c1, c2], false) {
             Selection::Verify(v) => assert_eq!(v.len(), 2),
             s => panic!("{s:?}"),
         }
+        assert!(matches!(sel(&fp, &[], false), Selection::Wait(None)));
+    }
+
+    fn part(disk: &DeviceInfo, n: u32, start: u64, size: u64) -> DeviceInfo {
+        let p = diskrescue_core::device::PartitionInfo {
+            path: Some(PathBuf::from(format!("{}{n}", disk.path.display()))),
+            number: n,
+            start,
+            size,
+            fs_type: None,
+            mountpoints: vec![],
+        };
+        crate::partition_view(disk, &p, None)
+    }
+
+    #[test]
+    fn partition_sources_never_switch_to_a_sibling() {
+        // Two partitions of the same size: the first one (sdc1) used to be
+        // taken for a lost sdb2.
+        let disk = dev("sdb", Some("4C530001231012345678"), "Cruzer Blade", 4 << 30);
+        let lost_p2 = part(&disk, 2, 2 << 30, 1 << 30);
+        let fp = Fingerprint::of(&lost_p2, None);
+        let lost2 = Lost::of(&lost_p2);
+        assert_eq!(lost2.partition, Some((2, 2 << 30)));
+        let back = dev("sdc", Some("4C530001231012345678"), "Cruzer Blade", 4 << 30);
+        let c1 = part(&back, 1, 1 << 30, 1 << 30);
+        let c2 = part(&back, 2, 2 << 30, 1 << 30);
+        match select_candidate(&fp, &lost2, &[c1.clone(), c2.clone()], true, &never) {
+            Selection::Found(i) => assert_eq!(i.name, "sdc2"),
+            s => panic!("{s:?}"),
+        }
+        // Only the wrong slot is there: wait.
         assert!(matches!(
-            select_candidate(&fp, "sdb", &[], false),
-            Selection::Wait(None)
+            select_candidate(&fp, &lost2, std::slice::from_ref(&c1), true, &never),
+            Selection::Wait(_)
         ));
+        // The slot moved on the disk (re-partitioned): not ours.
+        let moved = part(&back, 2, 3 << 30, 1 << 30);
+        assert!(matches!(
+            select_candidate(&fp, &lost2, &[moved], true, &never),
+            Selection::Wait(_)
+        ));
+        // Without slot information (public find_by_fingerprint) the twins
+        // are ambiguous and are never guessed.
+        assert!(matches!(
+            select_candidate(&fp, &Lost::default(), &[c1, c2], true, &never),
+            Selection::Wait(Some(_))
+        ));
+    }
+
+    /// A minimal fake `/sys/block/<name>` with a SCSI-like `device/` and a
+    /// regular file standing in for the device node (`dev/<name>`).
+    #[cfg(target_os = "linux")]
+    mod fake {
+        use std::fs;
+        use std::path::Path;
+
+        pub const SECTORS: u64 = 64;
+
+        pub fn data(fill: u8) -> Vec<u8> {
+            let mut v: Vec<u8> = (0..SECTORS as usize * 512)
+                .map(|i| (i % 251) as u8)
+                .collect();
+            v[..512].fill(fill);
+            v
+        }
+
+        pub fn disk(root: &Path, name: &str, serial: Option<&str>, seq: u64, content: &[u8]) {
+            let b = root.join("sys/block").join(name);
+            fs::create_dir_all(b.join("queue")).unwrap();
+            fs::write(b.join("size"), format!("{SECTORS}\n")).unwrap();
+            fs::write(b.join("dev"), "8:16\n").unwrap();
+            fs::write(b.join("diskseq"), format!("{seq}\n")).unwrap();
+            fs::write(b.join("removable"), "1\n").unwrap();
+            fs::write(b.join("queue/logical_block_size"), "512\n").unwrap();
+            let d = root.join("sys/devices/scsi").join(name);
+            fs::create_dir_all(&d).unwrap();
+            fs::write(d.join("vendor"), "SanDisk \n").unwrap();
+            fs::write(d.join("model"), "Cruzer Blade    \n").unwrap();
+            if let Some(s) = serial {
+                let mut p = vec![0u8, 0x80, 0, s.len() as u8];
+                p.extend_from_slice(s.as_bytes());
+                fs::write(d.join("vpd_pg80"), p).unwrap();
+            }
+            let _ = fs::remove_file(b.join("device"));
+            std::os::unix::fs::symlink(&d, b.join("device")).unwrap();
+            fs::create_dir_all(root.join("dev")).unwrap();
+            fs::write(root.join("dev").join(name), content).unwrap();
+        }
+
+        /// Two partitions of 16 sectors each, at sectors 16 and 32.
+        pub fn partitions(root: &Path, disk: &str, content: &[u8]) {
+            for (n, start) in [(1u32, 16u64), (2, 32)] {
+                let pname = format!("{disk}{n}");
+                let p = root.join("sys/block").join(disk).join(&pname);
+                fs::create_dir_all(&p).unwrap();
+                fs::write(p.join("partition"), format!("{n}\n")).unwrap();
+                fs::write(p.join("start"), format!("{start}\n")).unwrap();
+                fs::write(p.join("size"), "16\n").unwrap();
+                fs::write(p.join("dev"), format!("8:{}\n", 16 + n)).unwrap();
+                let s = start as usize * 512;
+                fs::write(root.join("dev").join(&pname), &content[s..s + 16 * 512]).unwrap();
+            }
+        }
+
+        pub fn remove(root: &Path, name: &str) {
+            fs::remove_dir_all(root.join("sys/block").join(name)).unwrap();
+            let _ = fs::remove_file(root.join("dev").join(name));
+            for n in 1..=2 {
+                let _ = fs::remove_file(root.join("dev").join(format!("{name}{n}")));
+            }
+        }
+    }
+
+    /// Open `name` under the fake roots as if it were a block device.
+    #[cfg(target_os = "linux")]
+    fn open_fake(root: &Path, name: &str) -> DeviceSource {
+        let roots = crate::sysfs::Roots::under(root);
+        let opts = OpenOptions {
+            direct: false,
+            default_timeout: Duration::from_secs(5),
+            allow_mounted: false,
+            fallback_buffered: true,
+        };
+        let mut src = DeviceSource::open_with_ctx(
+            &roots.dev.join(name),
+            &opts,
+            Ctx {
+                roots: roots.clone(),
+            },
+        )
+        .unwrap();
+        let info = crate::sysfs::describe_name_with(&roots, name).unwrap();
+        src.is_block = true;
+        src.partition_view = crate::is_partition_view(&info);
+        let first = std::fs::read(roots.dev.join(name)).unwrap();
+        let mut s = src.state.lock().unwrap();
+        s.fingerprint = Fingerprint::of(&info, Some(&first[..512]));
+        s.attach_seq = crate::sysfs::diskseq_of(&roots, name);
+        s.info = info;
+        drop(s);
+        src.set_reattach_deadline(Some(Duration::from_millis(1500)));
+        src
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn device_reattach_follows_the_medium_not_the_name() {
+        use diskrescue_core::source::SourceExt;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let ours = fake::data(0x11);
+        fake::disk(root, "sdb", Some("4C530001231012345678"), 5, &ours);
+        let src = open_fake(root, "sdb");
+        assert!(src.fingerprint().has_strong_serial());
+
+        // Still there, same attach: a plain re-open.
+        src.reopen().unwrap();
+        assert_eq!(src.current_path(), root.join("dev/sdb"));
+
+        // Reset: gone from sdb, back as sdc with the same medium.
+        fake::remove(root, "sdb");
+        fake::disk(root, "sdc", Some("4C530001231012345678"), 9, &ours);
+        src.reopen().unwrap();
+        assert_eq!(src.current_path(), root.join("dev/sdc"));
+        assert_eq!(src.read_exact_vec(512, 8).unwrap(), ours[512..520].to_vec());
+
+        // Another card in the same reader (same serial, same size, other
+        // content): refused, not resumed on.
+        fake::remove(root, "sdc");
+        fake::disk(
+            root,
+            "sdd",
+            Some("4C530001231012345678"),
+            12,
+            &fake::data(0x22),
+        );
+        let e = src.reopen().unwrap_err();
+        assert_eq!(e.kind, ReadErrorKind::DeviceGone);
+        assert!(
+            e.detail.contains("first sector is different"),
+            "{}",
+            e.detail
+        );
+        assert!(src.is_gone());
+
+        // Two sticks with the same "unique" serial: only the one with our
+        // first sector is taken.
+        fake::disk(root, "sde", Some("4C530001231012345678"), 13, &ours);
+        src.reopen().unwrap();
+        assert_eq!(src.current_path(), root.join("dev/sde"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn partition_reattach_keeps_the_partition() {
+        use diskrescue_core::source::SourceExt;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let content = fake::data(0x33);
+        fake::disk(root, "sdb", Some("4C530001231012345678"), 5, &content);
+        fake::partitions(root, "sdb", &content);
+        let src = open_fake(root, "sdb2");
+        assert!(crate::is_partition_view(&src.info()));
+        fake::remove(root, "sdb");
+        fake::disk(root, "sdc", Some("4C530001231012345678"), 8, &content);
+        fake::partitions(root, "sdc", &content);
+        src.reopen().unwrap();
+        assert_eq!(src.current_path(), root.join("dev/sdc2"));
+        assert_eq!(
+            src.read_exact_vec(0, 16).unwrap(),
+            content[32 * 512..32 * 512 + 16].to_vec()
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn weak_identity_without_hash_reattaches_only_to_the_same_attach() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let content = fake::data(0x44);
+        fake::disk(root, "sdb", None, 5, &content);
+        let src = open_fake(root, "sdb");
+        // LBA 0 was never readable: no hash.
+        src.state.lock().unwrap().fingerprint.first_sector_hash = None;
+        // Re-open after errors while the stick never went away: fine.
+        src.reopen().unwrap();
+        // It was re-plugged (new diskseq): a stick of the same model and
+        // size is not assumed to be ours.
+        fake::remove(root, "sdb");
+        fake::disk(root, "sdb", None, 6, &content);
+        let e = src.reopen().unwrap_err();
+        assert!(e.detail.contains("cannot be confirmed"), "{}", e.detail);
     }
 }
