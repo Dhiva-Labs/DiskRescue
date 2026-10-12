@@ -2,5 +2,6 @@
 
 pub mod bits;
 pub mod bytes;
+pub mod foreign;
 pub mod hash;
 pub mod human;

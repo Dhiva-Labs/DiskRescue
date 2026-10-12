@@ -661,9 +661,38 @@ impl FileFormat for HeifFormat {
 
     fn measure(&self, src: &SharedSource, start: u64, limit: u64) -> Result<Option<Measured>> {
         let s: &dyn Source = &**src;
-        let Some(w) = walk_heif(s, start, limit)? else {
+        let Some(mut w) = walk_heif(s, start, limit)? else {
             return Ok(None);
         };
+        // A cut HEIF followed by other files still has box sizes and iloc
+        // extents that claim the bytes after the cut. Look for another file's
+        // start on the sector grid that none of the item extents explains.
+        if w.status == ExtentStatus::Complete {
+            let items: Vec<Item> = w.meta.as_ref().map(|m| m.items.clone()).unwrap_or_default();
+            let allowed = |p: u64, _sig| {
+                items
+                    .iter()
+                    .filter(|i| i.construction_method == 0)
+                    .any(|i| {
+                        let container = matches!(&i.kind, b"Exif" | b"jpeg" | b"mime");
+                        i.extents.iter().any(|&(o, l)| {
+                            p == o || (container && p >= o && p < o.saturating_add(l))
+                        })
+                    })
+            };
+            if let Some(hit) =
+                diskrescue_core::util::foreign::scan_source(s, start, 1, w.len, &allowed)
+            {
+                w.notes.push(format!(
+                    "a {} file starts at offset {} inside the declared size; the HEIF data was cut there",
+                    hit.sig.name(),
+                    hit.offset
+                ));
+                w.len = hit.offset;
+                w.status = ExtentStatus::Truncated;
+                w.err_offset = Some(hit.offset);
+            }
+        }
         let (meta, nested) = heif_meta(s, start, &w);
         let mut conf = if w.status == ExtentStatus::Complete {
             Confidence::MEDIUM

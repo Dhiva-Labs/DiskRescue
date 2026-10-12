@@ -9,17 +9,14 @@
 //! Known format-crate limitations the expectations below allow for (each is
 //! named where it is allowed):
 //!
-//! * `KNOWN_OVERCLAIM`: the HEIF and MP4 measures report a file whose tail
-//!   is missing (cut at 60 % and followed by other data) as `Complete` at
-//!   confidence 90, trusting `iloc` / box sizes without checking that the
-//!   data they point to is there.
-//! * `KNOWN_LOST`: a moov-less MP4 (confidence 25, `Truncated`) whose
-//!   header lies inside such an over-long, confident file is suppressed: a
-//!   weak candidate is no evidence against a strong parent.
-//! * `video.ts` in the holes image: the MPEG-TS measure stops at a known
-//!   unreadable range instead of resynchronising after it, so the stream
-//!   comes back in two pieces and the packets between the hole and the next
-//!   512-byte-aligned packet are in neither.
+//! * `KNOWN_OVERCLAIM`: `image.heic` in the truncated image is cut inside its
+//!   single HEVC item and followed by random fill up to its declared end; the
+//!   next file starts beyond that end. Neither the box structure nor a
+//!   signature scan can tell the fill from image data (only an HEVC decoder
+//!   could), so the HEIC keeps its declared length. When the next file starts
+//!   inside the declared length the HEIF measure does cut there (see
+//!   `cut_heic_stops_at_the_next_file`).
+//! * `KNOWN_LOST`: empty; every truncated file in the image is found.
 
 mod common;
 
@@ -40,8 +37,8 @@ use diskrescue_core::{Range, RangeSet, Result, SharedSource};
 use diskrescue_fixtures::raw::{self, RawImage, RawObject};
 use diskrescue_fixtures::tools;
 
-const KNOWN_OVERCLAIM: &[&str] = &["image.heic", "video_faststart.mp4"];
-const KNOWN_LOST: &[&str] = &["video_moovlast.mp4", "video.mov"];
+const KNOWN_OVERCLAIM: &[&str] = &["image.heic"];
+const KNOWN_LOST: &[&str] = &[];
 
 /// Bytes a measure may stop short of a cut point that falls inside a
 /// marker or chunk header (a dangling 0xFF holds no data).
@@ -435,11 +432,6 @@ fn unreadable_ranges_are_reported_and_files_kept() {
         let mut out = Vec::new();
         let rep = Carver::extract(&src, f, &mut out).expect("extract");
         assert_eq!(rep.unreadable, f.unreadable, "{}", o.name);
-        if o.kind == "ts" {
-            // Split at the hole by the MPEG-TS measure (see the module docs).
-            assert!(f.len < len);
-            continue;
-        }
         assert_eq!(f.len, len, "{}", o.name);
         assert_eq!(f.unreadable.total_len(), o.unreadable_bytes, "{}", o.name);
     }
@@ -779,4 +771,76 @@ fn scan_1gib_random_all_real_formats_over_1gbps() {
         assert!(best > 1e9, "scanner rate {:.2} GB/s", best / 1e9);
         assert!(deep > 1e9, "deep scan rate {:.2} GB/s", deep / 1e9);
     }
+}
+
+/// A HEIC cut short and followed by a JPEG that starts inside the HEIC's
+/// declared size: the HEIC must stop exactly where the JPEG starts and both
+/// must be carved.
+#[test]
+fn cut_heic_stops_at_the_next_file() {
+    use diskrescue_fixtures::media::{self, HeicOpts};
+    let heic = match media::heic(&HeicOpts::default()) {
+        Ok(h) => h,
+        Err(e) => {
+            eprintln!("skipped: {e}");
+            return;
+        }
+    };
+    let jpeg = media::baseline_jpeg(160, 120, 85, 9);
+    let cut = heic.len() * 6 / 10;
+    let jpeg_at = cut.div_ceil(512) * 512;
+    assert!(
+        (jpeg_at as usize) < heic.len(),
+        "the JPEG must start inside the declared HEIC size"
+    );
+    let mut img = heic[..cut].to_vec();
+    img.resize(jpeg_at, 0);
+    img.extend_from_slice(&jpeg);
+    img.resize(img.len().div_ceil(512) * 512 + 4096, 0);
+    let src: diskrescue_core::SharedSource =
+        std::sync::Arc::new(diskrescue_core::source::MemSource::new(img));
+
+    let heif = diskrescue_isobmff::formats()
+        .into_iter()
+        .find(|f| f.id() == "heic")
+        .expect("heic format");
+    let m = heif
+        .measure(&src, 0, src.size())
+        .unwrap()
+        .expect("measured");
+    // The item-data check stops at the cut itself; the foreign-start scan
+    // would stop at the JPEG. Either way the HEIC must not reach into it.
+    assert!(
+        m.len >= cut as u64 && m.len <= jpeg_at as u64,
+        "len {} cut {cut} jpeg {jpeg_at}: {:?}",
+        m.len,
+        m.notes
+    );
+    assert_eq!(m.status, ExtentStatus::Truncated);
+
+    let mut reg = diskrescue_core::format::FormatRegistry::new();
+    for f in diskrescue_isobmff::formats() {
+        reg.register(f);
+    }
+    reg.register(std::sync::Arc::new(diskrescue_jpeg::JpegFormat));
+    let carver = Carver::new(CarveOptions::new(reg)).unwrap();
+    let mut found = Vec::new();
+    carver
+        .scan(&src, &mut |_| {}, &mut |f| {
+            found.push((f.start, f.len, f.format.clone()));
+            true
+        })
+        .unwrap();
+    assert!(
+        found
+            .iter()
+            .any(|(s, l, f)| *s == 0 && *l <= jpeg_at as u64 && f == "heic"),
+        "{found:?}"
+    );
+    assert!(
+        found
+            .iter()
+            .any(|(s, l, f)| *s == jpeg_at as u64 && *l == jpeg.len() as u64 && f == "jpeg"),
+        "{found:?}"
+    );
 }
