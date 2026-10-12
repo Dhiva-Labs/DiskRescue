@@ -158,4 +158,57 @@ mod tests {
         let mut p = Planner::new(&RangeSet::new(), 100, 10, 10, 1);
         assert!(p.next(0).is_none());
     }
+
+    #[test]
+    fn random_range_sets_are_covered_exactly_once() {
+        let mut x = 0x2545_F491_4F6C_DD1Du64;
+        let mut rnd = |n: u64| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x % n.max(1)
+        };
+        for _ in 0..300 {
+            let size = 1 + rnd(8 << 20);
+            let mut set = RangeSet::new();
+            for _ in 0..rnd(40) {
+                let s = rnd(size);
+                set.insert(Range::new(s, s + 1 + rnd(3 << 20)));
+            }
+            let set = set.intersection_with_range(Range::new(0, size));
+            let chunk = 1 + rnd(2 << 20);
+            let overlap = rnd(100_000);
+            let sector = [1u64, 512, 4096][rnd(3) as usize];
+            let mut p = Planner::new(&set, size, chunk, overlap, sector);
+            let mut owned = RangeSet::new();
+            let mut last_end = 0;
+            let mut covered = 0;
+            let mut windows = 0;
+            while let Some(w) = p.next(0) {
+                windows += 1;
+                assert!(windows <= 1 + set.total_len() / chunk + 2 * set.len() as u64 + 1);
+                assert!(w.own.start >= last_end, "windows ascend");
+                assert!(!w.own.is_empty() && w.own.len() <= chunk);
+                last_end = w.own.end;
+                let own = set.intersection_with_range(w.own);
+                assert!(!own.is_empty(), "a window owns some of the set");
+                for r in own.iter() {
+                    assert!(!owned.intersects(r), "owned twice");
+                    owned.insert(r);
+                }
+                // The read holds every owned byte plus the overlap (up to
+                // the source end), sector-aligned at the start.
+                assert!(w.read.start <= w.own.start && w.read.start % sector == 0);
+                assert!(w.own.start - w.read.start < sector);
+                let want_end = ((w.own.end + overlap).div_ceil(sector) * sector)
+                    .min(size)
+                    .max(w.own.end);
+                assert_eq!(w.read.end, want_end);
+                assert!(w.covered_after >= covered);
+                covered = w.covered_after;
+            }
+            assert_eq!(owned, set);
+            assert_eq!(covered, set.total_len());
+        }
+    }
 }
