@@ -22,9 +22,10 @@
 //!   wrong. `p` is cut at `c` and loses [`PENALTY_SPLIT`] points: every byte
 //!   still lands in an output file, whereas dropping `c` would lose all of
 //!   it beyond `p`'s end;
-//! * `p` is `Complete`, `c` is on the grid, confident and lies inside `p`,
-//!   and `p` cannot contain `c`'s format (R2c, a strengthened R2'): `p`'s
-//!   length field claims the bytes of an unrelated, self-consistent file.
+//! * `p` is `Complete`, `c` is on the grid, scores at least 85 (see
+//!   [`TRUSTED_INSIDE`]) and lies inside `p`, and `p` cannot contain `c`'s
+//!   format (R2c, a strengthened R2'): `p`'s length field claims the bytes
+//!   of an unrelated, self-consistent file.
 //!   That is what an overwritten or truncated file whose size field
 //!   survived looks like (a deleted video whose clusters were reused for a
 //!   new photo). `c` is recorded as a *conflict* child of `p`, always
@@ -68,9 +69,16 @@ use crate::scan::Fmt;
 use crate::types::PENALTY_SPLIT;
 
 /// Confidence at which a complete file can no longer be split by R4, and
-/// at which a candidate on the grid is trusted against an enclosing file's
-/// length (P2, R2c).
+/// at which a candidate on the grid that runs past the end of an enclosing
+/// complete file is trusted against that file's length (P2).
 pub(crate) const STRONG: u8 = 80;
+
+/// Confidence a candidate on the grid lying fully inside a complete file
+/// needs to be a conflict child (R2c). Higher than [`STRONG`]: an EXIF
+/// block is a little TIFF file (IFD0, IFD1, thumbnail) that the TIFF
+/// measure scores 80, and HEIF, MP4, CR3, WebP, PNG and JPEG files carry
+/// one at an arbitrary offset, which lands on the grid by chance.
+pub(crate) const TRUSTED_INSIDE: u8 = 85;
 
 /// Upper bound on nested entries a single file keeps.
 pub(crate) const MAX_NESTED: usize = 65_536;
@@ -416,6 +424,7 @@ impl Resolver {
         // bytes are not handed to an enclosing file on that file's length
         // field alone.
         let c_trusted = c.aligned && c_eff.value() >= STRONG;
+        let c_conflict = c.aligned && c_eff.value() >= TRUSTED_INSIDE && !may;
         let p_complete = p.status == ExtentStatus::Complete;
         if p_complete && c_trusted && !inside {
             // P2: an embedded object never runs past its container.
@@ -433,7 +442,7 @@ impl Resolver {
             return;
         }
         if p.strong() {
-            if c_trusted && !may {
+            if c_conflict {
                 // R2c.
                 p.add_conflict(c, fmts);
                 return;
@@ -476,7 +485,7 @@ impl Resolver {
         if inside {
             if may {
                 p.add_child(c, fmts);
-            } else if c_trusted && p_complete {
+            } else if c_conflict && p_complete {
                 // R2c for a complete file R4 could not split.
                 p.add_conflict(c, fmts);
                 return;
@@ -879,6 +888,31 @@ mod tests {
             ]
         );
         assert_eq!(out[0].conflicts, 0);
+    }
+
+    #[test]
+    fn a_tiff_like_score_inside_is_no_conflict_but_running_past_is() {
+        // 80 (what an EXIF block measures as TIFF) is enough to cut a file
+        // it runs past, not to be a conflict child inside it.
+        let (out, r) = run(vec![
+            cand(0, 1, 100_000, ExtentStatus::Complete, 90),
+            cand(8192, 2, 4096, ExtentStatus::Complete, TRUSTED_INSIDE - 1),
+        ]);
+        assert_eq!(spans(&out), vec![(0, 100_000, ExtentStatus::Complete)]);
+        assert_eq!(out[0].conflicts, 0);
+        assert!(out[0].children.is_empty());
+        assert_eq!(r.suppressed, 1);
+        let (out, _) = run(vec![
+            cand(0, 1, 100_000, ExtentStatus::Complete, 90),
+            cand(98_304, 2, 4096, ExtentStatus::Complete, STRONG),
+        ]);
+        assert_eq!(
+            spans(&out),
+            vec![
+                (0, 98_304, ExtentStatus::Truncated),
+                (98_304, 4096, ExtentStatus::Complete)
+            ]
+        );
     }
 
     #[test]

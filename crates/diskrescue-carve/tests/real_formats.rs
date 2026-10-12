@@ -308,6 +308,36 @@ fn embedded_pictures_are_not_separate_files() {
 }
 
 #[test]
+fn an_exif_block_on_the_grid_is_not_a_separate_file() {
+    let Some(img) = image("contig") else {
+        return;
+    };
+    // Place the EXIF JPEG so that its APP1 TIFF header (a little TIFF file
+    // the TIFF measure accepts) lands on a sector boundary; deep scan.
+    let data = std::fs::read(&img.path).unwrap();
+    let o = img
+        .objects
+        .iter()
+        .find(|o| o.name == "photo_exif.jpg")
+        .unwrap();
+    let (s, l) = o.extents[0];
+    let jpeg = &data[s as usize..(s + l) as usize];
+    let tiff = jpeg
+        .windows(4)
+        .position(|w| w == b"II*\0" || w == b"MM\0*")
+        .expect("EXIF TIFF header");
+    let mut buf = vec![0u8; 8192 - tiff];
+    buf.extend_from_slice(jpeg);
+    buf.resize(buf.len() + 65_536, 0);
+    let src: SharedSource = Arc::new(MemSource::new(buf));
+    let (files, _) = scan(options(1), &src);
+    assert_eq!(files.len(), 1, "{files:#?}");
+    assert_eq!(files[0].start, (8192 - tiff) as u64);
+    assert_eq!(hash(&src, &files[0]), o.blake3);
+    assert_eq!(files[0].confidence, Confidence(90));
+}
+
+#[test]
 fn motion_photo_is_one_file() {
     let Some(img) = image("motion_photo") else {
         return;
