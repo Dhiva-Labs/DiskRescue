@@ -44,14 +44,19 @@ pub use status::{BlockStatus, Direction, MapBlock, ResizePolicy, Stats, StatusMa
 /// not mark finished attached as unreadable (bad sectors and areas never
 /// read or not yet trimmed/scraped all read back as zeros from the image).
 /// Image bytes beyond the extent of the mapfile are unreadable too.
-/// Assumes the image was written with `output_offset` 0.
+/// When the sidecar `<mapfile>.dr.json` records a non-zero
+/// `output_offset`, the map is applied at that offset in the image (the
+/// bytes before it were not written by the rescue and are left as they
+/// are); without a sidecar the offset is taken to be 0.
 pub fn open_rescued_image(image: &Path, mapfile: &Path) -> Result<FileSource> {
     let mf = MapFile::load(mapfile)?;
     let src = FileSource::open(image).map_err(|e| mapfile::io_ctx(e, image))?;
-    let mut unreadable = mf.map.unfinished_ranges();
-    let (img_len, map_len) = (src.size(), mf.map.size());
-    if img_len > map_len {
-        unreadable.insert(Range::new(map_len, img_len));
+    let offset = engine::sidecar_output_offset(mapfile).unwrap_or(0);
+    let mut unreadable = mf.map.unfinished_ranges().shifted_up(offset);
+    let img_len = src.size();
+    let map_end = mf.map.size().saturating_add(offset);
+    if img_len > map_end {
+        unreadable.insert(Range::new(map_end, img_len));
     }
     Ok(src.with_unreadable(unreadable))
 }
