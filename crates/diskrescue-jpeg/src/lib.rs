@@ -48,6 +48,7 @@ pub mod exif;
 mod huffman;
 pub mod markers;
 mod measure;
+mod pad;
 pub mod repair;
 pub mod scan;
 pub mod tables;
@@ -59,7 +60,10 @@ pub use exif::{parse_app1, ExifInfo};
 pub use markers::{walk_headers, Headers};
 pub use measure::MEASURE_DECODE_BUDGET;
 pub use repair::{apply, plan, Strategy};
-pub use scan::{analyze, analyze_source, AnalyzeOptions, ScanAnalysis, ScanError, ScanErrorKind};
+pub use scan::{
+    analyze, analyze_source, AnalyzeOptions, CutPoint, DamagedRange, ScanAnalysis, ScanError,
+    ScanErrorKind,
+};
 pub use validate::{zune_check, ZuneCheck};
 
 /// Default largest JPEG the carver measures (128 MiB).

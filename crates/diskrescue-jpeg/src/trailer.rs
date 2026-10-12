@@ -71,12 +71,12 @@ pub(crate) fn extend_after_eoi(cur: &mut Cursor<'_>, h: &Headers, eoi_end: u64) 
             if e.offset == 0 || e.size < 4 {
                 continue;
             }
-            let start = mpf.tiff_offset + e.offset as u64;
-            let end = start + e.size as u64;
+            let start = mpf.tiff_offset.saturating_add(e.offset as u64);
+            let end = start.saturating_add(e.size as u64);
             if start < eoi_end {
                 continue;
             }
-            if start + 3 > limit {
+            if start.saturating_add(3) > limit {
                 out.notes
                     .push(format!("MPF image {} lies beyond the readable data", i + 1));
                 out.truncated = true;
