@@ -975,7 +975,7 @@ const RECOVER_SLOTS: &[Slot] = &[
     Slot::Report,
 ];
 const SCAN_SLOTS: &[Slot] = &[Slot::Partitions, Slot::Listing, Slot::Carving];
-const REPAIR_SLOTS: &[Slot] = &[Slot::Validating, Slot::Repairing, Slot::Report];
+const REPAIR_SLOTS: &[Slot] = &[Slot::Validating, Slot::Repairing];
 
 fn slot_of(stage: &Stage) -> Slot {
     match stage {

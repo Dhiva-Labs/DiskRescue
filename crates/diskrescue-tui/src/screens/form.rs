@@ -235,7 +235,7 @@ impl Form {
         let name = target
             .as_ref()
             .map(|t| default_output_name(&t.info))
-            .unwrap_or_else(|| "repaired".to_string());
+            .unwrap_or_else(|| "repair".to_string());
         let out_dir = cfg.home.join("DiskRescue").join(&name);
         let image = out_dir.join(format!("{name}.img"));
         let kind_of_device = target
@@ -1559,7 +1559,7 @@ mod tests {
             panic!()
         };
         assert_eq!(p.files, vec![PathBuf::from("/a/b.mp4")]);
-        assert!(p.output.ends_with("DiskRescue/repaired") && !p.aggressive);
+        assert!(p.output.ends_with("DiskRescue/repair") && !p.aggressive);
         let f = Form::new(FormKind::Recover, Some(entry), vec![], &cfg);
         assert!(f.field(FieldId::Image).is_none());
     }

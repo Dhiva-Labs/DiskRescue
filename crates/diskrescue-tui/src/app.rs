@@ -1,7 +1,7 @@
 //! The application: a state machine that takes [`Event`]s and draws
 //! itself, so that tests can drive it without a terminal.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -158,7 +158,7 @@ pub struct App {
     run: Option<Run>,
     overlay: Option<Overlay>,
     status: Option<(String, Instant)>,
-    size: (u16, u16),
+    size: Cell<(u16, u16)>,
     quit: bool,
     exit_code: i32,
     interrupts: u32,
@@ -180,7 +180,7 @@ impl App {
             run: None,
             overlay: None,
             status: None,
-            size: (MIN_WIDTH, MIN_HEIGHT),
+            size: Cell::new((MIN_WIDTH, MIN_HEIGHT)),
             quit: false,
             exit_code: 0,
             interrupts: 0,
@@ -245,7 +245,8 @@ impl App {
 
     /// The window is smaller than the app can draw in.
     pub fn too_small(&self) -> bool {
-        self.size.0 < MIN_WIDTH || self.size.1 < MIN_HEIGHT
+        let (w, h) = self.size.get();
+        w < MIN_WIDTH || h < MIN_HEIGHT
     }
 
     fn set_status(&mut self, s: impl Into<String>) {
@@ -256,13 +257,13 @@ impl App {
 
     /// Tell the app the size of the window.
     pub fn resize(&mut self, w: u16, h: u16) {
-        self.size = (w, h);
+        self.size.set((w, h));
     }
 
     /// React to an event.
     pub fn handle_event(&mut self, ev: Event) {
         match ev {
-            Event::Resize(w, h) => self.size = (w, h),
+            Event::Resize(w, h) => self.size.set((w, h)),
             Event::Tick => self.on_tick(),
             Event::Interrupt => self.interrupt(),
             Event::Key(k) => self.on_key(k),
@@ -1058,7 +1059,7 @@ impl App {
     }
 
     fn repair_with_donor(&mut self, data: &ResultsData, target: usize, donor: PathBuf) {
-        let Some(file) = data.items.get(target).and_then(|i| i.path.clone()) else {
+        let Some(file) = data.sources.get(target).cloned().flatten() else {
             self.set_status("This file was not written, so it cannot be repaired.");
             return;
         };
@@ -1136,6 +1137,9 @@ impl App {
     pub fn draw(&self, f: &mut Frame) {
         let area = f.area();
         let theme = self.cfg.theme;
+        // What was drawn is the truth about the window, whether or not a
+        // resize event was delivered.
+        self.size.set((area.width, area.height));
         *self.hits.borrow_mut() = Hits::default();
         if area.width < MIN_WIDTH || area.height < MIN_HEIGHT {
             self.draw_too_small(f, area, &theme);

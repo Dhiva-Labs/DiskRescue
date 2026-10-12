@@ -175,7 +175,16 @@ pub fn main() -> i32 {
     }
     install_panic_hook();
     install_signal_handler();
-    let mut app = App::new(Config::detect());
+    // Internal hooks for the tests that run the real program in a
+    // pseudo-terminal: no real device is ever looked at, and a panic can be
+    // provoked to see that the terminal is given back.
+    let hooks = std::env::var("DISKRESCUE_TUI_TEST").unwrap_or_default();
+    let hook = |name: &str| hooks.split(',').any(|h| h == name);
+    let mut cfg = Config::detect();
+    if hook("no-devices") {
+        cfg.devices = crate::config::DeviceSource::Fixed(Vec::new());
+    }
+    let mut app = App::new(cfg);
     let mut session = match Session::start(mouse) {
         Ok(s) => s,
         Err(e) => {
@@ -183,6 +192,10 @@ pub fn main() -> i32 {
             return 1;
         }
     };
+    if hook("panic") {
+        let _ = session.terminal.draw(|f| app.draw(f));
+        panic!("selftest: a panic while the terminal is in the alternate screen");
+    }
     let result = run_loop(&mut app, &mut session.terminal);
     drop(session);
     if let Err(e) = result {

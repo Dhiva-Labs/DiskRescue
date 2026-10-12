@@ -130,3 +130,58 @@ pub fn flatten(screen: &str) -> String {
         .collect();
     no_boxes.split_whitespace().collect::<Vec<_>>().join(" ")
 }
+
+/// An app with one "device" that is a big, mostly empty regular file, and
+/// a rescue of it under way with tiny reads, so that it stays running.
+pub fn slow_rescue(home: &Path) -> (App, std::path::PathBuf) {
+    use diskrescue_tui::config::FixedDevice;
+    use diskrescue_tui::testing::{device, render};
+    let src = home.join("stick.bin");
+    {
+        let f = std::fs::File::create(&src).unwrap();
+        f.set_len(256 << 20).unwrap();
+    }
+    let out = home.join("rescue");
+    let mut info = device(
+        &src.display().to_string(),
+        diskrescue_core::device::DeviceKind::UsbFlash,
+        256 << 20,
+    );
+    info.model = Some("Test stick".into());
+    let mut app = App::new(Config::for_tests(
+        home,
+        vec![FixedDevice {
+            info,
+            needs_root: false,
+        }],
+    ));
+    app.resize(100, 30);
+    app.handle_event(Event::Tick);
+    press(&mut app, KeyCode::Enter);
+    press(&mut app, KeyCode::Enter);
+    for _ in 0..3 {
+        press(&mut app, KeyCode::PageUp);
+    }
+    replace_text(&mut app, &out.display().to_string());
+    // More options, then the size of one read (the last field).
+    for _ in 0..4 {
+        press(&mut app, KeyCode::Down);
+    }
+    press(&mut app, KeyCode::Down);
+    press(&mut app, KeyCode::Enter);
+    for _ in 0..6 {
+        press(&mut app, KeyCode::Down);
+    }
+    type_text(&mut app, "512");
+    app.handle_event(ctrl('s'));
+    wait_for_check(&mut app);
+    press(&mut app, KeyCode::Enter);
+    let started = tick_until(&mut app, Duration::from_secs(60), |a| {
+        a.run().is_some_and(|r| {
+            matches!(&r.snap, diskrescue_tui::screens::run::Snap::Recover(s)
+                if s.image.as_ref().is_some_and(|i| i.progress.is_some()))
+        })
+    });
+    assert!(started, "{}", render(&app, 100, 30));
+    (app, out)
+}

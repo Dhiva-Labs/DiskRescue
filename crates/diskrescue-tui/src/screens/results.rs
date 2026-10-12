@@ -7,9 +7,7 @@ use std::sync::Arc;
 
 use crossterm::event::{KeyCode, KeyEvent};
 use diskrescue_app::results::{self, ResultItem};
-use diskrescue_app::text::{
-    self, bytes, date_text, outcome_label, outcome_tone, plural, repair_result_label,
-};
+use diskrescue_app::text::{self, bytes, date_text, outcome_label, outcome_tone, plural};
 use diskrescue_core::media::MediaCategory;
 use diskrescue_recover::report::{Outcome, Report};
 use ratatui::layout::{Constraint, Layout, Rect};
@@ -17,6 +15,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use ratatui::Frame;
 
+use crate::model::plain_words;
 use crate::widgets::{ellipsize_start, fit, fit_right, render_list, wrap_words, ListNav, Theme};
 
 /// A report and its files ready to show.
@@ -28,16 +27,41 @@ pub struct ResultsData {
     pub items: Vec<ResultItem>,
     /// The report.
     pub report: Arc<Report>,
+    /// For each item: it is a file the person gave (a repair), not one
+    /// that was recovered.
+    pub is_input: Vec<bool>,
+    /// For each item: the file to act on. A recovered file as written to
+    /// the output folder; for a repair, the file that was given (the
+    /// repaired copy is `ResultItem::repaired`).
+    pub sources: Vec<Option<PathBuf>>,
 }
 
 impl ResultsData {
     /// Items of `report`, with absolute paths below `output`.
     pub fn new(output: PathBuf, report: Arc<Report>) -> Self {
         let items = results::items(&report, &output);
+        let mut is_input = Vec::with_capacity(items.len());
+        let mut sources = Vec::with_capacity(items.len());
+        for (item, rec) in items.iter().zip(report.files.iter()) {
+            match &rec.origin {
+                diskrescue_recover::report::Origin::Input { path } => {
+                    is_input.push(true);
+                    sources.push(Some(
+                        std::path::absolute(path).unwrap_or_else(|_| path.clone()),
+                    ));
+                }
+                _ => {
+                    is_input.push(false);
+                    sources.push(item.path.clone());
+                }
+            }
+        }
         ResultsData {
             output,
             items,
             report,
+            is_input,
+            sources,
         }
     }
 
@@ -315,10 +339,12 @@ impl ResultsScreen {
             KeyCode::Char('J') => self.detail_scroll = self.detail_scroll.saturating_add(3),
             KeyCode::Char('K') => self.detail_scroll = self.detail_scroll.saturating_sub(3),
             KeyCode::Char('o') | KeyCode::Enter => {
-                let dir = match self
-                    .selected()
-                    .and_then(|(_, it)| it.repaired.clone().or_else(|| it.path.clone()))
-                {
+                let dir = match self.selected().and_then(|(i, it)| {
+                    it.repaired
+                        .clone()
+                        .or_else(|| it.path.clone())
+                        .or_else(|| self.data.sources[i].clone())
+                }) {
                     Some(p) => p.parent().map(PathBuf::from).unwrap_or(p),
                     None => self.data.output.clone(),
                 };
@@ -336,7 +362,7 @@ impl ResultsScreen {
                             .into(),
                     );
                 }
-                if it.path.is_none() {
+                if self.data.sources[i].is_none() {
                     return ResAction::Status(
                         "This file was not written, so it cannot be repaired.".into(),
                     );
@@ -475,8 +501,7 @@ impl ResultsScreen {
         let rows: Vec<Line<'static>> = self
             .view
             .iter()
-            .map(|&i| self.data.items[i].clone())
-            .map(|it| item_row(&it, &self.data.output, w, theme))
+            .map(|&i| item_row(&self.data, i, w, theme))
             .collect();
         let off = if rows.is_empty() {
             let msg = if self.data.items.is_empty() {
@@ -494,7 +519,7 @@ impl ResultsScreen {
         let inner = block.inner(detail_area);
         f.render_widget(block, detail_area);
         let lines = match self.selected() {
-            Some((_, it)) => detail_lines(it, &self.data.output, inner.width as usize, theme),
+            Some((i, _)) => detail_lines(&self.data, i, inner.width as usize, theme),
             None => vec![Line::from(Span::styled("Nothing selected.", theme.dim()))],
         };
         let max = lines.len().saturating_sub(inner.height as usize) as u16;
@@ -530,10 +555,20 @@ fn kind_word(c: MediaCategory) -> &'static str {
     }
 }
 
-fn display_name(it: &ResultItem, output: &std::path::Path) -> String {
+fn display_name(data: &ResultsData, i: usize) -> String {
+    let it = &data.items[i];
     match it.repaired.as_ref().or(it.path.as_ref()) {
-        Some(p) => p.strip_prefix(output).unwrap_or(p).display().to_string(),
-        None => "(not written)".to_string(),
+        Some(p) => p
+            .strip_prefix(&data.output)
+            .unwrap_or(p)
+            .display()
+            .to_string(),
+        None => match &data.sources[i] {
+            // A file that needed no repair, or could not be repaired, stays
+            // where it is.
+            Some(p) if data.is_input[i] => p.display().to_string(),
+            _ => "(not written)".to_string(),
+        },
     }
 }
 
@@ -550,12 +585,8 @@ fn short_outcome(o: Outcome) -> &'static str {
     }
 }
 
-fn item_row(
-    it: &ResultItem,
-    output: &std::path::Path,
-    width: usize,
-    theme: &Theme,
-) -> Line<'static> {
+fn item_row(data: &ResultsData, i: usize, width: usize, theme: &Theme) -> Line<'static> {
+    let it = &data.items[i];
     let tone = outcome_tone(it.outcome);
     let name_w = width.saturating_sub(2 + 16 + 5 + 10 + 6);
     Line::from(vec![
@@ -567,7 +598,7 @@ fn item_row(
         Span::styled(if it.deleted { "del  " } else { "     " }, theme.warn()),
         Span::raw(format!("{} ", fit_right(&bytes(it.size), 9))),
         Span::raw(format!("{} ", fit(kind_word(it.category), 5))),
-        Span::raw(ellipsize_start(&display_name(it, output), name_w)),
+        Span::raw(ellipsize_start(&display_name(data, i), name_w)),
     ])
 }
 
@@ -578,7 +609,7 @@ fn kv(
     theme: &Theme,
     style: Option<ratatui::style::Style>,
 ) -> Vec<Line<'static>> {
-    let lead = 11usize;
+    let lead = 12usize;
     let parts = wrap_words(v, width.saturating_sub(lead).max(8));
     parts
         .into_iter()
@@ -602,16 +633,20 @@ fn kv(
 
 /// The detail pane of a file.
 pub fn detail_lines(
-    it: &ResultItem,
-    output: &std::path::Path,
+    data: &ResultsData,
+    i: usize,
     width: usize,
     theme: &Theme,
 ) -> Vec<Line<'static>> {
+    let it = &data.items[i];
+    let output = data.output.as_path();
+    let is_input = data.is_input[i];
     let mut v: Vec<Line<'static>> = Vec::new();
     let tone = outcome_tone(it.outcome);
     let name = it
         .path
         .as_ref()
+        .or(data.sources[i].as_ref())
         .and_then(|p| p.file_name())
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| "(not written)".to_string());
@@ -621,34 +656,48 @@ pub fn detail_lines(
         result.push_str(", found as a deleted file");
     }
     v.extend(kv("Result", &result, width, theme, Some(theme.tone(tone))));
-    if it.repaired.is_some() {
-        v.extend(kv(
-            "Repair",
-            repair_result_label(it.outcome),
-            width,
-            theme,
-            None,
-        ));
+    if matches!(it.outcome, Outcome::Damaged | Outcome::PartiallyRepaired)
+        && data.sources[i].is_some()
+    {
+        v.push(Line::from(Span::styled(
+            "Press r to repair it with a healthy reference file.",
+            theme.accent(),
+        )));
     }
-    if let Some(p) = &it.path {
-        v.extend(kv(
-            "Saved as",
-            &p.strip_prefix(output).unwrap_or(p).display().to_string(),
-            width,
-            theme,
-            None,
-        ));
+    if is_input {
+        if let Some(p) = &data.sources[i] {
+            v.extend(kv("Original", &p.display().to_string(), width, theme, None));
+        }
+        if let Some(p) = &it.repaired {
+            v.extend(kv(
+                "Repaired as",
+                &p.strip_prefix(output).unwrap_or(p).display().to_string(),
+                width,
+                theme,
+                None,
+            ));
+        }
+    } else {
+        if let Some(p) = &it.path {
+            v.extend(kv(
+                "Saved as",
+                &p.strip_prefix(output).unwrap_or(p).display().to_string(),
+                width,
+                theme,
+                None,
+            ));
+        }
+        if let Some(p) = &it.repaired {
+            v.extend(kv(
+                "Repaired as",
+                &p.strip_prefix(output).unwrap_or(p).display().to_string(),
+                width,
+                theme,
+                None,
+            ));
+        }
+        v.extend(kv("Found at", &it.origin, width, theme, None));
     }
-    if let Some(p) = &it.repaired {
-        v.extend(kv(
-            "Repaired as",
-            &p.strip_prefix(output).unwrap_or(p).display().to_string(),
-            width,
-            theme,
-            None,
-        ));
-    }
-    v.extend(kv("Found at", &it.origin, width, theme, None));
     let mut kind = vec![kind_word(it.category).to_string()];
     if let Some(f) = &it.format {
         kind.push(f.clone());
@@ -693,7 +742,7 @@ pub fn detail_lines(
         for (n, p) in it.problems.iter().enumerate() {
             v.extend(kv(
                 if n == 0 { "Problems" } else { "" },
-                p,
+                &plain_words(p),
                 width,
                 theme,
                 Some(theme.warn()),
@@ -720,13 +769,6 @@ pub fn detail_lines(
             theme,
             None,
         ));
-    }
-    if matches!(it.outcome, Outcome::Damaged | Outcome::PartiallyRepaired) && it.path.is_some() {
-        v.push(Line::raw(""));
-        v.push(Line::from(Span::styled(
-            "Press r to repair it with a healthy file from the same camera as a reference.",
-            theme.accent(),
-        )));
     }
     v
 }
@@ -762,7 +804,7 @@ pub fn rank_donors(data: &ResultsData, damaged: usize) -> Vec<Donor> {
         {
             continue;
         }
-        let Some(path) = it.path.clone() else {
+        let Some(path) = data.sources[i].clone() else {
             continue;
         };
         let same_format = it.format.is_some() && it.format == target.format;
@@ -891,11 +933,9 @@ impl DonorScreen {
 
     /// Draw the chooser. Returns the rows' area and first visible row.
     pub fn draw(&self, f: &mut Frame, area: Rect, theme: &Theme) -> (Rect, usize) {
-        let it = &self.data.items[self.target];
         let [head, list] =
             Layout::vertical([Constraint::Length(5), Constraint::Min(2)]).areas(area);
-        let name = it
-            .path
+        let name = self.data.sources[self.target]
             .as_ref()
             .map(|p| p.display().to_string())
             .unwrap_or_default();
