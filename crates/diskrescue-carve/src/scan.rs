@@ -31,7 +31,7 @@ use diskrescue_core::{Error, Range, RangeSet, ReadError, Result, SharedSource, S
 
 use crate::patterns::{Hit, PatternSet, SearchArea};
 use crate::plan::{Planner, Window};
-use crate::resolve::{Candidate, Child, Open, PendingState, Resolver, ResolverCfg};
+use crate::resolve::{Candidate, Child, Open, PendingState, Resolver, ResolverCfg, MAX_NESTED};
 use crate::types::{
     CarveMode, CarveOptions, CarvedFile, ExtractReport, ScanProgress, ScanSummary, MAX_CHUNK_SIZE,
     MAX_PROBE_WINDOW, MIN_CHUNK_SIZE, PENALTY_ALLOCATED, PENALTY_CONFLICT, PENALTY_OFF_CLUSTER,
@@ -44,6 +44,9 @@ const SUB_WINDOW: u64 = 256 << 10;
 
 /// Nested objects measured per parent for promotion.
 const MAX_CHILDREN: usize = 4096;
+
+/// Notes kept from one measurement.
+const MAX_FORMAT_NOTES: usize = 64;
 
 /// Jobs in flight per worker before the scanner waits.
 const IN_FLIGHT_PER_WORKER: usize = 4;
@@ -205,6 +208,24 @@ fn measure_guarded(ctx: &JobCtx, f: &Fmt, start: u64, limit: u64) -> Option<Meas
             .push("reported length exceeded the read limit; clamped".into());
     }
     m.confidence = Confidence::new(m.confidence.value());
+    // Keep what a buggy or hostile format returns self-consistent and
+    // bounded: nested ranges inside the file and well-formed (`Range` has
+    // public fields, so `end < start` can be built), the error offset
+    // inside the file, a bounded number of entries.
+    let len = m.len;
+    m.nested.truncate(MAX_NESTED);
+    for n in &mut m.nested {
+        n.range = Range::new(n.range.start.min(len), n.range.end.min(len));
+    }
+    m.nested.retain(|n| !n.range.is_empty());
+    if let Some(e) = m.err_offset {
+        m.err_offset = Some(e.min(len));
+    }
+    if m.notes.len() > MAX_FORMAT_NOTES {
+        let extra = m.notes.len() - MAX_FORMAT_NOTES;
+        m.notes.truncate(MAX_FORMAT_NOTES);
+        m.notes.push(format!("{extra} further notes omitted"));
+    }
     Some(m)
 }
 

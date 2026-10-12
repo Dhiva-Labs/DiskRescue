@@ -11,9 +11,138 @@ use std::sync::Arc;
 
 use common::*;
 use diskrescue_carve::{CarveMode, CarvedFile, Carver, ScanSummary, MAX_CHUNK_SIZE};
-use diskrescue_core::format::Confidence;
+use diskrescue_core::format::{
+    Confidence, ExtentStatus, FileFormat, FormatRegistry, Measured, Nested, NestedRole, Signature,
+    Validation,
+};
+use diskrescue_core::media::MediaCategory;
 use diskrescue_core::source::MemSource;
 use diskrescue_core::{Range, RangeSet, ReadError, ReadErrorKind, SharedSource, Source};
+
+/// Returns an absurd measurement record: reversed and out-of-file nested
+/// ranges (some pointing at real `test` files), 200 000 nested entries, an
+/// error offset of `u64::MAX` and 100 000 notes.
+struct Garbage;
+
+static GARB_SIGS: &[Signature] = &[Signature::at_start(b"GARB")];
+
+impl FileFormat for Garbage {
+    fn id(&self) -> &'static str {
+        "garb"
+    }
+    fn name(&self) -> &'static str {
+        "garbage"
+    }
+    fn extensions(&self) -> &'static [&'static str] {
+        &["garb"]
+    }
+    fn category(&self) -> MediaCategory {
+        MediaCategory::Video
+    }
+    fn signatures(&self) -> &'static [Signature] {
+        GARB_SIGS
+    }
+    fn min_size(&self) -> u64 {
+        1
+    }
+    fn max_size(&self) -> u64 {
+        1 << 20
+    }
+    fn may_contain(&self, inner: &str) -> bool {
+        inner == "test"
+    }
+    fn measure(
+        &self,
+        _: &SharedSource,
+        _: u64,
+        limit: u64,
+    ) -> diskrescue_core::Result<Option<Measured>> {
+        let len = limit.min(100_000);
+        let mut m = Measured::truncated(len, Confidence(60), u64::MAX, "garbage");
+        m.status = ExtentStatus::Truncated;
+        let mut nested = vec![
+            Nested {
+                range: Range {
+                    start: 50_000,
+                    end: 10,
+                },
+                format: Some("test".into()),
+                role: NestedRole::Thumbnail,
+            },
+            Nested {
+                range: Range::new(90_000, u64::MAX),
+                format: Some("test".into()),
+                role: NestedRole::Preview,
+            },
+            Nested {
+                range: Range::new(8192, 8192 + 5000),
+                format: Some("test".into()),
+                role: NestedRole::Thumbnail,
+            },
+            Nested {
+                range: Range::new(u64::MAX - 1, u64::MAX),
+                format: None,
+                role: NestedRole::Trailer,
+            },
+        ];
+        nested.extend((0..200_000u64).map(|i| Nested {
+            range: Range::with_len(i % 100_000, 1),
+            format: Some("nope".into()),
+            role: NestedRole::Frame,
+        }));
+        m.nested = nested;
+        m.notes = (0..100_000).map(|i| format!("note {i}")).collect();
+        Ok(Some(m))
+    }
+    fn validate(&self, _: &SharedSource) -> diskrescue_core::Result<Validation> {
+        Ok(Validation::invalid("test format"))
+    }
+}
+
+#[test]
+fn absurd_measurement_records_are_sanitised() {
+    let size = 1 << 20;
+    let mut img = random_bytes(size, 90);
+    let base = 65_536;
+    img[base..base + 4].copy_from_slice(b"GARB");
+    put(&mut img, base + 8192, &test_file(5000, 1));
+    let src: SharedSource = Arc::new(MemSource::new(img));
+    let reg = FormatRegistry::new()
+        .with(Arc::new(Garbage))
+        .with(Arc::new(LenFmt::test()));
+    for promote in [false, true] {
+        let mut o = opts(reg.clone());
+        o.promote_nested = promote;
+        let s2 = src.clone();
+        let (files, _) = with_timeout(move || carve(o, &s2));
+        let g = &files[0];
+        assert_eq!(
+            (g.format.as_str(), g.start, g.len),
+            ("garb", 65_536, 100_000)
+        );
+        assert!(g.err_offset.is_some_and(|e| e <= g.len));
+        assert!(g.nested.len() <= 65_536);
+        assert!(g
+            .nested
+            .iter()
+            .all(|n| n.range.start < n.range.end && n.range.end <= g.len));
+        assert!(g.notes.len() < 100);
+        // The test file the record points at comes out as a promoted child
+        // (the parent is truncated), never as an overlapping top-level file.
+        let kids: Vec<_> = files.iter().filter(|f| f.parent == Some(g.id)).collect();
+        assert_eq!(kids.len(), 1, "{:?}", spans(&files));
+        assert_eq!((kids[0].start, kids[0].len), (65_536 + 8192, 5000));
+    }
+}
+
+fn with_timeout<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(f());
+    });
+    rx.recv_timeout(std::time::Duration::from_secs(120))
+        .expect("finished in time")
+}
 
 /// Four test files at 4 KiB-aligned offsets in a random 8 MiB image.
 fn image() -> (Vec<u8>, Vec<(String, u64, u64)>) {
