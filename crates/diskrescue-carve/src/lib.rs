@@ -81,6 +81,16 @@
 //!   was emitted.
 //! * At most 4096 nested objects per file are measured for promotion, and
 //!   motion-photo trailers are never promoted.
+//! * A weakly measured file (a moov-less MP4 scores 25) whose header lies
+//!   inside a complete, confident file is still suppressed: only confident
+//!   headers count as evidence against an enclosing file's length. A file
+//!   of a format the enclosing file may contain (a JPEG inside an MP4) is
+//!   taken as embedded unless it runs past the enclosing file's end.
+//! * Weak signatures (fewer than three fixed bytes: MPEG-TS, M2TS, bare MP3
+//!   frames, BMP) are only tried at 512-byte multiples, even in a deep scan.
+//! * Alignment is taken from absolute source offsets, not from a partition
+//!   origin; with `alignment` above 512 on a disk image whose partition does
+//!   not start on that grid, use the `cluster` grid instead.
 
 #![warn(missing_docs)]
 
