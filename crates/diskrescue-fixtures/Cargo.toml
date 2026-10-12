@@ -14,11 +14,13 @@ thiserror.workspace = true
 log.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-image.workspace = true
+image = { workspace = true, features = ["gif", "bmp", "webp"] }
 crc32fast.workspace = true
 flate2.workspace = true
-rand.workspace = true
 tempfile.workspace = true
 
 [dev-dependencies]
 
+[[bin]]
+name = "gen-fixtures"
+path = "src/bin/gen-fixtures.rs"
