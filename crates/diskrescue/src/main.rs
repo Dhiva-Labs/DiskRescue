@@ -12,6 +12,7 @@ mod args;
 mod cmd;
 mod error;
 mod logging;
+mod ownership;
 mod profile_text;
 mod progress;
 mod signal;
@@ -50,7 +51,11 @@ fn real_main() -> i32 {
     } else {
         signal::global()
     };
-    match dispatch(cli.command, &interrupt) {
+    let started = std::time::SystemTime::now() - std::time::Duration::from_secs(2);
+    let written = written_paths(&cli.command);
+    let result = dispatch(cli.command, &interrupt);
+    ownership::hand_back(&written, started);
+    match result {
         Ok(code) => code,
         Err(e) => {
             report_error(&e);
@@ -65,6 +70,24 @@ fn can_stop_cleanly(command: &Command) -> bool {
         command,
         Command::Image(_) | Command::Scan(_) | Command::Recover(_) | Command::Carve(_)
     )
+}
+
+/// Paths a command writes to, so that files created under sudo can be given
+/// back to the user afterwards.
+fn written_paths(command: &Command) -> Vec<std::path::PathBuf> {
+    match command {
+        Command::Image(a) => ownership::image_and_sidecars(&a.image, a.map.as_deref()),
+        Command::Recover(a) => {
+            let mut v = vec![a.output.clone()];
+            if let Some(img) = &a.image_to {
+                v.extend(ownership::image_and_sidecars(img, a.map.as_deref()));
+            }
+            v
+        }
+        Command::Carve(a) => vec![a.output.clone()],
+        Command::Repair(a) => vec![a.output.clone()],
+        _ => Vec::new(),
+    }
 }
 
 fn dispatch(command: Command, interrupt: &Arc<Interrupt>) -> CmdResult {

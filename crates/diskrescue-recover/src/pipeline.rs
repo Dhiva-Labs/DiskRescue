@@ -316,11 +316,12 @@ pub fn discover(
             origin: vol.entry.origin.clone(),
             files_listed: 0,
             deleted_listed: 0,
-            warnings: vol
-                .probe
-                .as_ref()
-                .map(|p| p.notes.clone())
-                .unwrap_or_default(),
+            warnings: match &vol.probe {
+                Some(p) if p.via_backup => {
+                    vec!["found through the backup boot sector (the primary one is damaged)".into()]
+                }
+                _ => Vec::new(),
+            },
             error: None,
         };
         match kind {
@@ -502,6 +503,44 @@ pub struct Candidate {
     pub category: MediaCategory,
     /// Format id when sniffed.
     pub format: Option<String>,
+    /// For deleted FAT entries whose first letter was lost: the name with
+    /// the letter restored from neighbouring files (used for the output
+    /// name only; the entry itself is read unchanged).
+    pub restored_name: Option<String>,
+}
+
+/// Restore the first letter of a deleted FAT short name (`_MG_0004.JPG`)
+/// from live files in the same folder (`IMG_0003.JPG`, `IMG_0005.JPG`).
+/// Only when the neighbours agree clearly; otherwise `None`.
+pub fn restore_first_letter(name: &str, siblings: &[String]) -> Option<String> {
+    let rest = name.strip_prefix('_')?;
+    if rest.is_empty() {
+        return None;
+    }
+    let ext = |n: &str| n.rsplit_once('.').map(|(_, e)| e.to_ascii_lowercase());
+    let k = rest
+        .char_indices()
+        .nth(3)
+        .map(|(i, _)| i)
+        .unwrap_or(rest.len());
+    let mut counts: std::collections::BTreeMap<char, usize> = std::collections::BTreeMap::new();
+    for sib in siblings {
+        let mut chars = sib.chars();
+        let Some(first) = chars.next() else { continue };
+        let srest = chars.as_str();
+        if srest.len() != rest.len() || !srest.is_char_boundary(k) || ext(srest) != ext(rest) {
+            continue;
+        }
+        if srest[..k].eq_ignore_ascii_case(&rest[..k]) {
+            *counts.entry(first).or_default() += 1;
+        }
+    }
+    let total: usize = counts.values().sum();
+    let (&best, &n) = counts.iter().max_by_key(|(_, n)| **n)?;
+    if best == '_' || n * 3 < total * 2 {
+        return None;
+    }
+    Some(format!("{best}{rest}"))
 }
 
 /// Walk every parsed volume and pick entries the selection wants.
@@ -516,6 +555,10 @@ pub fn select_entries(
 ) -> Vec<Candidate> {
     let mut picked = Vec::new();
     let mut to_sniff: Vec<(usize, FileEntry)> = Vec::new();
+    // Live file names per folder, to restore lost first letters of deleted
+    // FAT short names.
+    let mut live_names: std::collections::HashMap<(usize, Option<u64>), Vec<String>> =
+        std::collections::HashMap::new();
     for (vi, pv) in parsed.iter().enumerate() {
         let mut listed = 0u64;
         let mut deleted = 0u64;
@@ -529,6 +572,11 @@ pub fn select_entries(
             listed += 1;
             if e.deleted {
                 deleted += 1;
+            } else {
+                live_names
+                    .entry((vi, e.parent_id))
+                    .or_default()
+                    .push(e.name.clone());
             }
             if !sel.wants_entry_state(e) || !sel.wants_size(e.size) {
                 return WalkControl::Continue;
@@ -539,6 +587,7 @@ pub fn select_entries(
                     entry: e.clone(),
                     category: cat,
                     format: None,
+                    restored_name: None,
                 }),
                 Some(_) => {}
                 None if sel.wants_everything() => picked.push(Candidate {
@@ -546,6 +595,7 @@ pub fn select_entries(
                     entry: e.clone(),
                     category: MediaCategory::Other,
                     format: None,
+                    restored_name: None,
                 }),
                 None if sel.sniff_unknown && e.size >= 16 => to_sniff.push((vi, e.clone())),
                 None => {}
@@ -594,10 +644,20 @@ pub fn select_entries(
                 category: fmt.category(),
                 format: Some(fmt.id().to_string()),
                 entry,
+                restored_name: None,
             })
         })
         .collect();
     picked.extend(sniffed);
+    for c in &mut picked {
+        let lost_first =
+            c.entry.deleted && c.entry.flags.iter().any(|f| f == "first character lost");
+        if lost_first {
+            if let Some(sibs) = live_names.get(&(c.volume, c.entry.parent_id)) {
+                c.restored_name = restore_first_letter(&c.entry.name, sibs);
+            }
+        }
+    }
     picked
 }
 
@@ -777,7 +837,21 @@ fn extract_fs_entry(ctx: &Ctx<'_>, pv: &ParsedVolume, c: &Candidate) -> FileReco
         e.size,
     );
     rec.format = c.format.clone();
-    let rel = OutputTree::fs_relative(&pv.dir, e);
+    let rel = match &c.restored_name {
+        Some(name) => {
+            let mut shown = e.clone();
+            shown.path = match e.path.rsplit_once('/') {
+                Some((dir, _)) => format!("{dir}/{name}"),
+                None => name.clone(),
+            };
+            shown.name = name.clone();
+            rec.notes.push(format!(
+                "the first letter of this deleted file's name was lost; restored as \"{name}\" from the other files in its folder"
+            ));
+            OutputTree::fs_relative(&pv.dir, &shown)
+        }
+        None => OutputTree::fs_relative(&pv.dir, e),
+    };
     let (file, rel) = match ctx.tree.create_new(&rel) {
         Ok(x) => x,
         Err(err) => {
@@ -1597,6 +1671,43 @@ pub fn survey(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn first_letter_restoration() {
+        let sibs: Vec<String> = [
+            "IMG_0001.JPG",
+            "IMG_0002.JPG",
+            "IMG_0003.JPG",
+            "MVI_0004.MOV",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        assert_eq!(
+            restore_first_letter("_MG_0009.JPG", &sibs).as_deref(),
+            Some("IMG_0009.JPG")
+        );
+        assert_eq!(
+            restore_first_letter("_VI_0010.MOV", &sibs).as_deref(),
+            Some("MVI_0010.MOV")
+        );
+        // Nothing similar: leave it.
+        assert_eq!(restore_first_letter("_OC_0001.PDF", &sibs), None);
+        // Neighbours use a real underscore (Nikon Adobe RGB names): leave it.
+        let nikon: Vec<String> = ["_DSC1000.JPG", "_DSC1001.JPG"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(restore_first_letter("_DSC1002.JPG", &nikon), None);
+        // Disagreement without a clear majority: leave it.
+        let mixed: Vec<String> = ["IMG_0001.JPG", "XMG_0002.JPG"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(restore_first_letter("_MG_0003.JPG", &mixed), None);
+        assert_eq!(restore_first_letter("NOPREFIX.JPG", &sibs), None);
+        assert_eq!(restore_first_letter("_", &sibs), None);
+    }
 
     #[test]
     fn rank_order() {
