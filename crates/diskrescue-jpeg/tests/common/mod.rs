@@ -23,15 +23,65 @@ pub fn large_fixture() -> Option<&'static Path> {
     DIR.get_or_init(|| generate("large")).as_deref()
 }
 
+/// Directory with the realistic camera/phone set (`gen_camera.py`).
+pub fn camera_fixtures() -> Option<&'static Path> {
+    static DIR: OnceLock<Option<PathBuf>> = OnceLock::new();
+    DIR.get_or_init(|| run_script("gen_camera.py", "camera", &[]))
+        .as_deref()
+}
+
+/// `(name, offset just past the primary image's EOI)` for every file of
+/// the camera set, from its manifest.
+pub fn camera_manifest(dir: &Path) -> Vec<(String, u64)> {
+    std::fs::read_to_string(dir.join("manifest.txt"))
+        .unwrap()
+        .lines()
+        .filter_map(|l| {
+            let (n, len) = l.split_once(' ')?;
+            Some((n.to_string(), len.parse().ok()?))
+        })
+        .collect()
+}
+
+/// True when Pillow decodes `path` completely (`None` when python3 or
+/// Pillow is missing, after an explicit "skipped" message).
+pub fn pillow_decodes(path: &Path) -> Option<bool> {
+    let o = Command::new("python3")
+        .arg("-c")
+        .arg("import sys\nfrom PIL import Image\nim = Image.open(sys.argv[1])\nim.load()")
+        .arg(path)
+        .output();
+    match o {
+        Ok(o) if o.status.success() => Some(true),
+        Ok(o) => {
+            if String::from_utf8_lossy(&o.stderr).contains("No module named") {
+                eprintln!("skipped: Pillow missing");
+                return None;
+            }
+            Some(false)
+        }
+        Err(_) => {
+            eprintln!("skipped: python3 missing");
+            None
+        }
+    }
+}
+
 fn generate(set: &str) -> Option<PathBuf> {
+    run_script("gen_jpegs.py", set, &[set])
+}
+
+fn run_script(script: &str, tag: &str, args: &[&str]) -> Option<PathBuf> {
     let dir = Path::new(env!("CARGO_TARGET_TMPDIR"))
-        .join(format!("jpeg-fixtures-{}-{set}", env!("CARGO_CRATE_NAME")));
+        .join(format!("jpeg-fixtures-{}-{tag}", env!("CARGO_CRATE_NAME")));
     let _ = std::fs::remove_dir_all(&dir);
-    let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/gen_jpegs.py");
+    let script = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures")
+        .join(script);
     match Command::new("python3")
         .arg(&script)
         .arg(&dir)
-        .arg(set)
+        .args(args)
         .output()
     {
         Ok(o) if o.status.success() => Some(dir),

@@ -180,8 +180,10 @@ pub(crate) fn measure(src: &SharedSource, start: u64, limit: u64) -> Result<Opti
     if let Some(off) = cur.read_error_offset() {
         notes.push(format!("unreadable data at file offset {off}"));
     }
+    // Known bad sectors inside the extent are only reported: the carver
+    // applies its own confidence penalty for holes, and lowering it here
+    // as well would count the same hole twice.
     if src.overlaps_unreadable(start, len) {
-        confidence = confidence.lowered(10);
         let bad = src
             .unreadable()
             .map(|s| {

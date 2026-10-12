@@ -8,10 +8,12 @@
 //! up to [`ZUNE_MAX_BYTES`] and [`ZUNE_MAX_PIXELS`], inside a panic guard.
 
 use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::sync::mpsc;
+use std::time::Duration;
 
 use diskrescue_core::format::{RepairContext, Validation, ValidationStatus};
 use diskrescue_core::media::MediaMeta;
-use diskrescue_core::source::{Source, SourceExt};
+use diskrescue_core::source::{ReadError, Source};
 use diskrescue_core::{Range, Result};
 use zune_jpeg::zune_core::options::DecoderOptions;
 use zune_jpeg::JpegDecoder;
@@ -50,14 +52,89 @@ pub struct ZuneCheck {
     pub error: Option<String>,
 }
 
+/// Longest a reference decode may take before it is abandoned.
+pub const ZUNE_TIMEOUT: Duration = Duration::from_secs(60);
+
 /// Decode `data` with zune-jpeg, strictly and then leniently.
+///
+/// The decoder allocates its whole output up front from the frame header
+/// it parses itself (which need not be the one this crate's header walk
+/// used: a second SOF, a different resynchronisation), so the dimensions
+/// are read first and images above [`ZUNE_MAX_PIXELS`] are not decoded:
+/// an allocation of several GiB aborts the process, which no panic guard
+/// can catch.
+///
+/// zune-jpeg 0.4 can also loop forever: its lenient progressive decoder
+/// retries the last marker when the data ends without an EOI. The lenient
+/// pass therefore always sees an EOI at the end, and the whole check runs
+/// on a worker thread that is abandoned after [`ZUNE_TIMEOUT`] (the
+/// result then says so) instead of hanging the caller.
 pub fn zune_check(data: &[u8]) -> ZuneCheck {
+    zune_check_owned(data.to_vec())
+}
+
+/// [`zune_check`] on an owned buffer (no extra copy).
+pub(crate) fn zune_check_owned(data: Vec<u8>) -> ZuneCheck {
+    let (tx, rx) = mpsc::channel();
+    let worker = std::thread::Builder::new()
+        .name("zune-check".into())
+        .spawn(move || {
+            let r = catch_unwind(AssertUnwindSafe(|| zune_decode(data)));
+            let _ = tx.send(r.unwrap_or_else(|_| ZuneCheck {
+                error: Some("decoder panicked".into()),
+                ..Default::default()
+            }));
+        });
+    if worker.is_err() {
+        return ZuneCheck {
+            error: Some("reference decoder could not be started".into()),
+            ..Default::default()
+        };
+    }
+    rx.recv_timeout(ZUNE_TIMEOUT).unwrap_or_else(|_| ZuneCheck {
+        error: Some(format!(
+            "reference decoder gave up after {} s",
+            ZUNE_TIMEOUT.as_secs()
+        )),
+        ..Default::default()
+    })
+}
+
+fn zune_decode(mut data: Vec<u8>) -> ZuneCheck {
     let base = DecoderOptions::default()
         .set_max_width(1 << 16)
         .set_max_height(1 << 16);
     let mut out = ZuneCheck::default();
+    let headers = catch_unwind(AssertUnwindSafe(|| {
+        let mut d = JpegDecoder::new_with_options(&data[..], base.set_strict_mode(false));
+        d.decode_headers().map(|_| d.info())
+    }));
+    match headers {
+        Ok(Ok(Some(info))) => {
+            let pixels = info.width as u64 * info.height as u64;
+            if pixels == 0 || pixels > ZUNE_MAX_PIXELS {
+                out.error = Some(format!(
+                    "{}x{} frame: not decoded (limit {ZUNE_MAX_PIXELS} pixels)",
+                    info.width, info.height
+                ));
+                return out;
+            }
+        }
+        Ok(Ok(None)) => {
+            out.error = Some("no frame header".into());
+            return out;
+        }
+        Ok(Err(e)) => {
+            out.error = Some(e.to_string());
+            return out;
+        }
+        Err(_) => {
+            out.error = Some("decoder panicked".into());
+            return out;
+        }
+    }
     let strict = catch_unwind(AssertUnwindSafe(|| {
-        let mut d = JpegDecoder::new_with_options(data, base.set_strict_mode(true));
+        let mut d = JpegDecoder::new_with_options(&data[..], base.set_strict_mode(true));
         d.decode().map(|_| d.info())
     }));
     match strict {
@@ -73,8 +150,11 @@ pub fn zune_check(data: &[u8]) -> ZuneCheck {
         Ok(Err(e)) => out.error = Some(e.to_string()),
         Err(_) => out.error = Some("decoder panicked".into()),
     }
+    if !data.ends_with(&[0xFF, 0xD9]) {
+        data.extend_from_slice(&[0xFF, 0xD9]);
+    }
     let lenient = catch_unwind(AssertUnwindSafe(|| {
-        let mut d = JpegDecoder::new_with_options(data, base.set_strict_mode(false));
+        let mut d = JpegDecoder::new_with_options(&data[..], base.set_strict_mode(false));
         d.decode().map(|px| (px, d.info()))
     }));
     if let Ok(Ok((px, Some(info)))) = lenient {
@@ -111,11 +191,51 @@ pub(crate) struct Detail {
     pub(crate) extra_trailing: u64,
 }
 
+/// Up to `len` bytes at `offset`, stopping at the first unreadable byte (a
+/// bad sector further on must not hide the readable start of a file).
+/// `Err` only when not even the first byte can be read.
+pub(crate) fn read_prefix(
+    src: &dyn Source,
+    offset: u64,
+    len: usize,
+) -> std::result::Result<Vec<u8>, ReadError> {
+    let size = src.size();
+    if offset >= size {
+        return Ok(Vec::new());
+    }
+    let want = (size - offset).min(len as u64) as usize;
+    let mut buf = vec![0u8; want];
+    let mut done = 0usize;
+    while done < want {
+        let pos = offset + done as u64;
+        match src.read_at(pos, &mut buf[done..]) {
+            Ok(0) => break,
+            Ok(n) => done += n.min(want - done),
+            Err(e) => {
+                // Bytes before the failing offset may not have been
+                // stored: read that good stretch on its own.
+                let good = e.offset.saturating_sub(pos).min((want - done) as u64) as usize;
+                if good > 0 {
+                    if let Ok(n) = src.read_at(pos, &mut buf[done..done + good]) {
+                        done += n.min(good);
+                    }
+                }
+                if done == 0 {
+                    return Err(e);
+                }
+                break;
+            }
+        }
+    }
+    buf.truncate(done);
+    Ok(buf)
+}
+
 /// Find the SOI of the file: offset 0, or the first `FF D8 FF` in the first
 /// [`SOI_SEARCH`] bytes whose header chain reaches a scan.
 pub(crate) fn find_soi(src: &dyn Source) -> Option<u64> {
     let size = src.size();
-    let head = src.read_vec(0, SOI_SEARCH.min(size) as usize).ok()?;
+    let head = read_prefix(src, 0, SOI_SEARCH.min(size) as usize).ok()?;
     if head.starts_with(&[0xFF, 0xD8]) {
         return Some(0);
     }
@@ -141,11 +261,11 @@ pub(crate) fn looks_like_headerless(src: &dyn Source) -> bool {
         return false;
     }
     let tail_len = size.min(4096);
-    let Ok(tail) = src.read_vec(size - tail_len, tail_len as usize) else {
+    let Ok(tail) = read_prefix(src, size - tail_len, tail_len as usize) else {
         return false;
     };
     let has_eoi = tail.windows(2).any(|w| w == [0xFF, 0xD9]);
-    let Ok(head) = src.read_vec(0, SOI_SEARCH.min(size) as usize) else {
+    let Ok(head) = read_prefix(src, 0, SOI_SEARCH.min(size) as usize) else {
         return false;
     };
     let stuffed = head.windows(2).filter(|w| *w == [0xFF, 0x00]).count();
@@ -285,6 +405,9 @@ pub(crate) fn validate_source(src: &dyn Source, run_zune: bool) -> Result<Detail
             vec![],
         ));
     }
+    // Nothing readable at the start: that is a read error to report, not
+    // evidence that the file is no JPEG.
+    read_prefix(src, 0, 4)?;
     let Some(soi) = find_soi(src) else {
         if looks_like_headerless(src) {
             let mut d = fail(
@@ -414,14 +537,32 @@ pub(crate) fn validate_source(src: &dyn Source, run_zune: bool) -> Result<Detail
         ));
     }
     let mut extra_trailing = 0;
+    // End of everything that belongs to the file (file-relative).
+    let mut extent_end = a.data_end;
     if let Some(eoi) = a.eoi_offset {
         let after = extend_after_eoi(&mut cur, &h, eoi + 2);
+        // MPF images and trailers are part of the file: read them once so
+        // bad sectors there are noticed as well.
+        cur.read_through(eoi + 2, after.end);
+        extent_end = after.end;
         let extra = (size - soi).saturating_sub(after.end);
         extra_trailing = extra;
         if extra > 0 {
             problems.push(format!(
                 "{extra} bytes of unrecognised data after the end of the image"
             ));
+        }
+        if after.truncated {
+            // The primary image is whole; what is missing is an extra
+            // image or a trailer (or a stale MPF index), so this is
+            // reported without calling the file damaged.
+            problems.extend(
+                after
+                    .notes
+                    .iter()
+                    .filter(|n| n.contains("cut off") || n.contains("beyond"))
+                    .cloned(),
+            );
         }
         if !after.kinds.is_empty() {
             meta.extra
@@ -432,18 +573,37 @@ pub(crate) fn validate_source(src: &dyn Source, run_zune: bool) -> Result<Detail
     }
     if let Some(off) = cur.read_error_offset() {
         problems.push(format!("unreadable data at offset {}", soi + off));
+        structural = true;
+    }
+    // Bad sectors the source already knows about (a rescued image's
+    // mapfile) anywhere in the file: the bytes there are not the file's.
+    if let Some(bad) = src.unreadable() {
+        let holes = bad.intersection_with_range(Range::new(soi, soi + extent_end.max(1)));
+        if !holes.is_empty() {
+            if cur.read_error_offset().is_none() {
+                problems.push(format!(
+                    "{} unreadable bytes inside the file (first at offset {})",
+                    holes.total_len(),
+                    holes.iter().next().map(|r| r.start).unwrap_or(soi)
+                ));
+            }
+            structural = true;
+        }
     }
 
     let pixels = sof.width as u64 * sof.height as u64;
+    // The reference decoder needs the primary image only; a hole in it
+    // ends the bytes handed over (the decoder then sees a truncated file).
+    let primary_len = a.eoi_offset.map_or(size - soi, |e| (e + 2).min(size - soi));
     let zune = (run_zune
-        && size - soi <= ZUNE_MAX_BYTES
+        && primary_len <= ZUNE_MAX_BYTES
         && pixels > 0
         && pixels <= ZUNE_MAX_PIXELS
         && !sof.lossless)
         .then(|| {
-            src.read_vec(soi, (size - soi) as usize)
+            read_prefix(src, soi, primary_len as usize)
                 .ok()
-                .map(|bytes| zune_check(&bytes))
+                .map(zune_check_owned)
         })
         .flatten();
 

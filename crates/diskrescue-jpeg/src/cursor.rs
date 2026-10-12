@@ -150,6 +150,21 @@ impl<'a> Cursor<'a> {
         out
     }
 
+    /// Read `from..to` once (chunk by chunk, nothing kept), so that a read
+    /// error in that range is noticed: afterwards [`Cursor::limit`] and
+    /// [`Cursor::read_error_offset`] reflect it.
+    pub(crate) fn read_through(&mut self, from: u64, to: u64) {
+        let mut p = from;
+        while p < to.min(self.limit) {
+            if self.byte(p).is_none() {
+                return;
+            }
+            // `byte` filled the window from `p` (or `p` was inside it).
+            let window_end = self.buf_start + self.buf.len() as u64;
+            p = window_end.max(p + 1);
+        }
+    }
+
     /// Exactly `len` bytes at `pos`, or `None` when not all are readable.
     pub(crate) fn read_exact(&mut self, pos: u64, len: usize) -> Option<Vec<u8>> {
         let v = self.read_vec(pos, len);

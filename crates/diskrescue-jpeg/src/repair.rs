@@ -1,4 +1,5 @@
-//! JPEG repair (image-formats spec 3.4-3.6), without re-encoding.
+//! JPEG repair (image-formats spec 3.4-3.6), without re-encoding image
+//! content.
 //!
 //! [`plan`] turns what the header walk and the scan analyzer found into a
 //! list of [`Strategy`]s; [`apply`] assembles the repaired file as a list
@@ -7,26 +8,44 @@
 //! zune-jpeg decode) and only then streams it to the output. Nothing is
 //! written when the result still does not decode.
 //!
+//! Wherever a sequential scan (or a progressive DC-first scan) has to end
+//! early, the missing MCUs are re-encoded as empty blocks with the scan's
+//! own Huffman tables and restart markers (spec 3.4 option B): the output
+//! is a complete, standard-conforming file that
+//! every decoder shows with grey where data is missing, instead of a scan
+//! that stops mid-MCU (zune-jpeg rejects many of those). The kept data is
+//! always the original bytes; the outcome is `PartiallyRepaired` with the
+//! intact fraction of real MCUs.
+//!
 //! Strategies:
 //!
 //! * `StructuralFix`: drop junk before SOI, duplicate SOIs and stray bytes;
 //!   rewrite damaged APPn/COM lengths to the resynchronised chain.
 //! * `InsertStandardHuffmanTables`: insert the Annex K DHT before SOS
 //!   (Motion-JPEG frames and other DHT-less files).
-//! * `DonorHeader`: replace SOI..SOS with a healthy file's header (same
-//!   dimensions, components and sampling required); the scan data start is
-//!   the damaged file's intact SOS, else the best-decoding candidate
-//!   offset (surviving SOS, the donor's header length, the end of a zeroed
-//!   run, an `00 3F 00` SOS tail), or the offset given in the strategy.
-//! * `AppendEoi`: end the data with `FF D9` (dropping a dangling `FF` and
-//!   any foreign data after the scan).
+//! * `DonorHeader`: replace SOI..SOS with a healthy file's header; the scan
+//!   data start is the damaged file's intact SOS, else the best-decoding
+//!   candidate offset (surviving SOS, the donor's header length, the end
+//!   of a zeroed run, an `00 3F 00` SOS tail), or the offset given in the
+//!   strategy. Refused when the donor's frame (dimensions, sampling,
+//!   precision, process) or restart interval differs from what survives of
+//!   the damaged header, and when the damaged file's scan data does not
+//!   decode with the donor's header (more or fewer MCUs than its frame,
+//!   or errors within the first MCU row: other Huffman tables, restart
+//!   interval or sampling).
+//! * `AppendEoi`: complete a scan that simply stops (from the last decoded
+//!   MCU) and end the data with `FF D9`, dropping a dangling `FF` and any
+//!   foreign data after the scan.
 //! * `TruncateAtLastGoodRestart`: cut at the restart marker that starts the
-//!   first damaged interval, append EOI.
-//! * `TruncateAtLastGoodMcuRow`: baseline with restarts: cut at the last
-//!   restart boundary that starts an MCU row; baseline without restarts:
-//!   keep the data up to the last good MCU (its last byte padded with
-//!   1-bits) and append EOI, decoders show the rest grey; progressive: keep
-//!   the complete scans and append EOI.
+//!   first damaged interval and complete the scan with empty MCUs.
+//! * `TruncateAtLastGoodMcuRow`: cut after the last good MCU (at the last
+//!   good restart marker when the damage is corruption rather than a plain
+//!   truncation) and complete the scan with empty MCUs; when re-encoding
+//!   is impossible, the last byte is filled with 0-bits and EOI follows;
+//!   progressive: keep the complete scans and append EOI.
+//! * `ReplaceDamagedIntervals`: sequential scan with restart markers: every
+//!   restart interval the analyzer skipped is re-encoded as empty MCUs and
+//!   the intervals after it are kept (spec 3.5).
 //! * `StripTrailingGarbage`: drop unrecognised bytes after the EOI (MPF
 //!   images and motion-photo trailers are kept).
 
@@ -40,12 +59,13 @@ use diskrescue_core::Result;
 
 use crate::cursor::{Cursor, SCAN_CHUNK};
 use crate::markers::{self, parse_sof, walk_headers, FrameInfo, Headers};
+use crate::pad::{PadStart, ScanPadder};
 use crate::scan::{
-    analyze_after_headers, analyze_source, AnalyzeOptions, ScanAnalysis, ScanErrorKind,
+    analyze_after_headers, analyze_source, AnalyzeOptions, CutPoint, ScanAnalysis, ScanErrorKind,
 };
 use crate::tables::standard_dht;
 use crate::trailer::extend_after_eoi;
-use crate::validate::{find_soi, validate_source};
+use crate::validate::{find_soi, read_prefix, validate_source};
 
 /// MCUs decoded when scoring a candidate scan start for a donor header.
 const SCORE_MCUS: u64 = 4096;
@@ -77,12 +97,17 @@ pub enum Strategy {
     },
     /// Drop unrecognised bytes after the EOI.
     StripTrailingGarbage,
+    /// Sequential scan with restart markers: re-encode every damaged
+    /// restart interval as grey blocks and keep the intervals after it
+    /// (image-formats spec 3.5).
+    ReplaceDamagedIntervals,
 }
 
 impl Strategy {
     /// Stable name used in `Validation::repairable_by` and reports.
     pub fn name(&self) -> &'static str {
         match self {
+            Strategy::ReplaceDamagedIntervals => "replace_damaged_intervals",
             Strategy::StructuralFix => "structural_fix",
             Strategy::AppendEoi => "append_eoi",
             Strategy::TruncateAtLastGoodRestart => "truncate_at_last_good_restart",
@@ -142,18 +167,26 @@ pub fn plan(headers: &Headers, analysis: &ScanAnalysis, ctx: &RepairContext) -> 
         Some(e) if e.kind == ScanErrorKind::Eof => {
             if ctx.aggressive {
                 v.push(Strategy::TruncateAtLastGoodMcuRow);
-            } else if no_eoi {
+            } else {
+                // Completing a scan that simply stops (or appending the EOI
+                // after it) discards nothing.
                 v.push(Strategy::AppendEoi);
             }
         }
         Some(e) if e.kind == ScanErrorKind::DataAfterEoi => {
-            if no_eoi {
+            if ctx.aggressive && !analysis.progressive {
+                // Every MCU decoded: cutting after the last one only drops
+                // the extraneous bytes.
+                v.push(Strategy::TruncateAtLastGoodMcuRow);
+            } else if no_eoi {
                 v.push(Strategy::AppendEoi);
             }
         }
         Some(_) => {
             if ctx.aggressive {
-                if analysis.restart_interval > 0 && analysis.last_good_restart.is_some() {
+                if can_replace_intervals(analysis) {
+                    v.push(Strategy::ReplaceDamagedIntervals);
+                } else if analysis.restart_interval > 0 && analysis.last_good_restart.is_some() {
                     v.push(Strategy::TruncateAtLastGoodRestart);
                 } else {
                     v.push(Strategy::TruncateAtLastGoodMcuRow);
@@ -334,6 +367,10 @@ struct Built {
     donor: Option<SharedSource>,
     applied: Vec<String>,
     notes: Vec<String>,
+    /// MCUs re-encoded as empty (grey) blocks.
+    padded: u64,
+    /// MCUs in the padded scan.
+    scan_total: u64,
 }
 
 enum Build {
@@ -366,7 +403,7 @@ pub fn apply(
     };
     let splice = Splice::new(built.pieces, src.clone(), built.donor);
     let detail = validate_source(&splice, true)?;
-    let v = detail.validation;
+    let mut v = detail.validation;
     // Partially decodable: the reference decoder shows something, or the
     // analyzer decoded part of the image (zune-jpeg 0.4 cannot decode some
     // valid files, e.g. progressive with restart markers).
@@ -375,13 +412,26 @@ pub fn apply(
         .as_ref()
         .is_some_and(|z| z.strict_ok || z.lenient_ok)
         || v.intact_fraction.unwrap_or(0.0) > 0.0;
-    let result = match v.status {
+    let mut result = match v.status {
         ValidationStatus::Valid if strategies.is_empty() => RepairResult::NoRepairNeeded,
         ValidationStatus::Valid => RepairResult::Repaired,
         ValidationStatus::Damaged if decodes => RepairResult::PartiallyRepaired,
         _ => RepairResult::Unrepairable,
     };
     let mut notes = built.notes;
+    if built.padded > 0 && built.scan_total > 0 && result != RepairResult::Unrepairable {
+        // A structurally complete file whose missing MCUs are grey filler:
+        // valid, but not the whole picture.
+        let kept = 1.0 - built.padded.min(built.scan_total) as f32 / built.scan_total as f32;
+        v.intact_fraction = Some(v.intact_fraction.unwrap_or(1.0).min(kept));
+        let text = format!(
+            "{} of {} MCUs could not be recovered and are filled with grey blocks",
+            built.padded, built.scan_total
+        );
+        v.problems.push(text.clone());
+        notes.push(text);
+        result = RepairResult::PartiallyRepaired;
+    }
     if result == RepairResult::Unrepairable {
         notes.push("the repaired candidate still does not decode; nothing was written".into());
         return Ok(RepairOutcome {
@@ -487,82 +537,241 @@ fn build(src: &SharedSource, strategies: &[Strategy]) -> Result<Build> {
         len: sdo - sos_off,
     });
 
-    // Scan data.
-    let mut cut = false;
-    let mut patch: Option<Vec<u8>> = None;
-    let mut data_end = match a.eoi_offset {
-        Some(e) => e,
-        None if has(strategies, "append_eoi") => a.data_end,
-        None => size - soi,
-    };
-    if has(strategies, "truncate_at_last_good_restart") {
-        match a.last_good_restart {
-            Some((off, mcu)) => {
-                data_end = off;
-                cut = true;
-                applied.push(format!(
-                    "cut the scan at the restart marker before MCU {mcu} (offset {})",
-                    soi + off
-                ));
+    // Scan data. `ended` means the pieces already end with an EOI;
+    // otherwise the original EOI and what follows it are appended below.
+    let ri = h.dri.unwrap_or(0) as u64;
+    let padder = h
+        .sof
+        .as_ref()
+        .zip(h.scans.first())
+        .and_then(|(f, s)| ScanPadder::new(&h, f, s, ri));
+    let in_first_scan = |c: &CutPoint| c.scan == 0 && padder.is_some();
+    let eof = a.first_error.is_some_and(|e| e.kind == ScanErrorKind::Eof);
+    let truncate = has(strategies, "truncate_at_last_good_mcu_row")
+        || has(strategies, "truncate_at_last_good_restart");
+    let append = has(strategies, "append_eoi");
+    let scan_total = padder.as_ref().map(|p| p.total()).unwrap_or(0);
+    let mut padded = 0u64;
+    let mut ended = false;
+    let mut done = false;
+
+    if has(strategies, "replace_damaged_intervals") {
+        match padder.as_ref().filter(|_| can_replace_intervals(&a)) {
+            Some(p) => {
+                let total = p.total();
+                let mut pos = sdo;
+                let mut complete = false;
+                for r in a.damaged_ranges.iter().filter(|r| r.scan == 0) {
+                    if r.byte_start < pos || r.first_mcu >= total {
+                        continue;
+                    }
+                    pieces.push(Piece::Src {
+                        from: soi + pos,
+                        len: r.byte_start - pos,
+                    });
+                    let end = r.end_mcu.min(total);
+                    let start = PadStart {
+                        mcu: r.first_mcu,
+                        value: 0,
+                        bits: 0,
+                        preds: [0; 4],
+                        rst_first: false,
+                    };
+                    pieces.push(Piece::Bytes(Arc::new(p.encode(start, end))));
+                    padded += end - r.first_mcu;
+                    applied.push(format!(
+                        "replaced the damaged restart interval(s) of MCUs {}..{end} (offset {}) \
+                         with grey blocks",
+                        r.first_mcu,
+                        soi + r.byte_start
+                    ));
+                    pos = r.byte_end.max(r.byte_start);
+                    if end >= total {
+                        complete = true;
+                        break;
+                    }
+                }
+                if complete {
+                    // The damage runs to the end of the scan.
+                } else if let Some(c) = a
+                    .tail_cut
+                    .filter(|c| in_first_scan(c) && c.position.byte_offset >= pos)
+                {
+                    pieces.push(Piece::Src {
+                        from: soi + pos,
+                        len: c.position.byte_offset - pos,
+                    });
+                    pieces.push(Piece::Bytes(Arc::new(p.encode(pad_from(&c), total))));
+                    padded += total.saturating_sub(c.position.mcu_index);
+                    applied.push(format!(
+                        "completed the scan with empty MCUs after MCU {}",
+                        c.position.mcu_index
+                    ));
+                } else if let Some(e) = a.eoi_offset {
+                    pieces.push(Piece::Src {
+                        from: soi + pos,
+                        len: e.saturating_sub(pos),
+                    });
+                } else {
+                    let mut len = a.data_end.max(pos) - pos;
+                    if len > 0 && cur.byte(pos + len - 1) == Some(0xFF) {
+                        len -= 1;
+                    }
+                    pieces.push(Piece::Src {
+                        from: soi + pos,
+                        len,
+                    });
+                }
+                if a.eoi_offset.is_none() {
+                    pieces.push(Piece::bytes(&[0xFF, 0xD9]));
+                    applied.push("appended the EOI marker".into());
+                    ended = true;
+                }
+                done = true;
             }
-            None => notes.push(
-                "no clean restart marker before the damage; cutting after the last good MCU".into(),
-            ),
+            None => {
+                notes.push("the damaged intervals cannot be re-encoded; cutting instead".into())
+            }
         }
     }
-    if !cut
-        && (has(strategies, "truncate_at_last_good_mcu_row")
-            || has(strategies, "truncate_at_last_good_restart"))
-    {
-        if a.progressive {
-            if let Some(e) = a.last_complete_scan_end {
-                let n = a.scans.iter().filter(|s| s.complete).count();
-                data_end = e;
-                cut = true;
-                applied.push(format!("kept the {n} complete progressive scan(s)"));
-            }
-        } else if let Some((off, mcu)) = a.last_good_row_restart {
-            data_end = off;
-            cut = true;
+
+    // Where the original scan data is cut, and where empty MCUs continue it.
+    let mut cut: Option<(u64, Option<PadStart>)> = None;
+    if !done && truncate {
+        // A restart boundary before corruption is safer than the last MCU
+        // that happened to decode (damage can go unnoticed for a while);
+        // after plain truncation every decoded MCU is genuine.
+        let corrupt = a
+            .first_error
+            .is_some_and(|e| !matches!(e.kind, ScanErrorKind::Eof | ScanErrorKind::DataAfterEoi));
+        let restart = (corrupt && ri > 0).then_some(a.last_good_restart).flatten();
+        let restart_in_first = a.first_error.is_some_and(|e| e.scan == 0) && padder.is_some();
+        if a.progressive && a.last_complete_scan_end.is_some() {
+            let n = a.scans.iter().filter(|s| s.complete).count();
+            cut = Some((a.last_complete_scan_end.unwrap_or(sdo), None));
+            applied.push(format!("kept the {n} complete progressive scan(s)"));
+        } else if let Some((off, mcu)) = restart.filter(|_| restart_in_first) {
+            let start = PadStart {
+                mcu,
+                value: 0,
+                bits: 0,
+                preds: [0; 4],
+                rst_first: true,
+            };
+            cut = Some((off, Some(start)));
             applied.push(format!(
-                "cut the scan at the restart marker before MCU row {} (offset {})",
-                mcu / a.mcus_per_row.max(1) as u64,
+                "cut the scan at the restart marker before MCU {mcu} (offset {})",
+                soi + off
+            ));
+        } else if let Some(c) = a.last_good_cut.filter(|c| in_first_scan(c)) {
+            cut = Some((c.position.byte_offset, Some(pad_from(&c))));
+            applied.push(format!(
+                "cut the scan after MCU {} (offset {})",
+                c.position.mcu_index,
+                soi + c.position.byte_offset
+            ));
+        } else if let Some((off, mcu)) = restart {
+            cut = Some((off, None));
+            applied.push(format!(
+                "cut the scan at the restart marker before MCU {mcu} (offset {})",
                 soi + off
             ));
         } else if let Some(p) = a.last_good_mcu {
-            data_end = p.byte_offset;
+            // No re-encoding possible: keep the used bits of the partial
+            // byte and fill the rest of it with 0-bits, which decoders read
+            // as valid codes (1-bits followed by the marker's zero fill can
+            // form an invalid code, which stops zune-jpeg).
+            pieces.push(Piece::Src {
+                from: soi + sdo,
+                len: p.byte_offset.max(sdo) - sdo,
+            });
             if p.bit > 0 {
-                let b = p.byte_value | ((1u16 << (8 - p.bit)) - 1) as u8;
-                patch = Some(if b == 0xFF { vec![0xFF, 0x00] } else { vec![b] });
+                pieces.push(Piece::bytes(&[
+                    p.byte_value & !(((1u16 << (8 - p.bit)) - 1) as u8)
+                ]));
             }
-            cut = true;
+            pieces.push(Piece::bytes(&[0xFF, 0xD9]));
             applied.push(format!(
                 "cut the scan after MCU {} (offset {}); the rest decodes as grey",
                 p.mcu_index,
                 soi + p.byte_offset
             ));
-        }
-        if !cut {
-            notes.push("nothing decodable to keep before the damage".into());
+            applied.push("appended the EOI marker".into());
+            ended = true;
+            done = true;
+        } else {
+            notes.push("nothing decodable to keep before the damage; keeping the data".into());
         }
     }
-    let data_end = data_end.max(sdo);
-    let ends_at_eoi = !cut && a.eoi_offset.is_some();
-    let mut data_len = data_end - sdo;
-    if !ends_at_eoi && patch.is_none() && data_len > 0 && cur.byte(data_end - 1) == Some(0xFF) {
-        data_len -= 1;
-    }
-    pieces.push(Piece::Src {
-        from: soi + sdo,
-        len: data_len,
-    });
-    if let Some(p) = patch {
-        pieces.push(Piece::bytes(&p));
+    if !done && cut.is_none() && (append || truncate) {
+        // Data that simply stops: complete the scan from the last MCU that
+        // decoded, so decoders do not have to guess.
+        if let Some(c) = a.tail_cut.filter(|c| in_first_scan(c)) {
+            cut = Some((c.position.byte_offset, Some(pad_from(&c))));
+        }
     }
 
-    // Tail.
-    if ends_at_eoi {
-        let eoi = a.eoi_offset.expect("checked above");
+    if done {
+    } else if let Some((end, pad)) = cut {
+        let end = end.max(sdo);
+        let mut len = end - sdo;
+        if pad.is_none() && len > 0 && cur.byte(end - 1) == Some(0xFF) {
+            len -= 1;
+        }
+        pieces.push(Piece::Src {
+            from: soi + sdo,
+            len,
+        });
+        if let (Some(start), Some(p)) = (pad, padder.as_ref()) {
+            let total = p.total();
+            pieces.push(Piece::Bytes(Arc::new(p.encode(start, total))));
+            let n = total.saturating_sub(start.mcu);
+            padded += n;
+            applied.push(format!(
+                "completed the scan with {n} empty MCU(s) after MCU {} (shown grey)",
+                start.mcu
+            ));
+        }
+        // After plain truncation that ended on a real EOI, keep it and what
+        // follows; a cut through corrupt data gets a new EOI.
+        let keep_tail = eof && a.eoi_offset.is_some() && !truncate;
+        if !keep_tail {
+            pieces.push(Piece::bytes(&[0xFF, 0xD9]));
+            applied.push("appended the EOI marker".into());
+            ended = true;
+        }
+    } else {
+        let data_end = match a.eoi_offset {
+            Some(e) => e,
+            None if append || truncate => a.data_end,
+            None => size - soi,
+        }
+        .max(sdo);
+        let mut len = data_end - sdo;
+        if a.eoi_offset.is_none() && len > 0 && cur.byte(data_end - 1) == Some(0xFF) {
+            len -= 1;
+        }
+        pieces.push(Piece::Src {
+            from: soi + sdo,
+            len,
+        });
+        if a.eoi_offset.is_none() {
+            ended = true;
+            if append || truncate {
+                pieces.push(Piece::bytes(&[0xFF, 0xD9]));
+                applied.push("appended the EOI marker".into());
+                if a.data_end + 2 < size - soi {
+                    notes.push(format!(
+                        "dropped {} bytes that do not belong to the image",
+                        (size - soi).saturating_sub(a.data_end)
+                    ));
+                }
+            }
+        }
+    }
+
+    // Tail: the original EOI and what legitimately follows it.
+    if let (false, Some(eoi)) = (ended, a.eoi_offset) {
         let file_end = size - soi;
         let tail_end = if has(strategies, "strip_trailing_garbage") {
             let after = extend_after_eoi(&mut cur, &h, eoi + 2);
@@ -580,29 +789,41 @@ fn build(src: &SharedSource, strategies: &[Strategy]) -> Result<Build> {
             from: soi + eoi,
             len: tail_end.saturating_sub(eoi),
         });
-    } else if cut || has(strategies, "append_eoi") {
-        pieces.push(Piece::bytes(&[0xFF, 0xD9]));
-        applied.push("appended the EOI marker".into());
-        if !cut && a.data_end + 2 < size - soi && a.eoi_offset.is_none() {
-            notes.push(format!(
-                "dropped {} bytes that do not belong to the image",
-                (size - soi).saturating_sub(a.data_end)
-            ));
-        }
     }
     Ok(Build::Ok(Built {
         pieces,
         donor: None,
         applied,
         notes,
+        padded,
+        scan_total,
     }))
+}
+
+/// Where to continue the bit stream after a clean cut point.
+fn pad_from(c: &CutPoint) -> PadStart {
+    PadStart {
+        mcu: c.position.mcu_index,
+        value: c.position.byte_value,
+        bits: c.position.bit,
+        preds: c.preds,
+        rst_first: !c.after_restart,
+    }
+}
+
+/// Damaged intervals can be replaced when the file is a single sequential
+/// scan with restart markers and every damaged stretch is in it.
+fn can_replace_intervals(a: &ScanAnalysis) -> bool {
+    !a.progressive
+        && a.restart_interval > 0
+        && a.scans.len() == 1
+        && !a.damaged_ranges.is_empty()
+        && a.damaged_ranges.iter().all(|r| r.scan == 0)
 }
 
 /// Search the start of a damaged file for an intact SOF segment.
 fn scan_for_sof(src: &dyn Source) -> Option<FrameInfo> {
-    let head = src
-        .read_vec(0, REMNANT_SEARCH.min(src.size()) as usize)
-        .ok()?;
+    let head = read_prefix(src, 0, REMNANT_SEARCH.min(src.size()) as usize).ok()?;
     let mut i = 0usize;
     while let Some(k) = memchr::memchr(0xFF, head.get(i..)?) {
         let p = i + k;
@@ -639,9 +860,7 @@ fn scan_candidates(src: &dyn Source, victim: Option<(u64, &Headers)>, donor_abs:
             c.push(soi + d);
         }
     }
-    let head = src
-        .read_vec(0, REMNANT_SEARCH.min(src.size()) as usize)
-        .unwrap_or_default();
+    let head = read_prefix(src, 0, REMNANT_SEARCH.min(src.size()) as usize).unwrap_or_default();
     // Surviving SOS segments.
     let mut found = 0;
     for (i, w) in head.windows(5).enumerate() {
@@ -681,6 +900,59 @@ fn scan_candidates(src: &dyn Source, victim: Option<(u64, &Headers)>, donor_abs:
     c.retain(|x| *x < src.size() && seen.insert(*x));
     c.truncate(48);
     c
+}
+
+/// Search the start of a damaged file for an intact DRI segment (`FF DD
+/// 00 04 Ri` followed by the next marker).
+fn scan_for_dri(src: &dyn Source) -> Option<u16> {
+    let head = read_prefix(src, 0, REMNANT_SEARCH.min(src.size()) as usize).ok()?;
+    head.windows(7)
+        .find(|w| w[..4] == [0xFF, 0xDD, 0x00, 0x04] && w[6] == 0xFF)
+        .map(|w| u16::from_be_bytes([w[4], w[5]]))
+}
+
+/// Why a donor's header cannot be the damaged file's, judged from how the
+/// damaged file's scan data decodes with it; `None` when it fits.
+fn donor_mismatch(a: &ScanAnalysis) -> Option<String> {
+    let e = a.first_error.filter(|e| e.scan == 0)?;
+    let total = a.scans.first()?.mcus_total;
+    match e.kind {
+        ScanErrorKind::DataAfterEoi => Some(format!(
+            "the damaged file's scan data continues past the donor's {total} MCUs (smaller \
+             frame or different sampling)"
+        )),
+        ScanErrorKind::Eof => {
+            // Ending early at a real EOI (not at a truncation) means the
+            // data holds fewer MCUs than the donor's frame.
+            let at_eoi = a
+                .eoi_offset
+                .is_some_and(|eoi| eoi >= e.byte_offset && eoi - e.byte_offset <= 16);
+            at_eoi.then(|| {
+                format!(
+                    "the damaged file's scan data ends at its EOI after {} of the donor's \
+                     {total} MCUs (larger frame or different sampling)",
+                    e.mcu_index
+                )
+            })
+        }
+        _ => {
+            // Wrong Huffman tables, restart interval or sampling fail
+            // within a few blocks (at the first restart boundary at the
+            // latest); damage of the file's own shows up later or leaves
+            // most restart intervals decodable.
+            let ri = a.restart_interval as u64;
+            let threshold = total.min((a.mcus_per_row as u64).max(2 * ri).max(16));
+            let recovers =
+                a.mcu_fraction() >= 0.5 && a.restart_intervals_seen > a.corrupt_intervals;
+            (e.mcu_index < threshold && !recovers).then(|| {
+                format!(
+                    "its tables do not decode the damaged file's scan data (error at MCU {} of \
+                     {total}): Huffman tables, restart interval or sampling differ",
+                    e.mcu_index
+                )
+            })
+        }
+    }
 }
 
 fn score(a: &ScanAnalysis) -> u64 {
@@ -744,6 +1016,21 @@ fn build_donor(
                 .into(),
         ),
     }
+    // The restart interval decides where the RST markers in the scan data
+    // must fall; a donor with another one cannot decode it.
+    let victim_dri = vh
+        .as_ref()
+        .filter(|h| h.segments.iter().any(|s| s.marker == markers::DRI))
+        .and_then(|h| h.dri)
+        .or_else(|| scan_for_dri(&**src));
+    let donor_dri = dh.dri.unwrap_or(0);
+    if let Some(vri) = victim_dri.filter(|&v| v != donor_dri) {
+        return Ok(Build::Unrepairable(vec![format!(
+            "donor {} has a restart interval of {donor_dri} MCUs but the damaged file uses \
+             {vri}: a donor must come from the same camera settings",
+            donor_path.display()
+        )]));
+    }
     let header = Piece::Donor {
         from: dsoi,
         len: dlen,
@@ -801,14 +1088,9 @@ fn build_donor(
     let mut cur = Cursor::new(&sp, 0, sp.size(), SCAN_CHUNK);
     let h2 = markers::walk(&mut cur)?;
     let a2 = analyze_after_headers(&mut cur, &h2, &AnalyzeOptions::default());
-    if a2
-        .first_error
-        .is_some_and(|e| e.kind == ScanErrorKind::DataAfterEoi && e.scan == 0)
-    {
+    if let Some(why) = donor_mismatch(&a2) {
         return Ok(Build::Unrepairable(vec![format!(
-            "the damaged file's scan data continues past the {} MCUs of donor {}: the \
-             donor has different dimensions or sampling",
-            a2.scans.first().map(|s| s.mcus_total).unwrap_or(0),
+            "donor {} does not fit: {why}",
             donor_path.display()
         )]));
     }
@@ -862,6 +1144,8 @@ fn build_donor(
         donor: Some(donor),
         applied,
         notes,
+        padded: 0,
+        scan_total: 0,
     }))
 }
 

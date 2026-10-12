@@ -127,6 +127,41 @@ pub struct McuPosition {
     pub mcu_index: u64,
 }
 
+/// A clean cut point: right after a decoded MCU, with what is needed to
+/// continue the bit stream from there (repair completes cut scans with
+/// empty MCUs).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct CutPoint {
+    /// Scan index (0 = first).
+    pub scan: u32,
+    /// Bit-exact position after the MCU.
+    pub position: McuPosition,
+    /// DC predictors of the scan components at that point (in units of
+    /// the scan's point transform).
+    pub preds: [i32; 4],
+    /// The MCU starts a restart interval and its RST marker is already
+    /// behind `position` (the cut is right after the marker).
+    pub after_restart: bool,
+}
+
+/// Restart intervals that failed to decode and were skipped when decoding
+/// resynchronised on a later RST marker (or ran to the end of the scan).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct DamagedRange {
+    /// Scan index (0 = first).
+    pub scan: u32,
+    /// First MCU of the first damaged interval (an interval boundary).
+    pub first_mcu: u64,
+    /// MCU where decoding resumed (the scan's MCU count when it did not).
+    pub end_mcu: u64,
+    /// File-relative offset of the first entropy-coded byte of the first
+    /// damaged interval (right after the RST marker that precedes it).
+    pub byte_start: u64,
+    /// File-relative offset of the RST marker where decoding resumed, or
+    /// of whatever ended the scan.
+    pub byte_end: u64,
+}
+
 /// Per-scan result.
 #[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ScanReport {
@@ -204,6 +239,13 @@ pub struct ScanAnalysis {
     pub last_good_row_restart: Option<(u64, u64)>,
     /// Position right after the last MCU decoded before the first error.
     pub last_good_mcu: Option<McuPosition>,
+    /// `last_good_mcu` with its scan and DC predictors.
+    pub last_good_cut: Option<CutPoint>,
+    /// When the data ran out inside a scan: the position after the last
+    /// MCU decoded there (also after earlier, resynchronised damage).
+    pub tail_cut: Option<CutPoint>,
+    /// Restart intervals skipped by resynchronisation, in file order.
+    pub damaged_ranges: Vec<DamagedRange>,
     /// Offset of the marker that follows the last completely decoded scan
     /// (progressive repair cuts here).
     pub last_complete_scan_end: Option<u64>,
@@ -509,6 +551,26 @@ impl Bits {
             None => Err(self.current_offset()),
         }
     }
+}
+
+/// Markers that legitimately end a scan: EOI, SOI (the next file) and
+/// every segment marker. Anything else inside entropy-coded data
+/// (reserved codes, TEM) is damage.
+fn ends_scan(code: u8) -> bool {
+    code == EOI || code == markers::SOI || markers::is_header_segment(code)
+}
+
+/// The next RST marker from `from`, stepping over damaged marker codes
+/// (bounded); stops at a marker that ends the scan.
+fn next_rst(cur: &mut Cursor<'_>, from: u64) -> MarkerHit {
+    let mut h = next_marker(cur, from, true);
+    for _ in 0..256 {
+        match h.code {
+            Some(c) if !is_rst(c) && !ends_scan(c) => h = next_marker(cur, h.next, true),
+            _ => break,
+        }
+    }
+    h
 }
 
 /// Skip entropy-coded bytes from `from` to the next marker that is not a
@@ -1456,9 +1518,17 @@ impl<'o> Analyzer<'o> {
         // mean the quantisation tables do not belong to this data.
         let warm = st.per_row.max(16).min(st.total);
         let mut resynced_at: Option<u64> = None;
+        // First entropy-coded byte of the current restart interval.
+        let mut interval_start = data;
         while m < st.total {
             if ri > 0 && m > 0 && m % ri == 0 && resynced_at != Some(m) {
                 let interval = m / ri;
+                let at_boundary = CutPoint {
+                    scan: index,
+                    position: bits.position(m),
+                    preds,
+                    after_restart: false,
+                };
                 let err = match bits.align_to_marker(cur) {
                     Ok(hit) => match hit.code {
                         Some(c) if is_rst(c) && (c - 0xD0) == expected_rst => {
@@ -1470,6 +1540,7 @@ impl<'o> Analyzer<'o> {
                             }
                             self.a.restart_intervals_seen += 1;
                             bits.reset(hit.next);
+                            interval_start = hit.next;
                             preds = [0; 4];
                             eobrun = 0;
                             expected_rst = (expected_rst + 1) & 7;
@@ -1488,19 +1559,27 @@ impl<'o> Analyzer<'o> {
                     self.record_error(report, e);
                     clean = false;
                     if kind == ScanErrorKind::Eof {
+                        // The data ends exactly on an interval boundary.
+                        self.a.tail_cut = Some(at_boundary);
                         return hit.unwrap_or_else(|| next_marker(cur, off, false));
                     }
                     let damaged = interval.saturating_sub(1);
-                    match self.resync(cur, &mut bits, hit, off, damaged, ri, st.total) {
+                    let span = (index, damaged * ri, interval_start);
+                    match self.resync(cur, &mut bits, hit, off, damaged, ri, st.total, span) {
                         Some((new_m, exp)) => {
                             m = new_m;
+                            interval_start = bits.pos;
                             preds = [0; 4];
                             eobrun = 0;
                             expected_rst = exp;
                             resynced_at = Some(new_m);
                             continue;
                         }
-                        None => return next_marker(cur, off, false),
+                        None => {
+                            let end = next_marker(cur, off, false);
+                            self.damage_to_end(span, st.total, end.offset);
+                            return end;
+                        }
                     }
                 }
             }
@@ -1537,6 +1616,12 @@ impl<'o> Analyzer<'o> {
                 CheckMode::Error
             };
             let before = bits.position(m);
+            let before_cut = CutPoint {
+                scan: index,
+                position: before,
+                preds,
+                after_restart: ri > 0 && m > 0 && m % ri == 0,
+            };
             let r = self.decode_one(cur, &mut bits, st, m, &mut preds, &mut eobrun, mode);
             let r = if bits.overrun() {
                 Err(ScanErrorKind::Eof)
@@ -1565,20 +1650,29 @@ impl<'o> Analyzer<'o> {
                     let e = self.error_at(ScanErrorKind::Unreadable, hole.start, m, index);
                     if clean {
                         self.a.last_good_mcu = Some(before);
+                        self.a.last_good_cut = Some(before_cut);
                     }
                     self.record_error(report, e);
                     clean = false;
                     if let Some(interval) = m.checked_div(ri) {
-                        match self.resync(cur, &mut bits, None, hole.end, interval, ri, st.total) {
+                        let span = (index, interval * ri, interval_start);
+                        match self
+                            .resync(cur, &mut bits, None, hole.end, interval, ri, st.total, span)
+                        {
                             Some((new_m, exp)) => {
                                 m = new_m;
+                                interval_start = bits.pos;
                                 preds = [0; 4];
                                 eobrun = 0;
                                 expected_rst = exp;
                                 resynced_at = Some(new_m);
                                 continue;
                             }
-                            None => return next_marker(cur, hole.end, false),
+                            None => {
+                                let end = next_marker(cur, hole.end, false);
+                                self.damage_to_end(span, st.total, end.offset);
+                                return end;
+                            }
                         }
                     }
                     return next_marker(cur, hole.end, false);
@@ -1602,24 +1696,32 @@ impl<'o> Analyzer<'o> {
                     let e = self.error_at(kind, off, m, index);
                     if clean {
                         self.a.last_good_mcu = Some(before);
+                        self.a.last_good_cut = Some(before_cut);
                     }
                     self.record_error(report, e);
                     clean = false;
                     if kind == ScanErrorKind::Eof {
+                        self.a.tail_cut = Some(before_cut);
                         return hit.unwrap_or_else(|| next_marker(cur, off, false));
                     }
                     if let Some(interval) = m.checked_div(ri) {
                         let from = hit.map(|h| h.offset).unwrap_or(off);
-                        match self.resync(cur, &mut bits, hit, from, interval, ri, st.total) {
+                        let span = (index, interval * ri, interval_start);
+                        match self.resync(cur, &mut bits, hit, from, interval, ri, st.total, span) {
                             Some((new_m, exp)) => {
                                 m = new_m;
+                                interval_start = bits.pos;
                                 preds = [0; 4];
                                 eobrun = 0;
                                 expected_rst = exp;
                                 resynced_at = Some(new_m);
                                 continue;
                             }
-                            None => return next_marker(cur, from, false),
+                            None => {
+                                let end = next_marker(cur, from, false);
+                                self.damage_to_end(span, st.total, end.offset);
+                                return end;
+                            }
                         }
                     }
                     // No restart markers: the rest of this scan cannot be
@@ -1638,7 +1740,14 @@ impl<'o> Analyzer<'o> {
                 if m % st.per_row == 0 {
                     report.rows_clean = (m / st.per_row) as u32;
                 }
-                self.a.last_good_mcu = Some(bits.position(m));
+                let p = bits.position(m);
+                self.a.last_good_mcu = Some(p);
+                self.a.last_good_cut = Some(CutPoint {
+                    scan: index,
+                    position: p,
+                    preds,
+                    after_restart: false,
+                });
             }
             if let Some(max) = self.opts.max_mcus {
                 if self.mcus_budget_used >= max {
@@ -1659,16 +1768,35 @@ impl<'o> Analyzer<'o> {
                 if clean {
                     report.rows_clean = st.rows;
                 }
-                report.complete = report.error.is_none();
                 match hit.code {
                     Some(c) if is_rst(c) => {
-                        self.a.notes.push(format!(
-                            "restart marker after the last MCU at offset {}",
-                            hit.offset
-                        ));
+                        // Harmless right before the next marker; with
+                        // entropy-coded data after it, the scan holds more
+                        // MCUs than the frame (a wrong header, a donor of
+                        // the wrong size).
+                        let marker_follows = cur.byte(hit.next) == Some(0xFF)
+                            && cur.byte(hit.next + 1).is_some_and(|b| b != 0x00);
+                        if marker_follows {
+                            self.a.notes.push(format!(
+                                "restart marker after the last MCU at offset {}",
+                                hit.offset
+                            ));
+                        } else {
+                            let e = self.error_at(
+                                ScanErrorKind::DataAfterEoi,
+                                hit.next,
+                                st.total,
+                                index,
+                            );
+                            self.record_error(report, e);
+                        }
+                        report.complete = report.error.is_none();
                         next_marker(cur, hit.next, false)
                     }
-                    _ => hit,
+                    _ => {
+                        report.complete = report.error.is_none();
+                        hit
+                    }
                 }
             }
             Err(off) => {
@@ -1682,9 +1810,26 @@ impl<'o> Analyzer<'o> {
         }
     }
 
+    /// Record that the intervals from `span` (scan, first MCU, first byte)
+    /// up to the end of the scan could not be decoded.
+    fn damage_to_end(&mut self, span: (u32, u64, u64), total: u64, end: u64) {
+        let (scan, first_mcu, byte_start) = span;
+        if first_mcu < total && self.a.damaged_ranges.len() < 1 << 16 {
+            self.a.damaged_ranges.push(DamagedRange {
+                scan,
+                first_mcu,
+                end_mcu: total,
+                byte_start,
+                byte_end: end.max(byte_start),
+            });
+        }
+    }
+
     /// Resynchronise on the next RST marker after an error in interval
     /// `interval`. Returns the MCU index to continue from and the RST
-    /// number expected next.
+    /// number expected next. `span` is `(scan, first MCU, first byte)` of
+    /// the damaged interval, recorded in [`ScanAnalysis::damaged_ranges`]
+    /// when decoding resumes.
     #[allow(clippy::too_many_arguments)]
     fn resync(
         &mut self,
@@ -1695,13 +1840,17 @@ impl<'o> Analyzer<'o> {
         interval: u64,
         ri: u64,
         total: u64,
+        span: (u32, u64, u64),
     ) -> Option<(u64, u8)> {
         let h = match hit {
             Some(h) if h.code.is_some_and(is_rst) => h,
+            // A code no encoder writes (a damaged RST marker, say): keep
+            // looking for the next restart marker after it.
+            Some(h) if h.code.is_some_and(|c| !ends_scan(c)) => next_rst(cur, h.next),
             // A real marker (EOI, another segment) or the end of the data:
             // nothing to resynchronise on.
             Some(_) => return None,
-            None => next_marker(cur, from, true),
+            None => next_rst(cur, from),
         };
         let c = h.code.filter(|&c| is_rst(c))?;
         let n = (c - 0xD0) as i64;
@@ -1713,6 +1862,16 @@ impl<'o> Analyzer<'o> {
         }
         let lost = (j as u64).saturating_sub(interval) as u32;
         self.a.corrupt_intervals += lost.max(1);
+        if self.a.damaged_ranges.len() < 1 << 16 {
+            let (scan, first_mcu, byte_start) = span;
+            self.a.damaged_ranges.push(DamagedRange {
+                scan,
+                first_mcu,
+                end_mcu: new_m,
+                byte_start,
+                byte_end: h.offset.max(byte_start),
+            });
+        }
         bits.reset(h.next);
         Some((new_m, ((n + 1) & 7) as u8))
     }

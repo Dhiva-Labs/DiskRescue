@@ -185,19 +185,30 @@ fn append_eoi_makes_a_truncated_file_viewable() {
 fn aggressive_truncation_cuts_at_clean_boundaries() {
     let Some(dir) = fixtures() else { return };
     // Truncated without restart markers: cut after the last good MCU.
+    // The rest of the scan is re-encoded as empty (grey) MCUs, so the
+    // output is a complete, standard-conforming file.
     let d = read(dir, "photo_1024x768.jpg");
     let cut = &d[..d.len() / 2];
     let before = analyze(cut).unwrap();
+    let kept = before.last_good_mcu.unwrap();
     let (r, out) = repair_with(cut, &aggressive());
     assert_eq!(r.result, RepairResult::PartiallyRepaired, "{r:?}");
+    assert!(zune_strict(&out));
     assert_eq!(zune_dims(&out), Some((1024, 768)));
     let after = analyze(&out).unwrap();
-    assert_eq!(after.first_error.unwrap().kind, ScanErrorKind::Eof);
-    assert_eq!(after.mcus_decoded, before.mcus_decoded);
+    assert!(after.is_clean(), "{:?}", after.first_error);
+    assert_eq!(after.mcus_decoded, before.mcus_total);
     assert_eq!(after.eoi_offset, Some(out.len() as u64 - 2));
+    assert_eq!(
+        &out[..kept.byte_offset as usize],
+        &cut[..kept.byte_offset as usize]
+    );
+    let frac = r.validation.unwrap().intact_fraction.unwrap();
+    let want = before.mcus_decoded as f32 / before.mcus_total as f32;
+    assert!((frac - want).abs() < 0.01, "{frac} vs {want}");
 
-    // Corruption with restart markers: cut at the restart marker before
-    // the damaged interval.
+    // Corruption with restart markers: only the damaged interval is
+    // replaced; the intervals after it are kept.
     let d = read(dir, "noise_rst_1024x768.jpg");
     let mut rng = Rng(11);
     let mut at = d.len() / 2;
@@ -224,13 +235,58 @@ fn aggressive_truncation_cuts_at_clean_boundaries() {
         "{:?}",
         r.notes
     );
+    let damaged = a.damaged_ranges.clone();
+    assert!(!damaged.is_empty(), "{a:?}");
     let (r, out) = repair_with(&x, &aggressive());
     assert_eq!(r.result, RepairResult::PartiallyRepaired, "{r:?}");
-    assert_eq!(out.len() as u64, restart_off + 2);
+    assert!(
+        r.applied
+            .iter()
+            .any(|s| s.contains("damaged restart interval")),
+        "{:?}",
+        r.applied
+    );
+    let first = damaged[0];
+    assert!(first.byte_start <= restart_off + 2);
+    assert_eq!(
+        &out[..first.byte_start as usize],
+        &x[..first.byte_start as usize]
+    );
+    // Everything from the RST where decoding resumed is the original.
+    let last = damaged[damaged.len() - 1];
+    let tail = &x[last.byte_end as usize..];
+    assert!(out.ends_with(tail));
+    let after = analyze(&out).unwrap();
+    assert!(after.is_clean(), "{:?}", after.first_error);
+    assert_eq!(after.mcus_decoded, a.mcus_total);
+    assert!(zune_strict(&out));
+    assert_eq!(zune_dims(&out), Some((1024, 768)));
+    let lost: u64 = damaged.iter().map(|r| r.end_mcu - r.first_mcu).sum();
+    let frac = r.validation.unwrap().intact_fraction.unwrap();
+    assert!((frac - (1.0 - lost as f32 / a.mcus_total as f32)).abs() < 1e-3);
+    assert!(frac > 0.99, "{frac}");
+
+    // The plain cut at the restart marker before the damage, on request:
+    // the original data up to that marker, then grey MCUs.
+    let mut out = Vec::new();
+    let r = apply(
+        &mem(x.clone()),
+        &mut out,
+        &[Strategy::TruncateAtLastGoodRestart],
+        &RepairContext::default(),
+    )
+    .unwrap();
+    assert_eq!(r.result, RepairResult::PartiallyRepaired, "{r:?}");
     assert_eq!(&out[..restart_off as usize], &x[..restart_off as usize]);
     let after = analyze(&out).unwrap();
-    assert_eq!(after.mcus_decoded, restart_mcu);
-    assert_eq!(zune_dims(&out), Some((1024, 768)));
+    assert!(after.is_clean());
+    assert_eq!(
+        after.restart_intervals_seen as u64,
+        a.mcus_total.div_ceil(4) - 1
+    );
+    let frac = r.validation.unwrap().intact_fraction.unwrap();
+    assert!((frac - restart_mcu as f32 / a.mcus_total as f32).abs() < 1e-3);
+    assert!(zune_strict(&out));
 }
 
 #[test]

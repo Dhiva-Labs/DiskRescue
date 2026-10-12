@@ -301,7 +301,7 @@ pub fn parse_mpf(data: &[u8], payload_file_offset: u64) -> Option<MpfInfo> {
     let (t, first) = Tiff::new(&data[4..])?;
     let (entries, _) = t.ifd(first)?;
     let mut info = MpfInfo {
-        tiff_offset: payload_file_offset + 4,
+        tiff_offset: payload_file_offset.saturating_add(4),
         ..Default::default()
     };
     for e in &entries {
