@@ -17,7 +17,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Clear, Paragraph};
 use ratatui::Frame;
 
-use crate::config::{Config, DeviceSource, Opener};
+use crate::config::{Config, DeviceSource, Elevation, Opener};
 use crate::event::Event;
 use crate::fsbrowse::{PickMode, Picker};
 use crate::model::{DeviceEntry, Overrides, Plan};
@@ -714,6 +714,13 @@ impl App {
             MenuAction::Back => self.back(),
             MenuAction::Help => self.overlay = Some(Overlay::Help),
             MenuAction::Status(s) => self.message("Not available", vec![s]),
+            MenuAction::Form(_) if self.job_running() => self.message(
+                "Another job is running",
+                vec![
+                    "Only one job can run at a time. Wait for it to finish, or go back to it (press g on the home screen) and stop it first."
+                        .into(),
+                ],
+            ),
             MenuAction::Form(kind) => {
                 let target = match &self.screen {
                     Screen::Menu(m) => m.target.clone(),
@@ -872,7 +879,7 @@ impl App {
             self.message(
                 "Another job is running",
                 vec![
-                    "Only one job can run at a time. Press b to leave this screen while it keeps running, or stop it first."
+                    "Only one job can run at a time. Wait for it to finish, or go back to it (press g on the home screen) and stop it first."
                         .into(),
                 ],
             );
@@ -883,8 +890,10 @@ impl App {
             Plan::Recover(p) => p.image_to.is_some(),
             _ => false,
         };
-        let privileged =
-            self.cfg.allow_elevation && !self.cfg.is_root && needs_root && copies_device;
+        let privileged = self.cfg.elevation != Elevation::Off
+            && !self.cfg.is_root
+            && needs_root
+            && copies_device;
         let pf = PreflightScreen::new(plan, privileged, self.cfg.is_root);
         self.push(Screen::Preflight(Box::new(pf)));
     }
@@ -910,7 +919,7 @@ impl App {
             self.set_status("Another job is still running.");
             return;
         }
-        match Run::start(plan, ov, privileged) {
+        match Run::start(plan, ov, privileged.then(|| self.cfg.elevation.clone())) {
             Ok(run) => {
                 self.interrupts = 0;
                 self.quit_when_done = false;

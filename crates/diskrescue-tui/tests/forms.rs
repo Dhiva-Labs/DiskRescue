@@ -271,7 +271,7 @@ fn a_device_that_stops_answering_shows_a_banner_on_the_running_screen() {
     let mut run = Run::start(
         Plan::Image(ImagePlan::new(&src, dir.path().join("a.img"))),
         Overrides::default(),
-        false,
+        None,
     )
     .unwrap();
     // The state a USB drive that dropped off the bus leaves behind.

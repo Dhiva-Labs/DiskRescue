@@ -1075,7 +1075,6 @@ impl Form {
             ]));
         }
         head.push(Line::raw(""));
-        let head_h = head.len();
         lines.extend(head);
 
         let rows = self.rows();
@@ -1161,7 +1160,6 @@ impl Form {
             off = 0;
         }
         off = off.min(lines.len().saturating_sub(1));
-        let _ = head_h;
         self.offset.set(off);
         let visible: Vec<Line<'static>> = lines.into_iter().skip(off).take(h).collect();
         f.render_widget(Paragraph::new(visible), area);

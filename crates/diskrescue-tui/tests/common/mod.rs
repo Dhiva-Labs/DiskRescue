@@ -3,9 +3,10 @@
 
 #![allow(dead_code)]
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::OnceLock;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crossterm::event::KeyCode;
 use diskrescue_fixtures::sets::{self, Scenario};
@@ -184,4 +185,73 @@ pub fn slow_rescue(home: &Path) -> (App, std::path::PathBuf) {
     });
     assert!(started, "{}", render(&app, 100, 30));
     (app, out)
+}
+
+/// The `diskrescue` command-line program, built from this workspace into
+/// the same target folder (or the one named by `DISKRESCUE_CLI`).
+pub fn cli_binary() -> Option<PathBuf> {
+    static CELL: OnceLock<Option<PathBuf>> = OnceLock::new();
+    CELL.get_or_init(|| {
+        if let Some(p) = std::env::var_os("DISKRESCUE_CLI") {
+            return Some(PathBuf::from(p));
+        }
+        // This test runs from <target>/<profile>/deps/<name>.
+        let exe = std::env::current_exe().ok()?;
+        let profile_dir = exe.parent()?.parent()?.to_path_buf();
+        let target_dir = profile_dir.parent()?.to_path_buf();
+        let profile = profile_dir.file_name()?.to_string_lossy().into_owned();
+        let bin = profile_dir.join(format!("diskrescue{}", std::env::consts::EXE_SUFFIX));
+        let cargo = std::env::var_os("CARGO")
+            .or_else(|| option_env!("CARGO").map(Into::into))
+            .unwrap_or_else(|| "cargo".into());
+        let mut cmd = Command::new(cargo);
+        cmd.args([
+            "build",
+            "--quiet",
+            "-p",
+            "diskrescue",
+            "--bin",
+            "diskrescue",
+        ])
+        .env("CARGO_TARGET_DIR", &target_dir)
+        .current_dir(env!("CARGO_MANIFEST_DIR"));
+        match profile.as_str() {
+            "debug" => {}
+            "release" => {
+                cmd.arg("--release");
+            }
+            other => {
+                cmd.args(["--profile", other]);
+            }
+        }
+        let built = match cmd.spawn() {
+            Ok(mut child) => {
+                let t = Instant::now();
+                loop {
+                    match child.try_wait() {
+                        Ok(Some(st)) => break st.success(),
+                        Ok(None) if t.elapsed() > Duration::from_secs(900) => {
+                            let _ = child.kill();
+                            break false;
+                        }
+                        Ok(None) => std::thread::sleep(Duration::from_millis(200)),
+                        Err(_) => break false,
+                    }
+                }
+            }
+            Err(_) => false,
+        };
+        if !built {
+            eprintln!(
+                "could not build the diskrescue program; using an existing build if there is one"
+            );
+        }
+        if bin.is_file() {
+            Some(bin)
+        } else {
+            eprintln!("skipped: no diskrescue program at {}", bin.display());
+            None
+        }
+    })
+    .clone()
 }

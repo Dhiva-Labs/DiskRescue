@@ -212,7 +212,10 @@ impl Menu {
                     format!(
                         " {}. {}",
                         i + 1,
-                        ellipsize_end(&it.label, w.saturating_sub(6))
+                        ellipsize_end(
+                            &it.label,
+                            w.saturating_sub(if it.disabled.is_some() { 22 } else { 6 })
+                        )
                     ),
                     style,
                 )];

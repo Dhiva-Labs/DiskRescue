@@ -8,24 +8,24 @@ use std::time::{Duration, Instant};
 use diskrescue_app::devices;
 use diskrescue_app::helper;
 use diskrescue_app::jobs::{
-    self, ImageState, ImageStatus, RecoverState, RecoverStatus, RepairState, ScanState, VerifyState,
+    self, ImageState, RecoverState, RecoverStatus, RepairState, ScanState, VerifyState,
 };
 use diskrescue_app::plan::{CarveMode, ImagePlan, RecoverPlan};
 use diskrescue_app::results::verify_verdict;
 use diskrescue_app::text::{
     self, bytes, duration, fraction, outcome_label, outcome_tone, percent, plural,
-    stage_progress_label, Tone,
+    stage_progress_label,
 };
 use diskrescue_app::{JobHandle, JobOutcome};
 use diskrescue_recover::pipeline::Survey;
-use diskrescue_recover::report::{Outcome, Report};
+use diskrescue_recover::report::Report;
 use diskrescue_recover::Stage;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Gauge, Paragraph};
 use ratatui::Frame;
 
-use crate::config::Config;
+use crate::config::Elevation;
 use crate::dashboard::{render_image_dashboard, DashboardView, Header};
 use crate::model::{Overrides, Plan};
 use crate::widgets::{ellipsize_start, fit, wrap_words, Theme};
@@ -86,6 +86,21 @@ pub enum Next {
     Image(PathBuf),
 }
 
+/// Start the copy of a device, directly or through the helper.
+fn start_copy(plan: ImagePlan, via: Option<&Elevation>) -> Result<JobHandle<ImageState>, String> {
+    match via {
+        None | Some(Elevation::Off) => Ok(jobs::start_image(plan)),
+        Some(Elevation::Pkexec) => {
+            helper::start_image_privileged(plan).map_err(|e| e.message().to_string())
+        }
+        Some(Elevation::Program(cli)) => Ok(helper::start_image_via_cli(
+            plan,
+            cli.clone(),
+            helper::Elevation::None,
+        )),
+    }
+}
+
 /// A job and everything the screen shows about it.
 pub struct Run {
     /// Heading.
@@ -119,9 +134,11 @@ pub struct Run {
 }
 
 impl Run {
-    /// Start `plan` on a background thread. With `privileged` the copy of a
-    /// device is made through the helper that asks for administrator rights.
-    pub fn start(plan: Plan, ov: Overrides, privileged: bool) -> Result<Run, String> {
+    /// Start `plan` on a background thread. With `via` the copy of a device
+    /// is made by the helper program (which asks for administrator rights
+    /// when `via` is [`Elevation::Pkexec`]).
+    pub fn start(plan: Plan, ov: Overrides, via: Option<Elevation>) -> Result<Run, String> {
+        let privileged = via.is_some();
         let title = plan.title();
         let mut followup = None;
         let mut steps = 1;
@@ -133,13 +150,7 @@ impl Run {
                 p.allow_mounted |= ov.allow_mounted;
                 p.force |= ov.force;
                 p.no_space_check |= ov.skip_space;
-                if privileged {
-                    Job::Image(
-                        helper::start_image_privileged(p).map_err(|e| e.message().to_string())?,
-                    )
-                } else {
-                    Job::Image(jobs::start_image(p))
-                }
+                Job::Image(start_copy(p, via.as_ref())?)
             }
             Plan::Recover(mut p) => {
                 p.allow_mounted |= ov.allow_mounted;
@@ -172,14 +183,7 @@ impl Run {
                         };
                         steps = 2;
                         followup = Some(then);
-                        if privileged {
-                            Job::Image(
-                                helper::start_image_privileged(img)
-                                    .map_err(|e| e.message().to_string())?,
-                            )
-                        } else {
-                            Job::Image(jobs::start_image(img))
-                        }
+                        Job::Image(start_copy(img, via.as_ref())?)
                     }
                     _ => Job::Recover(jobs::start_recover(p)),
                 }
@@ -718,7 +722,14 @@ impl Run {
                     Span::styled(format!("   {elapsed}"), theme.dim()),
                 ]),
                 Line::from(Span::styled(
-                    ellipsize_start(&v.subtitle, width.saturating_sub(1)),
+                    format!(
+                        "{}{}",
+                        v.prefix,
+                        ellipsize_start(
+                            &v.subtitle,
+                            width.saturating_sub(1 + v.prefix.chars().count())
+                        )
+                    ),
                     theme.dim(),
                 )),
             ]),
@@ -932,8 +943,10 @@ fn ellipsize_end_str(s: &str, max: usize) -> String {
 pub struct ProgressView<'a> {
     /// Stages so far.
     pub pipeline: &'a jobs::Pipeline,
-    /// A second heading line.
+    /// A second heading line, and words that come before it.
     pub subtitle: String,
+    /// Shown before the subtitle; never shortened.
+    pub prefix: &'static str,
     /// The job has ended.
     pub finished: bool,
     /// Imaging happened before (a rescue), and how far it is.
@@ -1003,15 +1016,25 @@ fn slot_label(slot: Slot) -> &'static str {
 
 impl<'a> ProgressView<'a> {
     fn from_recover(s: &'a RecoverState, run: &Run) -> Self {
-        let imaging = s.image.as_ref().map(|i| {
-            (
-                s.status != RecoverStatus::Imaging && s.status != RecoverStatus::Checking,
-                i.stats().map(|st| fraction(st.rescued, st.total())),
-                image_percent(i),
-            )
-        });
+        let imaging = s
+            .image
+            .as_ref()
+            .map(|i| {
+                (
+                    s.status != RecoverStatus::Imaging && s.status != RecoverStatus::Checking,
+                    i.stats().map(|st| fraction(st.rescued, st.total())),
+                    image_percent(i),
+                )
+            })
+            // The copy was made in a first step of its own.
+            .or_else(|| (run.step.1 > 1).then(|| (true, None, String::new())));
         ProgressView {
             pipeline: &s.pipeline,
+            prefix: if run.step.1 > 1 {
+                "Step 2 of 2: recovering from the copy. "
+            } else {
+                ""
+            },
             subtitle: s
                 .source
                 .as_ref()
@@ -1026,6 +1049,7 @@ impl<'a> ProgressView<'a> {
     fn from_scan(s: &'a ScanState, run: &Run) -> Self {
         ProgressView {
             pipeline: &s.pipeline,
+            prefix: "",
             subtitle: s
                 .source
                 .as_ref()
@@ -1040,6 +1064,7 @@ impl<'a> ProgressView<'a> {
     fn from_repair(s: &'a RepairState, run: &Run) -> Self {
         ProgressView {
             pipeline: &s.pipeline,
+            prefix: "",
             subtitle: format!(
                 "{} to {}",
                 plural(s.inputs as u64, "file", "files"),
@@ -1120,29 +1145,4 @@ impl<'a> ProgressView<'a> {
         }
         rows
     }
-}
-
-/// The outcome label and tone for a file, as a marker and style.
-pub fn outcome_mark(o: Outcome, theme: &Theme) -> (String, ratatui::style::Style) {
-    let t: Tone = outcome_tone(o);
-    (theme.tone_mark(t).to_string(), theme.tone(t))
-}
-
-/// True for the states in which the job still writes to disk.
-pub fn is_writing(r: &Run) -> bool {
-    r.is_running() && !matches!(r.snap, Snap::Scan(_) | Snap::Verify(_))
-}
-
-/// Status of an imaging job, for tests and the app.
-pub fn image_status(r: &Run) -> Option<ImageStatus> {
-    match &r.snap {
-        Snap::Image(s) => Some(s.status),
-        _ => None,
-    }
-}
-
-/// Config is needed to build runs from the app; kept here so the module is
-/// self-contained.
-pub fn privileged_for(cfg: &Config, needs_root: bool) -> bool {
-    cfg.allow_elevation && !cfg.is_root && needs_root
 }

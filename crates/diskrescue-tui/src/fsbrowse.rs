@@ -12,7 +12,7 @@ use ratatui::Frame;
 
 use diskrescue_app::text::bytes;
 
-use crate::input::{Edit, TextInput};
+use crate::input::TextInput;
 use crate::widgets::{ellipsize_end, ellipsize_start, fit, fit_right, render_list, ListNav, Theme};
 
 /// One entry of a folder.
@@ -642,11 +642,6 @@ pub fn tab_complete(
     } else {
         Vec::new()
     }
-}
-
-/// True when an [`Edit`] changed the text.
-pub fn changed(e: Edit) -> bool {
-    e == Edit::Changed
 }
 
 #[cfg(test)]

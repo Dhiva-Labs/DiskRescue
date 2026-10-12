@@ -7,7 +7,7 @@ use crossterm::event::KeyEvent;
 use ratatui::layout::Rect;
 use ratatui::Frame;
 
-use crate::fsbrowse::{PickEvent, PickMode, Picker};
+use crate::fsbrowse::{PickEvent, Picker};
 use crate::screens::form::FieldId;
 use crate::screens::results::ResultsData;
 use crate::widgets::Theme;
@@ -99,10 +99,5 @@ impl PickScreen {
     pub fn draw(&self, f: &mut Frame, area: Rect, theme: &Theme) -> (Rect, usize) {
         let (off, rect) = self.picker.draw(f, area, theme);
         (rect, off)
-    }
-
-    /// Does the browser choose several files?
-    pub fn multi(&self) -> bool {
-        self.picker.mode == PickMode::Files
     }
 }

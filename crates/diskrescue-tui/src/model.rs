@@ -59,7 +59,8 @@ impl DeviceEntry {
         if self.info.read_only {
             v.push("read-only");
         }
-        if self.needs_root {
+        // Nothing can be done with the system disk anyway.
+        if self.needs_root && !self.system {
             v.push("needs root");
         }
         v

@@ -138,16 +138,16 @@ fn only_one_job_runs_at_a_time_and_esc_does_not_leave_a_running_one() {
         .status()
         .is_some_and(|s| s.contains("Press s to stop and save")));
     app.handle_event(ch('b'));
-    // Starting another is refused with an explanation.
+    // Starting another is refused with an explanation, before any form.
     press(&mut app, KeyCode::Enter);
     press(&mut app, KeyCode::Enter);
-    app.handle_event(ctrl('s'));
-    assert_eq!(app.screen_id(), ScreenId::Form);
+    assert_eq!(app.screen_id(), ScreenId::Menu);
     assert!(matches!(app.overlay(), Some(Overlay::Message { .. })));
     contains_all(
         &render(&app, 100, 30),
         &["Another job is running", "Only one job can run at a time"],
     );
+    press(&mut app, KeyCode::Esc);
     press(&mut app, KeyCode::Esc);
     // g goes back to the job, s stops it with a confirmation.
     press(&mut app, KeyCode::Esc);

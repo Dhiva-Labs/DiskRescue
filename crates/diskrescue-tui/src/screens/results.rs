@@ -214,6 +214,7 @@ pub struct ResultsScreen {
     /// Scroll of the detail pane.
     pub detail_scroll: u16,
     counts: [usize; 6],
+    summary: String,
 }
 
 impl ResultsScreen {
@@ -229,7 +230,9 @@ impl ResultsScreen {
             nav: ListNav::new(),
             detail_scroll: 0,
             counts: [0; 6],
+            summary: String::new(),
         };
+        s.summary = ResultsScreen::summarize(&s.data);
         for (n, f) in FILTERS.iter().enumerate() {
             s.counts[n] = s.data.items.iter().filter(|i| f.matches(i)).count();
         }
@@ -390,13 +393,14 @@ impl ResultsScreen {
         self.nav.scroll(delta, height, self.view.len());
     }
 
-    /// Title and summary lines for the top of the screen.
-    pub fn summary(&self) -> String {
-        let t = &self.data.report.totals;
-        let c = |name: &str| t.by_outcome.get(name).copied().unwrap_or(0);
-        let items = &self.data.items;
+    /// One line about every file of the report.
+    pub fn summary(&self) -> &str {
+        &self.summary
+    }
+
+    fn summarize(data: &ResultsData) -> String {
+        let items = &data.items;
         let n = |o: Outcome| items.iter().filter(|i| i.outcome == o).count();
-        let _ = c;
         format!(
             "{} - {} ok, {} damaged, {} repaired, {} deleted",
             plural(items.len() as u64, "file", "files"),

@@ -35,6 +35,19 @@ pub enum Opener {
     Disabled,
 }
 
+/// How a copy of a device that needs administrator rights is made when the
+/// app itself has none.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Elevation {
+    /// Never ask for administrator rights.
+    Off,
+    /// Ask through `pkexec` (the desktop shows a password prompt).
+    Pkexec,
+    /// Run this `diskrescue` program as the current user, without asking
+    /// for anything (tests of the helper path).
+    Program(PathBuf),
+}
+
 /// Everything the app reads from its surroundings.
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -50,9 +63,9 @@ pub struct Config {
     pub devices: DeviceSource,
     /// How "Open folder" works.
     pub opener: Opener,
-    /// Administrator rights may be asked for (through `pkexec`) to copy a
-    /// device when the app itself has none.
-    pub allow_elevation: bool,
+    /// How a device that needs administrator rights is copied when the app
+    /// has none.
+    pub elevation: Elevation,
 }
 
 impl Config {
@@ -67,7 +80,7 @@ impl Config {
             is_root,
             devices: DeviceSource::System,
             opener: Opener::System,
-            allow_elevation: true,
+            elevation: Elevation::Pkexec,
         }
     }
 
@@ -81,7 +94,7 @@ impl Config {
             is_root: false,
             devices: DeviceSource::Fixed(devices),
             opener: Opener::Disabled,
-            allow_elevation: false,
+            elevation: Elevation::Off,
         }
     }
 }

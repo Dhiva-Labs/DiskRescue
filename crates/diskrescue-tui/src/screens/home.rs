@@ -513,7 +513,7 @@ impl Home {
             v.push(Line::from(spans));
         }
         v.push(Line::raw(""));
-        if e.needs_root {
+        if e.needs_root && !e.system {
             for l in wrap_words(
                 "Reading this device needs administrator rights. To recover from it, close DiskRescue and start it again with: sudo diskrescue-tui. 'Copy to an image only' and 'Rescue' can ask for your password from here.",
                 w,

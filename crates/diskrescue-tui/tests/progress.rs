@@ -50,7 +50,7 @@ fn run_with(state: RecoverState) -> (Run, tempfile::TempDir) {
     let mut run = Run::start(
         Plan::Recover(RecoverPlan::new(&src, dir.path().join("out"))),
         Overrides::default(),
-        false,
+        None,
     )
     .unwrap();
     run.title = "Recovery from sd_card.img".into();
