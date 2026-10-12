@@ -10,8 +10,11 @@
 //!
 //! * `read_at(offset, buf)` reads up to `buf.len()` bytes starting at
 //!   `offset`. It returns the number of bytes placed at the start of `buf`.
-//!   Fewer than `buf.len()` means end of source was reached; `Ok(0)` means
-//!   `offset >= size()`.
+//!   `Ok(0)` means `offset >= size()`. A short read (`0 < n < buf.len()`)
+//!   happens at the end of the source, and may also happen just before an
+//!   unreadable region: the implementation returns the good prefix, and a
+//!   read starting at `offset + n` then reports the error. Callers that need
+//!   every byte loop until `Ok(0)` or an error (see [`SourceExt`]).
 //! * On failure it returns a [`ReadError`] that names the first offset the
 //!   implementation could not read. Bytes before `err.offset` may or may not
 //!   have been written to `buf`; callers must not rely on them.
@@ -729,15 +732,21 @@ impl BlockCache {
         let n = self.inner.read_at(offset, &mut buf)?;
         buf.truncate(n);
         let block = Arc::new(buf);
-        let mut st = self.state.lock().unwrap();
-        if st.blocks.len() >= self.capacity {
-            // Evict the least recently used block. Capacity is small enough
-            // that a linear scan is cheaper than keeping an ordered index.
-            if let Some((&victim, _)) = st.blocks.iter().min_by_key(|(_, (_, t))| *t) {
-                st.blocks.remove(&victim);
+        // Only cache complete blocks and the final block of the source. A
+        // short read in the middle stopped in front of an unreadable sector;
+        // caching it would turn that sector into a silent end of data.
+        let complete = n == self.block_size || offset.saturating_add(n as u64) >= self.inner.size();
+        if complete {
+            let mut st = self.state.lock().unwrap();
+            if st.blocks.len() >= self.capacity {
+                // Evict the least recently used block. Capacity is small enough
+                // that a linear scan is cheaper than keeping an ordered index.
+                if let Some((&victim, _)) = st.blocks.iter().min_by_key(|(_, (_, t))| *t) {
+                    st.blocks.remove(&victim);
+                }
             }
+            st.blocks.insert(index, (block.clone(), tick));
         }
-        st.blocks.insert(index, (block.clone(), tick));
         Ok(block)
     }
 }
@@ -768,7 +777,13 @@ impl Source for BlockCache {
                 e
             })?;
             if within >= block.len() {
-                break;
+                // The block ended early. At the end of the source that is
+                // EOF; otherwise the next byte is unreadable: return what we
+                // have, or let the inner source report the error.
+                if done > 0 || pos >= size {
+                    break;
+                }
+                return self.inner.read_at(pos, &mut buf[..want]);
             }
             let n = (block.len() - within).min(want - done);
             buf[done..done + n].copy_from_slice(&block[within..within + n]);
@@ -862,6 +877,35 @@ mod tests {
         let tail = cache.read_vec(4990, 100).unwrap();
         assert_eq!(tail, data[4990..].to_vec());
         assert_eq!(cache.read_vec(5000, 10).unwrap().len(), 0);
+    }
+
+    #[test]
+    fn block_cache_does_not_turn_holes_into_eof() {
+        let mut set = RangeSet::new();
+        set.insert(Range::new(1500, 1600));
+        let base: SharedSource =
+            Arc::new(MemSource::new((0..4096u32).map(|i| i as u8).collect()).with_unreadable(set));
+        let cache = BlockCache::new(base, 1024, 4);
+        // First read hits the short block [1024, 1500) and must not cache it.
+        let v = cache.read_vec(1024, 2048);
+        assert!(
+            v.is_err(),
+            "reading across a hole must fail, got {:?}",
+            v.map(|x| x.len())
+        );
+        // Reading inside the hole reports the error at the right place.
+        let mut b = [0u8; 16];
+        let e = cache.read_at(1510, &mut b).unwrap_err();
+        assert_eq!(e.kind, ReadErrorKind::Io);
+        // Reading before the hole works and returns a short read, never a
+        // fake EOF that hides the bytes after the hole.
+        let mut b = [0u8; 600];
+        let n = cache.read_at(1024, &mut b).unwrap();
+        assert_eq!(n, 476);
+        assert_eq!(
+            cache.read_exact_vec(1600, 100).unwrap(),
+            (1600..1700u32).map(|i| i as u8).collect::<Vec<_>>()
+        );
     }
 
     #[test]
