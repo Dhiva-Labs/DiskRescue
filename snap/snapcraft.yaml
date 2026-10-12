@@ -1,0 +1,71 @@
+name: diskrescue
+title: DiskRescue
+base: core24
+version: '0.1.0'
+summary: Recover photos and videos from failing drives and repair them
+description: |
+  DiskRescue gets photos and videos back from hard disks, SSDs, USB drives
+  and SD cards that are failing, have failed, were reformatted or had files
+  deleted, and repairs damaged JPEG, PNG, MP4/MOV and AVI files.
+
+  - Careful, resumable copies of failing drives, with a reading strategy per
+    device type and GNU ddrescue compatible progress maps.
+  - Recovery by name of existing and deleted files from FAT, exFAT, NTFS and
+    ext4, including cards whose boot sector is destroyed.
+  - Carving of photos, camera RAW files and videos from raw space.
+  - Repair of videos that will not open ("moov atom not found"), cut-off or
+    header-damaged photos, broken PNGs and AVIs without an index.
+
+  It never writes to the drive it rescues. Three programs share one engine:
+  diskrescue.gui (desktop app), diskrescue.tui (terminal app) and diskrescue
+  (command line).
+license: MIT
+grade: stable
+# A data recovery tool must read any raw block device, ask for
+# administrator rights from the desktop app (pkexec) and save to any
+# location the user picks, including other mounted disks. See
+# packaging/SNAP.md for the classic confinement request.
+confinement: classic
+contact: https://github.com/Dhiva-Labs/DiskRescue/issues
+issues: https://github.com/Dhiva-Labs/DiskRescue/issues
+source-code: https://github.com/Dhiva-Labs/DiskRescue
+website: https://github.com/Dhiva-Labs/DiskRescue
+icon: packaging/linux/diskrescue.svg
+
+apps:
+  diskrescue:
+    command: bin/diskrescue
+  tui:
+    command: bin/diskrescue-tui
+  gui:
+    command: bin/diskrescue-gui
+    desktop: meta/gui/diskrescue.desktop
+
+parts:
+  diskrescue:
+    plugin: rust
+    source: .
+    rust-channel: "1.97.1"
+    rust-path:
+      - crates/diskrescue
+      - crates/diskrescue-tui
+      - crates/diskrescue-gui
+    build-attributes:
+      - enable-patchelf
+    build-packages:
+      - pkg-config
+      - libxkbcommon-dev
+      - libwayland-dev
+    # The desktop app loads these at run time (winit and glutin use dlopen).
+    stage-packages:
+      - libgl1
+      - libegl1
+      - libxkbcommon0
+      - libxkbcommon-x11-0
+      - libwayland-client0
+      - libwayland-cursor0
+      - libwayland-egl1
+      - libx11-6
+      - libxcursor1
+      - libxrandr2
+      - libxi6

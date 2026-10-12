@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=DiskRescue
+GenericName=Photo and Video Recovery
+Comment=Recover photos and videos from failing drives and repair them
+Exec=diskrescue.gui
+Icon=${SNAP}/meta/gui/diskrescue.svg
+Terminal=false
+Categories=Utility;System;
+Keywords=recovery;undelete;photo;video;repair;sd card;usb;disk;
+StartupNotify=true
