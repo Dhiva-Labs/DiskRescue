@@ -68,6 +68,9 @@ rand = "0.8"
 ctrlc = { version = "3", features = ["termination"] }
 windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_IO", "Win32_System_Ioctl", "Win32_Security"] }
 
+# Never set `panic = "abort"`: format validators wrap third-party decoders
+# (zune-jpeg) in catch_unwind so a decoder bug on corrupt data cannot kill a
+# recovery run.
 [profile.release]
 lto = true
 codegen-units = 1
