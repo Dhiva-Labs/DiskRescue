@@ -341,6 +341,7 @@ fn clip_tables(src: &SharedSource, a: &Analysis) -> Result<Option<Step>> {
                 cts_offset: s.cts_offset,
                 keyframe: s.keyframe,
                 count: 1,
+                suffix: None,
             })
             .collect();
         let constant_size = match t.stsz {

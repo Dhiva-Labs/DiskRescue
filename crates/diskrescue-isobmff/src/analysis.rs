@@ -53,6 +53,9 @@ pub struct TrackCheck {
     pub l2_checked: u32,
     /// Content checks that failed.
     pub l2_failed: u32,
+    /// Checked samples whose first bytes are zero-filled or unreadable
+    /// (holes: counted neither as passed nor as failed).
+    pub l2_holes: u32,
     /// Problems.
     pub problems: Vec<String>,
 }
@@ -215,8 +218,14 @@ fn level2(src: &dyn Source, moov: &Moov, idx: usize, samples: &[Sample], tc: &mu
         }
         let step = firsts.len().div_ceil(256).max(1);
         for s in firsts.iter().step_by(step) {
-            tc.l2_checked += 1;
             let head = src.read_vec(s.offset, 8).unwrap_or_default();
+            if head.len() < 8 || head.iter().all(|&b| b == 0) {
+                // A zero-filled or unreadable region is damage, not
+                // evidence that the index belongs to another recording.
+                tc.l2_holes += 1;
+                continue;
+            }
+            tc.l2_checked += 1;
             if !nal_start_ok(&head, l, is_hevc, s.size) {
                 tc.l2_failed += 1;
             }
@@ -228,9 +237,20 @@ fn level2(src: &dyn Source, moov: &Moov, idx: usize, samples: &[Sample], tc: &mu
         .filter(aac::walk_supported)
     {
         let step = inside.len().div_ceil(64).max(1);
+        // No AAC frame exceeds 6144 bits per channel.
+        let max_frame = 768 * (cfg.channels.max(1) as usize) + 64;
         for s in inside.iter().step_by(step) {
-            tc.l2_checked += 1;
+            if s.size as usize > max_frame {
+                tc.l2_checked += 1;
+                tc.l2_failed += 1;
+                continue;
+            }
             let data = src.read_vec(s.offset, s.size as usize).unwrap_or_default();
+            if data.len() < s.size as usize || data.iter().all(|&b| b == 0) {
+                tc.l2_holes += 1;
+                continue;
+            }
+            tc.l2_checked += 1;
             if aac::frame_length(&data, &cfg) != Some(s.size as usize) {
                 tc.l2_failed += 1;
             }
@@ -398,6 +418,12 @@ pub fn analyze(src: &dyn Source) -> Result<Analysis> {
         if t.chunk_beyond_eof {
             a.problems
                 .push(format!("stco offsets beyond EOF (track {})", t.track_id));
+        }
+        if t.l2_holes > 0 {
+            a.problems.push(format!(
+                "track {}: {} sampled {kind} sample(s) start in zero-filled or unreadable data",
+                t.track_id, t.l2_holes
+            ));
         }
         for p in &t.problems {
             a.problems.push(format!("track {}: {p}", t.track_id));

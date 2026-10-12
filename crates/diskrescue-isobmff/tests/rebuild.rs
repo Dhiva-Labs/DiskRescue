@@ -275,8 +275,16 @@ fn hole_in_mdat_is_skipped() {
         .any(|r| r.start <= hole.start as u64 + 4096 && r.end >= hole.end as u64 - 4096);
     assert!(covered, "{:?}", rep.unclassified_ranges);
     ffprobe_clean(&out).unwrap();
+    // The pictures that depend on the frames lost in the hole are dropped
+    // up to the next keyframe (one GOP of 30), so the output decodes
+    // without errors.
+    decodes_clean(&out).unwrap_or_else(|e| panic!("decode errors after a hole: {e}"));
     let (v, _) = expected(&orig, None);
-    assert!(rep.video_samples as usize >= v * 8 / 10, "{rep:?}");
+    assert!(rep.video_samples as usize >= v - 32, "{rep:?}");
+    assert!(
+        rep.notes.iter().any(|n| n.contains("cannot reconstruct")),
+        "{rep:?}"
+    );
 }
 
 #[test]
