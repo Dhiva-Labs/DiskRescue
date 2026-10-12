@@ -19,6 +19,19 @@
 //! * a chunk runs past the RIFF end: `Truncated` at that chunk, length is the
 //!   RIFF end.
 //!
+//! Every top-level `VP8 ` / `VP8L` chunk must carry a valid bitstream header
+//! (a shown key frame whose first partition fits in the chunk, as libwebp
+//! requires; or the VP8L signature with version 0); a chunk that does not
+//! ends the walk there.
+//!
+//! The RIFF size alone does not prove that the bytes it covers are this
+//! file's: a WebP cut short and followed by other files still declares its
+//! old size. The payload after the last chunk header the walk verified is
+//! therefore scanned for the start of another file at sector-aligned offsets
+//! (see `crate::foreign`; a TIFF or JPEG header inside the `EXIF` chunk is
+//! the file's own Exif block). Such a start ends the file: `Truncated` at
+//! that offset with lower confidence.
+//!
 //! Metadata: dimensions from `VP8X` (canvas) or the bitstream; the `EXIF`
 //! chunk is parsed with the TIFF walker for the capture date, make, model and
 //! orientation.
@@ -26,7 +39,8 @@
 //! # Limits
 //!
 //! Chunk payloads (the VP8 bitstream, `ANMF` frames) are not decoded or
-//! checksummed.
+//! checksummed, so a file cut short and followed by zeros or by data that
+//! is not another file's header still measures to its declared size.
 
 use diskrescue_core::format::{Confidence, FileFormat, Measured, Signature, Validation};
 use diskrescue_core::media::{MediaCategory, MediaMeta};
@@ -34,7 +48,8 @@ use diskrescue_core::source::SharedSource;
 use diskrescue_core::util::bytes::{u24le, u32le};
 use diskrescue_core::Result;
 
-use crate::common::{failed, validate_with, Inspected};
+use crate::common::{cut_at, failed, foreign_note, validate_with, Inspected};
+use crate::foreign::{self, Sig};
 use crate::tiff::{exif_meta, walk_blob};
 use crate::win::{read_error, Cursor, Fail, Win};
 
@@ -47,7 +62,8 @@ const SIGNATURES: [Signature; 1] = [Signature::at_start(b"RIFF").with_also(b"WEB
 #[derive(Debug, Clone, Copy, Default)]
 pub struct WebpFormat;
 
-/// Dimensions from a `VP8 ` chunk payload.
+/// Dimensions from a `VP8 ` chunk payload: a key frame (bit 0 clear) of
+/// profile 0..3 with the `9D 01 2A` start code.
 fn vp8_dims(p: &[u8]) -> Option<(u32, u32)> {
     if p.len() < 10 || p[0] & 1 != 0 || (p[0] >> 1) & 7 > 3 || p[3..6] != [0x9D, 0x01, 0x2A] {
         return None;
@@ -55,6 +71,17 @@ fn vp8_dims(p: &[u8]) -> Option<(u32, u32)> {
     let w = (u16::from_le_bytes([p[6], p[7]]) & 0x3FFF) as u32;
     let h = (u16::from_le_bytes([p[8], p[9]]) & 0x3FFF) as u32;
     (w > 0 && h > 0).then_some((w, h))
+}
+
+/// The rest of libwebp's `VP8GetInfo` checks on a `VP8 ` frame tag: the
+/// frame is shown and its first partition fits in the `chunk_size`-byte
+/// chunk.
+fn vp8_consistent(p: &[u8], chunk_size: u64) -> bool {
+    let Some(t) = p.get(..3) else {
+        return false;
+    };
+    let bits = u32::from(t[0]) | u32::from(t[1]) << 8 | u32::from(t[2]) << 16;
+    bits & 0x10 != 0 && u64::from(bits >> 5) < chunk_size
 }
 
 /// Dimensions and alpha flag from a `VP8L` chunk payload.
@@ -112,6 +139,11 @@ struct Scan {
     frames: u32,
     exif: Option<(u64, u64)>,
     flags_reserved: bool,
+    /// A `VP8 ` frame header that libwebp would refuse.
+    vp8_inconsistent: bool,
+    /// Payload start of the last chunk whose header the walk accepted: the
+    /// bytes before it are vouched for by chunk headers.
+    last_payload: u64,
 }
 
 fn scan(win: &Win) -> std::result::Result<Option<Scan>, Fail> {
@@ -136,6 +168,8 @@ fn scan(win: &Win) -> std::result::Result<Option<Scan>, Fail> {
         frames: 0,
         exif: None,
         flags_reserved: false,
+        vp8_inconsistent: false,
+        last_payload: 20,
     };
     // The first chunk's bitstream header must parse.
     let first_size = u32le(&h, 16).unwrap_or(0) as usize;
@@ -151,7 +185,10 @@ fn scan(win: &Win) -> std::result::Result<Option<Scan>, Fail> {
             s.kind = "lossy";
             if complete_payload {
                 match vp8_dims(&payload) {
-                    Some(d) => s.image = Some(d),
+                    Some(d) => {
+                        s.image = Some(d);
+                        s.vp8_inconsistent |= !vp8_consistent(&payload, first_size as u64);
+                    }
                     None => return Ok(None),
                 }
             }
@@ -215,16 +252,27 @@ fn scan(win: &Win) -> std::result::Result<Option<Scan>, Fail> {
             break End::Over(pos);
         }
         match id {
-            b"VP8 " | b"VP8L" if pos > 12 && s.image.is_none() => {
+            b"VP8 " | b"VP8L" if pos > 12 => {
+                // Every image bitstream must start like one.
                 let n = size.min(32) as usize;
-                if let Ok(p) = cur.slice(pos + 8, n) {
-                    if id == b"VP8 " {
-                        s.image = vp8_dims(p);
-                    } else if let Some((w, hh, a)) = vp8l_dims(p) {
-                        s.image = Some((w, hh));
-                        s.alpha |= a;
+                let header = match cur.slice(pos + 8, n) {
+                    Ok(p) => {
+                        if id == b"VP8 " {
+                            s.vp8_inconsistent |= !vp8_consistent(p, size);
+                            vp8_dims(p).map(|d| (d, false))
+                        } else {
+                            vp8l_dims(p).map(|(w, hh, a)| ((w, hh), a))
+                        }
                     }
+                    Err(f) => break End::Stopped(f),
+                };
+                let Some((dims, a)) = header else {
+                    break End::Short(pos);
+                };
+                if s.image.is_none() {
+                    s.image = Some(dims);
                 }
+                s.alpha |= a;
             }
             b"ANIM" => s.animated = true,
             b"ANMF" => s.frames += 1,
@@ -232,6 +280,7 @@ fn scan(win: &Win) -> std::result::Result<Option<Scan>, Fail> {
             b"EXIF" if s.exif.is_none() => s.exif = Some((pos + 8, size)),
             _ => {}
         }
+        s.last_payload = pos + 8;
         pos = cend;
     };
     Ok(Some(s))
@@ -277,6 +326,32 @@ fn inspect(src: &SharedSource, start: u64, limit: u64) -> Result<Option<Inspecte
     if s.flags_reserved {
         m.confidence = m.confidence.lowered(10);
         notes.push("reserved VP8X flag bits are set".into());
+    }
+    if s.vp8_inconsistent {
+        m.confidence = m.confidence.lowered(20);
+        notes.push(
+            "a VP8 frame header is not decodable (hidden frame, or a first partition larger than its chunk)"
+                .into(),
+        );
+    }
+    // Another file starting inside the bytes the chunk headers do not vouch
+    // for ends this one. Exact walks are vouched for up to the last chunk
+    // header; otherwise only the first one is trusted.
+    let from = match s.end {
+        End::Exact => s.last_payload,
+        _ => 20,
+    };
+    let exif = s.exif.map(|(off, size)| (off, off.saturating_add(size)));
+    let allowed = |off: u64, sig: Sig| {
+        matches!(sig, Sig::Tiff | Sig::Jpeg) && exif.is_some_and(|(a, b)| (a..b).contains(&off))
+    };
+    if let Some(hit) = foreign::scan(&win, from, m.len, &allowed) {
+        let declared = s.riff_end;
+        cut_at(
+            &mut m,
+            hit.offset,
+            foreign_note(hit, declared, "the RIFF header"),
+        );
     }
     let mut meta = MediaMeta::default();
     match (s.canvas, s.image) {
@@ -358,6 +433,12 @@ impl FileFormat for WebpFormat {
 
     fn max_size(&self) -> u64 {
         MAX_SIZE
+    }
+
+    /// The `EXIF` chunk holds an Exif block (a little TIFF file) that may
+    /// carry a JPEG thumbnail (carving spec 2.3).
+    fn may_contain(&self, inner: &str) -> bool {
+        matches!(inner, "tiff" | "jpeg")
     }
 
     fn probe(&self, head: &[u8]) -> bool {

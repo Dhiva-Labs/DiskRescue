@@ -35,6 +35,13 @@
 //!   yields `Capped`.
 //! * Results are file-relative: `len`, `err_offset` and nested ranges count
 //!   from the signature start.
+//! * A size field alone is not trusted where the bytes it covers can be
+//!   checked cheaply: BMP, WebP and the TIFF family look for the start of
+//!   another file on the sector grid inside their declared extent (bounded:
+//!   at most 8192 reads of 16 bytes) and end there (`Truncated`); TIFF-family
+//!   files also check that every JPEG stream their IFDs point at starts with
+//!   `FF D8`. A bare Exif block (IFD0 without image data) is reported with
+//!   `Confidence::LOW` and the note "EXIF block without image data".
 //!
 //! The suggested file extension of a TIFF-family hit (`srw`, `erf`, `sr2`,
 //! `nrw`, `rwl`, `3fr`, `mef`, `mos`, `iiq`, ...) is in
@@ -48,6 +55,7 @@ use diskrescue_core::format::FileFormat;
 
 mod bmp;
 mod common;
+mod foreign;
 mod gif;
 mod jpegmini;
 mod makernote;

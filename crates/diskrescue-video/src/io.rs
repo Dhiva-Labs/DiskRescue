@@ -83,6 +83,15 @@ impl<'a> Window<'a> {
         self.fault.as_ref()
     }
 
+    /// Forget the recorded read failure when it lies before `pos`: the
+    /// caller accounted for it (a known hole it walked across), and a later
+    /// failure should be recorded instead.
+    pub fn forget_fault_before(&mut self, pos: u64) {
+        if self.fault.as_ref().is_some_and(|f| f.offset < pos) {
+            self.fault = None;
+        }
+    }
+
     /// Total bytes requested from the source so far (for tests and tuning).
     #[allow(dead_code)]
     pub fn bytes_fetched(&self) -> u64 {

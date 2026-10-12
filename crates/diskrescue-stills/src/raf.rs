@@ -299,8 +299,10 @@ impl FileFormat for RafFormat {
         (head.len() < HEADER_MIN as usize && SIGNATURES[0].matches(head)) || parse(head).is_some()
     }
 
+    /// The embedded JPEG (with its Exif block) and the CFA section, which is
+    /// a TIFF container (carving spec 2.2.6), are part of the file.
     fn may_contain(&self, inner: &str) -> bool {
-        inner == "jpeg"
+        matches!(inner, "jpeg" | "tiff")
     }
 
     fn measure(&self, src: &SharedSource, start: u64, limit: u64) -> Result<Option<Measured>> {

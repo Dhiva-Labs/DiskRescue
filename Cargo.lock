@@ -631,6 +631,7 @@ name = "diskrescue-stills"
 version = "0.1.0"
 dependencies = [
  "diskrescue-core",
+ "diskrescue-fixtures",
  "flate2",
  "log",
  "serde",

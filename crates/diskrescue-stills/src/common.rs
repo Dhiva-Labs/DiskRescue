@@ -5,6 +5,7 @@ use diskrescue_core::format::{Confidence, ExtentStatus, Measured, Validation, Va
 use diskrescue_core::source::{SharedSource, Source};
 use diskrescue_core::Result;
 
+use crate::foreign::Hit;
 use crate::win::{Fail, Win};
 
 /// A measurement together with the total size the file *claims* to have, so
@@ -71,6 +72,37 @@ pub(crate) fn sized(win: &Win, declared: u64, conf: Confidence, what: &str) -> M
             ),
         )
     }
+}
+
+/// End a measurement at `at` (file-relative) because the bytes from there on
+/// are evidently not part of the file: another file starts there, or data
+/// the structure points at is missing. The result is `Truncated` at `at`
+/// with confidence lowered by 30 (but not below [`Confidence::LOW`], so the
+/// carver still keeps the file); nested objects past the cut are dropped.
+/// Nothing happens when `at` is not inside the measured length.
+pub(crate) fn cut_at(m: &mut Measured, at: u64, note: String) {
+    if at == 0 || at >= m.len {
+        return;
+    }
+    m.confidence = m
+        .confidence
+        .lowered(30)
+        .max(Confidence::LOW)
+        .min(m.confidence);
+    m.len = at;
+    m.status = ExtentStatus::Truncated;
+    m.err_offset = Some(m.err_offset.map_or(at, |e| e.min(at)));
+    m.nested.retain(|n| n.range.end <= at);
+    m.notes.push(note);
+}
+
+/// Note for a cut at another file's signature.
+pub(crate) fn foreign_note(hit: Hit, declared: u64, what: &str) -> String {
+    format!(
+        "a {} file starts at offset {} inside the {declared} bytes {what} declares: this file ends there (cut short or overwritten)",
+        hit.sig.name(),
+        hit.offset
+    )
 }
 
 /// Trailing bytes after a measured end that `validate` tolerates as

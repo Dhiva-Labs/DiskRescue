@@ -535,8 +535,10 @@ impl FileFormat for PsdFormat {
         parse_header(head).is_some()
     }
 
+    /// The JPEG thumbnail (resource 0x040C) and the Exif block (resource
+    /// 0x0422, a little TIFF file) are part of the document.
     fn may_contain(&self, inner: &str) -> bool {
-        inner == "jpeg"
+        matches!(inner, "jpeg" | "tiff")
     }
 
     fn measure(&self, src: &SharedSource, start: u64, limit: u64) -> Result<Option<Measured>> {
