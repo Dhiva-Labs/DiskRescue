@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Version=1.5
+Name=DiskRescue
+GenericName=Photo and Video Recovery
+Comment=Get photos and videos back from failing cards, USB drives and disks, and repair damaged files
+Exec=diskrescue-gui
+Icon=diskrescue
+Terminal=false
+Categories=Utility;
+Keywords=recover;recovery;undelete;photos;videos;SD card;USB;disk;repair;ddrescue;
+StartupNotify=true
+StartupWMClass=diskrescue
