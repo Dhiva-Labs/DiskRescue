@@ -286,10 +286,14 @@ fn card_reader_hint(input: &ClassifyInput<'_>) -> Option<Classification> {
         || product
             .split(|c: char| !c.is_ascii_alphanumeric())
             .any(|w| w == "sd");
+    // Alcor and Genesys also make pen-drive controllers ("058f:6387 Flash
+    // Disk"): a flash-drive name wins over the vendor id.
+    let flash_named = looks_like_flash_model(input.vendor, input.model)
+        || looks_like_flash_model(input.vendor, input.usb_product);
     if let Some(vid) = input.usb_vendor_id {
         let vid = vid.trim().to_ascii_lowercase();
         if let Some((_, maker)) = CARD_READER_VIDS.iter().find(|(v, _)| *v == vid) {
-            if input.removable || readerish {
+            if readerish || (input.removable && !flash_named) {
                 return Some(Classification::reader(
                     Confidence::Medium,
                     format!(
@@ -670,6 +674,17 @@ mod tests {
         b1.product_type = 0;
         i.vpd_b1 = Some(b1);
         assert!(!classify(&i).card_reader);
+        // An Alcor-controller pen drive is not a card reader.
+        let mut i = usb("Flash Disk", true, Some(true), 8 * GIB);
+        i.usb_vendor_id = Some("058f");
+        i.usb_product = Some("Mass Storage Device");
+        let c = classify(&i);
+        assert!(!c.card_reader, "{c:?}");
+        assert_eq!(c.kind, DeviceKind::UsbFlash);
+        // ...while an Alcor reader still is.
+        let mut i = usb("Mass-Storage", true, Some(true), 0);
+        i.usb_vendor_id = Some("058f");
+        assert!(classify(&i).card_reader);
     }
 
     #[test]
@@ -718,5 +733,47 @@ mod tests {
         assert!(looks_like_ssd_model(Some("Samsung PSSD T7")));
         assert!(looks_like_hdd_model(Some("Expansion HDD")));
         assert!(!looks_like_hdd_model(None));
+    }
+
+    #[test]
+    fn usb_media_that_lie_about_themselves() {
+        // Modern sticks often clear the removable bit; the name decides.
+        let mut i = usb("Ultra Fit", false, Some(true), 128 * GIB);
+        i.vendor = Some("SanDisk");
+        assert_eq!(classify(&i).kind, DeviceKind::UsbFlash);
+        // A Realtek NVMe enclosure (Realtek also makes card readers):
+        // non-removable and B1 says non-rotating -> USB SSD, no reader.
+        let mut i = usb("RTL9210B-CG", false, Some(false), 1000 * GIB);
+        i.usb_vendor_id = Some("0bda");
+        let c = classify(&i);
+        assert_eq!(c.kind, DeviceKind::UsbSsd);
+        assert!(!c.card_reader);
+        // The same enclosure behind a bridge that hides everything.
+        i.rotational = Some(true);
+        let c = classify(&i);
+        assert_eq!(
+            (c.kind, c.confidence),
+            (DeviceKind::UsbHdd, Confidence::Low)
+        );
+        // An old small disk in an enclosure that sets the removable bit is
+        // taken for flash (documented limit; the class can be overridden).
+        let i = usb("ST9320325AS", true, Some(true), 298 * GIB);
+        assert_eq!(classify(&i).kind, DeviceKind::UsbFlash);
+        // A large removable device is flash with low confidence.
+        let i = usb("Thing", true, Some(true), 2000 * GIB);
+        assert_eq!(classify(&i).confidence, Confidence::Low);
+        // VPD B1 says 7200 rpm even though the device claims removable.
+        let mut i = usb("Thing", true, Some(true), 2000 * GIB);
+        i.vpd_b1 = Some(VpdB1 {
+            rotation: Some(Rotation::Rpm(7200)),
+            product_type: 0,
+            form_factor: 2,
+            zoned: 0,
+        });
+        assert_eq!(classify(&i).kind, DeviceKind::UsbHdd);
+        // SMART rotation rate 0 on a non-removable bridge -> SSD.
+        let mut i = usb("Thing", false, Some(true), 500 * GIB);
+        i.smart_rotation_rate = Some(0);
+        assert_eq!(classify(&i).kind, DeviceKind::UsbSsd);
     }
 }

@@ -97,3 +97,20 @@ output tree (photos/, raw/, videos/, ... by date) + report.json + report.txt
 * Warn (and require `--allow-mounted`) when the source is mounted.
 * Never run filesystem repair tools; never modify the source filesystem.
 * Direct I/O by default on devices so cached data never masks errors.
+* Read errors that say nothing about the medium (permission denied, out of
+  memory) stop the run with progress saved; only real media errors and
+  timeouts mark sectors bad.
+* The release profile keeps `panic = "unwind"`: third-party decoders run
+  under `catch_unwind` so a decoder bug on corrupt data cannot end a run.
+
+## Testing
+
+Every crate has unit tests and integration tests; images are generated at
+test time with the system's own tools (mkfs.vfat, mkfs.exfat, mkntfs and
+ntfs-3g, mkfs.ext4 and debugfs, ffmpeg, Pillow) and checked against them
+(fsck, ntfscat, ntfsundelete, dumpe2fs, ffprobe). `diskrescue-fixtures`
+builds complete scenarios with a ground-truth manifest (BLAKE3 of every
+file), and `crates/diskrescue-recover/tests` runs the whole pipeline on them:
+camera cards, phone cards, NTFS and ext4 disks, wiped filesystems,
+destroyed boot sectors, bad sectors, damaged media, and a simulated dying pen
+drive imaged and recovered end to end.

@@ -342,11 +342,12 @@ impl MapFile {
             one_line(tool_name),
             one_line(version)
         );
-        if let Some(c) = cmdline.or(self.command_line.as_deref()) {
-            if !c.trim().is_empty() {
-                let _ = writeln!(s, "# Command line: {}", one_line(c));
-            }
-        }
+        // ddrescue writes this line unconditionally (empty when unknown).
+        let _ = writeln!(
+            s,
+            "# Command line: {}",
+            one_line(cmdline.or(self.command_line.as_deref()).unwrap_or(""))
+        );
         let _ = writeln!(
             s,
             "# Start time:   {}",

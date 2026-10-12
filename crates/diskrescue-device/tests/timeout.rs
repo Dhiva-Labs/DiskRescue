@@ -133,6 +133,84 @@ fn concurrent_reads_are_not_blocked_by_a_hung_one() {
     );
 }
 
+/// A source that never answers in time, fails with a given kind, or lies
+/// about how much it read.
+struct Hostile {
+    mode: u8,
+}
+
+impl Source for Hostile {
+    fn size(&self) -> u64 {
+        1 << 20
+    }
+
+    fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize, ReadError> {
+        match self.mode {
+            0 => {
+                thread::sleep(Duration::from_secs(3));
+                Ok(0)
+            }
+            1 => Err(ReadError::new(
+                offset,
+                buf.len(),
+                ReadErrorKind::DeviceGone,
+                "gone",
+            )),
+            2 => Err(ReadError::new(
+                offset,
+                buf.len(),
+                ReadErrorKind::Timeout,
+                "slow",
+            )),
+            // Claims more bytes than the buffer holds.
+            _ => {
+                buf.fill(7);
+                Ok(buf.len() * 4 + 1)
+            }
+        }
+    }
+
+    fn describe(&self) -> String {
+        "hostile".into()
+    }
+}
+
+#[test]
+fn hung_reads_are_bounded_and_errors_pass_through() {
+    // Every read hangs: at most the hung limit of threads pile up, then
+    // reads fail at once without spawning more.
+    let src = TimeoutSource::new(Hostile { mode: 0 }, Duration::from_millis(5));
+    let mut buf = vec![0u8; 512];
+    for i in 0..60u64 {
+        let e = src.read_at(i * 512, &mut buf).unwrap_err();
+        assert_eq!(e.kind, ReadErrorKind::Timeout);
+    }
+    assert!(src.hung_workers() <= 32, "{}", src.hung_workers());
+    assert!(src.abandoned_workers() <= 32, "{}", src.abandoned_workers());
+    let t = Instant::now();
+    let e = src.read_at(0, &mut buf).unwrap_err();
+    assert!(e.detail.contains("still hung"), "{}", e.detail);
+    assert!(t.elapsed() < Duration::from_millis(50));
+
+    for (mode, kind) in [(1, ReadErrorKind::DeviceGone), (2, ReadErrorKind::Timeout)] {
+        let src = TimeoutSource::new(Hostile { mode }, Duration::from_secs(5));
+        let e = src.read_at(4096, &mut buf).unwrap_err();
+        assert_eq!((e.kind, e.offset), (kind, 4096));
+        assert_eq!(src.abandoned_workers(), 0);
+    }
+    // A lying source cannot make the wrapper report or copy more than the
+    // caller's buffer.
+    let src = TimeoutSource::new(Hostile { mode: 3 }, Duration::from_secs(5));
+    let mut small = vec![0u8; 100];
+    assert_eq!(src.read_at(0, &mut small).unwrap(), 100);
+    assert!(small.iter().all(|&b| b == 7));
+    // An unbounded wait is allowed.
+    assert_eq!(
+        src.read_at_timeout(0, &mut small, Duration::MAX).unwrap(),
+        100
+    );
+}
+
 #[test]
 fn errors_and_metadata_pass_through() {
     let mut bad = RangeSet::new();

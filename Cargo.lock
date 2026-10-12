@@ -413,17 +413,21 @@ dependencies = [
  "ctrlc",
  "diskrescue-core",
  "diskrescue-device",
+ "diskrescue-fixtures",
  "diskrescue-imaging",
  "diskrescue-partition",
  "diskrescue-recover",
  "env_logger",
  "indicatif",
+ "libc",
  "log",
+ "rand",
  "ratatui",
  "serde",
  "serde_json",
  "tempfile",
  "thiserror",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -433,6 +437,12 @@ dependencies = [
  "aho-corasick",
  "blake3",
  "diskrescue-core",
+ "diskrescue-fixtures",
+ "diskrescue-isobmff",
+ "diskrescue-jpeg",
+ "diskrescue-png",
+ "diskrescue-stills",
+ "diskrescue-video",
  "log",
  "memchr",
  "rayon",
@@ -485,6 +495,7 @@ name = "diskrescue-fat"
 version = "0.1.0"
 dependencies = [
  "diskrescue-core",
+ "diskrescue-fixtures",
  "log",
  "serde",
  "serde_json",

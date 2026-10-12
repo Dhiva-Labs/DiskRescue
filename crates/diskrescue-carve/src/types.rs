@@ -22,6 +22,14 @@ pub const DEFAULT_ALIGNMENT: u64 = 512;
 /// Smallest accepted `chunk_size`.
 pub const MIN_CHUNK_SIZE: usize = 4096;
 
+/// Largest `chunk_size` used; larger values are clamped to it (two chunk
+/// buffers are resident during a scan).
+pub const MAX_CHUNK_SIZE: usize = 1 << 30;
+
+/// Largest `probe_window` used; larger values are clamped to it (the window
+/// is also the overlap read with every chunk).
+pub const MAX_PROBE_WINDOW: usize = 16 << 20;
+
 /// Size of the blocks the zero-skip optimisation tests for "all zero".
 pub const ZERO_BLOCK: usize = 4096;
 
@@ -37,8 +45,14 @@ pub const PENALTY_ALLOCATED: u8 = 20;
 pub const PENALTY_OFF_CLUSTER: u8 = 20;
 
 /// Confidence points removed from a complete file that the resolver had to
-/// cut short because a much stronger file starts inside it.
+/// cut short because a much stronger file starts inside it, or a confident
+/// file starts inside it and runs past its end.
 pub const PENALTY_SPLIT: u8 = 30;
+
+/// Confidence points removed from a complete file whose extent holds a
+/// confident file of a format it cannot contain (reported separately as a
+/// child with `parent` set): its length field probably overran its real end.
+pub const PENALTY_CONFLICT: u8 = 20;
 
 /// Which part of the source the carver scans for file headers.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -65,23 +79,30 @@ pub struct CarveOptions {
     pub mode: CarveMode,
     /// Candidate file starts must be multiples of this (absolute source
     /// offsets). Default 512; 1 disables the filter ("deep" scan); 0 is
-    /// treated as 1.
+    /// treated as 1. Weak signatures (fewer than three fixed bytes: MPEG-TS,
+    /// M2TS, bare MP3 frames, BMP) are only accepted at multiples of 512 as
+    /// well, even in a deep scan (carving spec 3.1).
     pub alignment: u64,
     /// `(data_start, cluster_size)` of the filesystem, when known. Headers at
     /// `data_start + k * cluster_size` are preferred; others lose
     /// [`PENALTY_OFF_CLUSTER`] confidence points and are not `aligned`.
     pub cluster: Option<(u64, u64)>,
     /// Bytes read per scanner step. Default 64 MiB; at least
-    /// [`MIN_CHUNK_SIZE`].
+    /// [`MIN_CHUNK_SIZE`]; values above [`MAX_CHUNK_SIZE`] are clamped.
     pub chunk_size: usize,
     /// Bytes handed to `FileFormat::probe` (default 64 KiB). Raised
-    /// automatically to the longest signature probe length.
+    /// automatically to the longest signature probe length; values above
+    /// [`MAX_PROBE_WINDOW`] are clamped.
     pub probe_window: usize,
     /// Threads measuring candidates in parallel. 0 means
     /// `std::thread::available_parallelism()`.
     pub workers: usize,
-    /// Results whose final confidence is below this are dropped
-    /// (default [`Confidence::LOW`]).
+    /// Measurements whose confidence, as the format reports it, is below
+    /// this are rejected (default [`Confidence::LOW`]). The carver's own
+    /// adjustments (unreadable bytes, allocated space, off-grid header,
+    /// splits, conflicts) lower the reported [`CarvedFile::confidence`],
+    /// possibly below this value, but never drop a file the format accepted:
+    /// a damaged file is still a file.
     pub min_confidence: Confidence,
     /// Global size cap; overrides a format's `max_size` when smaller.
     pub max_file_size: Option<u64>,

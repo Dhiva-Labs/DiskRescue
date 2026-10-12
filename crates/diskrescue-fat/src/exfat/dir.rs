@@ -113,8 +113,11 @@ fn parse_set(d: &DirData, i: usize, n: usize, upcase: Option<&[u16]>, past_end: 
     let e0 = &bytes[i * 32..i * 32 + 32];
     let in_use = e0[0] & 0x80 != 0;
     let bit = if in_use { 0x80u8 } else { 0 };
+    // A File set holds one stream extension, 1..17 name entries and any
+    // number of benign secondaries (vendor extensions): SecondaryCount
+    // ranges over 2..=255.
     let sc = e0[1] as usize;
-    if !(2..=18).contains(&sc) {
+    if sc < 2 {
         return SetParse::Skip(format!("SecondaryCount {sc} out of range"));
     }
     if i + 1 + sc > n {
@@ -215,7 +218,7 @@ pub(crate) fn sniff_dir(head: &[u8]) -> bool {
             continue;
         }
         let sc = e[1] as usize;
-        if !(2..=18).contains(&sc) || i + 1 + sc > n {
+        if sc < 2 || i + 1 + sc > n {
             continue;
         }
         let bit = e[0] & 0x80;
@@ -380,6 +383,24 @@ pub(crate) mod tests {
         head.resize(512, 0);
         assert!(sniff_dir(&head));
         assert!(!sniff_dir(&[0u8; 512]));
+    }
+
+    #[test]
+    fn vendor_secondaries_beyond_eighteen_are_accepted() {
+        // 255-character name (17 name entries) plus a vendor extension
+        // entry: SecondaryCount 19.
+        let name: String = std::iter::repeat_n('v', 255).collect();
+        let mut b = make_set(&name, 0x20, 3, 9, 1, 1);
+        b[1] = 19;
+        let mut vendor = [0u8; 32];
+        vendor[0] = 0xE0;
+        b.extend_from_slice(&vendor);
+        let cs = exfat_set_checksum(&b);
+        b[2..4].copy_from_slice(&cs.to_le_bytes());
+        let p = parse_dir(&dir(b), None);
+        assert_eq!(p.items.len(), 1, "{:?}", p.notes);
+        assert_eq!(p.items[0].name, name);
+        assert!(p.items[0].notes.is_empty(), "{:?}", p.items[0].notes);
     }
 
     #[test]

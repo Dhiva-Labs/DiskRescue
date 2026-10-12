@@ -15,18 +15,18 @@ use crate::runs::encode_runs;
 use crate::walk::{flags, split_id, MAX_DEPTH};
 use crate::{open, NtfsFs, NtfsOptions};
 
-const CLUSTER: u64 = 4096;
-const RS: u64 = 1024;
-const MFT_LCN: u64 = 4;
+pub(crate) const CLUSTER: u64 = 4096;
+pub(crate) const RS: u64 = 1024;
+pub(crate) const MFT_LCN: u64 = 4;
 
-struct Img {
-    bytes: Vec<u8>,
-    used: Vec<bool>,
+pub(crate) struct Img {
+    pub(crate) bytes: Vec<u8>,
+    pub(crate) used: Vec<bool>,
     mft_records: u64,
     next_lcn: u64,
 }
 
-fn si() -> Vec<u8> {
+pub(crate) fn si() -> Vec<u8> {
     let mut v = vec![0u8; 48];
     let t = 133_000_000_000_000_000u64;
     for i in 0..4 {
@@ -36,7 +36,7 @@ fn si() -> Vec<u8> {
     v
 }
 
-fn index_root_empty() -> Vec<u8> {
+pub(crate) fn index_root_empty() -> Vec<u8> {
     let mut v = vec![0u8; 0x20];
     v[0..4].copy_from_slice(&0x30u32.to_le_bytes());
     v[4..8].copy_from_slice(&1u32.to_le_bytes());
@@ -52,7 +52,7 @@ fn index_root_empty() -> Vec<u8> {
     v
 }
 
-fn fname(parent: u64, pseq: u16, name: &str, ns: u8, dir: bool) -> Vec<u8> {
+pub(crate) fn fname(parent: u64, pseq: u16, name: &str, ns: u8, dir: bool) -> Vec<u8> {
     build_file_name(
         parent | ((pseq as u64) << 48),
         name,
@@ -63,7 +63,7 @@ fn fname(parent: u64, pseq: u16, name: &str, ns: u8, dir: bool) -> Vec<u8> {
 }
 
 impl Img {
-    fn new(clusters: u64, mft_records: u64) -> Img {
+    pub(crate) fn new(clusters: u64, mft_records: u64) -> Img {
         let mut bytes = vec![0u8; (clusters * CLUSTER) as usize + 512];
         let mut boot = sample_boot_sector();
         let sectors = clusters * 8;
@@ -152,20 +152,20 @@ impl Img {
         img
     }
 
-    fn mark(&mut self, lcn: u64, count: u64) {
+    pub(crate) fn mark(&mut self, lcn: u64, count: u64) {
         for c in lcn..lcn + count {
             self.used[c as usize] = true;
         }
     }
 
-    fn put(&mut self, n: u64, raw: Vec<u8>) {
+    pub(crate) fn put(&mut self, n: u64, raw: Vec<u8>) {
         assert!(n < self.mft_records);
         let off = (MFT_LCN * CLUSTER + n * RS) as usize;
         self.bytes[off..off + raw.len()].copy_from_slice(&raw);
     }
 
     /// Store `data` in fresh clusters; returns the first LCN.
-    fn store(&mut self, data: &[u8], allocated: bool) -> u64 {
+    pub(crate) fn store(&mut self, data: &[u8], allocated: bool) -> u64 {
         let lcn = self.next_lcn;
         let n = (data.len() as u64).div_ceil(CLUSTER).max(1);
         let off = (lcn * CLUSTER) as usize;
@@ -177,7 +177,15 @@ impl Img {
         lcn
     }
 
-    fn file(&mut self, n: u64, seq: u16, flags: u16, parent: u64, name: &str, extra: Vec<Vec<u8>>) {
+    pub(crate) fn file(
+        &mut self,
+        n: u64,
+        seq: u16,
+        flags: u16,
+        parent: u64,
+        name: &str,
+        extra: Vec<Vec<u8>>,
+    ) {
         let mut attrs = vec![
             resident(types::STANDARD_INFORMATION, "", &si(), 0),
             resident(
@@ -197,7 +205,7 @@ impl Img {
         self.put(n, build_record(n as u32, seq, flags, &attrs));
     }
 
-    fn finish(mut self) -> Vec<u8> {
+    pub(crate) fn finish(mut self) -> Vec<u8> {
         let mut bm = vec![0u8; self.used.len().div_ceil(8)];
         for (i, u) in self.used.iter().enumerate() {
             if *u {
@@ -212,7 +220,7 @@ impl Img {
     }
 }
 
-fn nr_data(name: &str, lcn: u64, len: u64, size: u64) -> Vec<u8> {
+pub(crate) fn nr_data(name: &str, lcn: u64, len: u64, size: u64) -> Vec<u8> {
     let clusters = len;
     non_resident(
         types::DATA,
@@ -227,17 +235,20 @@ fn nr_data(name: &str, lcn: u64, len: u64, size: u64) -> Vec<u8> {
     )
 }
 
-fn open_bytes(bytes: Vec<u8>) -> NtfsFs {
+pub(crate) fn open_bytes(bytes: Vec<u8>) -> NtfsFs {
     open(Arc::new(MemSource::new(bytes)), &NtfsOptions::default()).unwrap()
 }
 
-fn read_all(fs: &NtfsFs, e: &FileEntry) -> (Vec<u8>, diskrescue_core::fs::FileReadReport) {
+pub(crate) fn read_all(
+    fs: &NtfsFs,
+    e: &FileEntry,
+) -> (Vec<u8>, diskrescue_core::fs::FileReadReport) {
     let mut v = Vec::new();
     let r = fs.read_file(e, &mut v).unwrap();
     (v, r)
 }
 
-fn get<'a>(all: &'a [FileEntry], path: &str) -> &'a FileEntry {
+pub(crate) fn get<'a>(all: &'a [FileEntry], path: &str) -> &'a FileEntry {
     all.iter().find(|e| e.path == path).unwrap_or_else(|| {
         panic!(
             "{path} missing: {:?}",
@@ -246,7 +257,7 @@ fn get<'a>(all: &'a [FileEntry], path: &str) -> &'a FileEntry {
     })
 }
 
-fn pattern(seed: u8, len: usize) -> Vec<u8> {
+pub(crate) fn pattern(seed: u8, len: usize) -> Vec<u8> {
     (0..len)
         .map(|i| (i as u8).wrapping_mul(31).wrapping_add(seed))
         .collect()

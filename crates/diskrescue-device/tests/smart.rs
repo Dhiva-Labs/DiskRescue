@@ -108,3 +108,62 @@ fn query_never_fails_hard() {
     // just yield None.
     assert!(query(Path::new("/dev/does-not-exist-diskrescue")).is_none());
 }
+
+/// Fake `smartctl` executables (shell scripts): output, retry with
+/// `-d sat`, hangs and helpers that keep the output pipe open must never
+/// make the query hang or fail hard.
+#[cfg(unix)]
+#[test]
+fn fake_smartctl_runs_are_bounded() {
+    use std::os::unix::fs::PermissionsExt;
+    use std::time::{Duration, Instant};
+
+    use diskrescue_device::smart::query_with_binary;
+
+    if !Path::new("/bin/sh").exists() {
+        eprintln!("skipped: /bin/sh missing");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let json = dir.path().join("ata.json");
+    std::fs::write(&json, fixture("ata_hdd.json")).unwrap();
+    let script = |name: &str, body: String| {
+        let p = dir.path().join(name);
+        std::fs::write(&p, format!("#!/bin/sh\n{body}\n")).unwrap();
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+        p
+    };
+    let ok = script("ok", format!("cat '{}'", json.display()));
+    // First run: "device open failed" (exit bit 1); with -d sat: the data.
+    let sat = script(
+        "sat",
+        format!(
+            "case \"$*\" in *'-d sat'*) cat '{}';; *) echo '{{\"smartctl\":{{\"exit_status\":2}}}}';; esac",
+            json.display()
+        ),
+    );
+    let hang = script("hang", "exec sleep 30".into());
+    // Prints valid output, then leaves a helper holding stdout open.
+    let leak = script(
+        "leak",
+        format!("cat '{}'; (sleep 30 &) ; exit 0", json.display()),
+    );
+    let garbage = script("garbage", "head -c 100000 /dev/urandom; exit 3".into());
+    let dev = Path::new("/dev/does-not-exist-diskrescue");
+
+    let h = query_with_binary(&ok, dev, Duration::from_secs(20)).unwrap();
+    assert_eq!(h.reallocated_sectors, Some(412));
+    let h = query_with_binary(&sat, dev, Duration::from_secs(20)).unwrap();
+    assert_eq!(h.pending_sectors, Some(36));
+
+    let t = Instant::now();
+    assert!(query_with_binary(&hang, dev, Duration::from_millis(500)).is_none());
+    assert!(t.elapsed() < Duration::from_secs(5), "{:?}", t.elapsed());
+
+    let t = Instant::now();
+    let _ = query_with_binary(&leak, dev, Duration::from_secs(10));
+    assert!(t.elapsed() < Duration::from_secs(8), "{:?}", t.elapsed());
+
+    assert!(query_with_binary(&garbage, dev, Duration::from_secs(10)).is_none());
+    assert!(query_with_binary(&dir.path().join("missing"), dev, Duration::from_secs(1)).is_none());
+}

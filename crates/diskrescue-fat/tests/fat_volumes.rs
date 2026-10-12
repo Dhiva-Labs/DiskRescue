@@ -402,7 +402,7 @@ fn backup_boot_sector_is_used() {
 }
 
 #[test]
-fn fat16_without_boot_sector_fails_cleanly() {
+fn fat16_without_boot_sector_is_reconstructed() {
     let tmp = tempfile::tempdir().unwrap();
     let Some(b) = build(tmp.path(), 16, 32 * MIB) else {
         return;
@@ -410,7 +410,26 @@ fn fat16_without_boot_sector_fails_cleanly() {
     let mut bytes = std::fs::read(&b.img).unwrap();
     bytes[..512].fill(0);
     let src: SharedSource = Arc::new(MemSource::new(bytes));
-    assert!(open(src, &FatOptions::default()).is_err());
+    // Without the fallbacks the volume cannot be opened, and fails cleanly.
+    let strict = FatOptions {
+        use_backup_boot_sector: false,
+        ..FatOptions::default()
+    };
+    assert!(open(src.clone(), &strict).is_err());
+    // With them (the default) the geometry is rebuilt from the FATs and
+    // directories, and every live file reads back exactly.
+    let fs = open(src, &FatOptions::default()).unwrap();
+    assert_eq!(fs.info().kind, FsKind::Fat16);
+    assert!(fs
+        .info()
+        .warnings
+        .iter()
+        .any(|w| w.contains("reconstructed")));
+    let all = entries(&*fs);
+    for (path, data) in &b.live {
+        let e = by_path(&all, path);
+        assert_eq!(&read(&*fs, e).0, data, "{path}");
+    }
 }
 
 #[test]

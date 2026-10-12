@@ -4,3 +4,4 @@
 /fixtures/generated/
 /out/
 /*.map
+/.claude/

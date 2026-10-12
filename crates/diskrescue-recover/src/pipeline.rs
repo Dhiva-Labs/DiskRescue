@@ -283,6 +283,27 @@ pub fn discover(
 
     let mut records = Vec::new();
     let mut parsed = Vec::new();
+    // NTFS volumes whose boot sectors are destroyed: search for the MFT
+    // inside partitions the table marks as NTFS but where no filesystem was
+    // recognised, and over the whole source when nothing is readable at all.
+    let mut ntfs_search: Vec<Range> = vols
+        .iter()
+        .filter(|v| v.probe.is_none() && is_ntfs_partition_type(&v.entry.type_id))
+        .map(|v| Range::with_len(v.entry.start, v.entry.size))
+        .collect();
+    if vols.iter().all(|v| v.probe.is_none()) && scan_lost {
+        ntfs_search = vec![Range::new(0, src.size())];
+    }
+    let mut found_ntfs = Vec::new();
+    for range in ntfs_search {
+        if cancel.load(Ordering::Relaxed) {
+            break;
+        }
+        match diskrescue_ntfs::discover::find_volumes(src, range) {
+            Ok(found) => found_ntfs.extend(found),
+            Err(e) => warnings.push(format!("search for NTFS file tables failed: {e}")),
+        }
+    }
     for (i, vol) in vols.into_iter().enumerate() {
         let index = i as u32 + 1;
         let kind = vol.probe.as_ref().map(|p| p.kind).or(vol.entry.fs);
@@ -295,11 +316,12 @@ pub fn discover(
             origin: vol.entry.origin.clone(),
             files_listed: 0,
             deleted_listed: 0,
-            warnings: vol
-                .probe
-                .as_ref()
-                .map(|p| p.notes.clone())
-                .unwrap_or_default(),
+            warnings: match &vol.probe {
+                Some(p) if p.via_backup => {
+                    vec!["found through the backup boot sector (the primary one is damaged)".into()]
+                }
+                _ => Vec::new(),
+            },
             error: None,
         };
         match kind {
@@ -333,7 +355,123 @@ pub fn discover(
                 rec.error =
                     Some("filesystem recognised but not supported; its space will be carved".into())
             }
+            None if crate::fsopen::is_fat_partition_type(&vol.entry.type_id) => {
+                // The table says FAT/exFAT but no boot sector was recognised:
+                // try rebuilding it from the FAT copies and directories.
+                match crate::fsopen::open_fat_rebuilding(vol.source.clone()) {
+                    Ok(fs) => {
+                        let info = fs.info();
+                        rec.fs = Some(info.kind);
+                        rec.label = info.label.clone();
+                        rec.warnings.push(
+                            "boot sector missing; rebuilt from the file allocation tables".into(),
+                        );
+                        rec.warnings.extend(info.warnings.iter().cloned());
+                        let dir =
+                            OutputTree::volume_dir(index, Some(info.kind), rec.label.as_deref());
+                        parsed.push(ParsedVolume {
+                            index,
+                            start: vol.entry.start,
+                            size: vol.entry.size,
+                            dir,
+                            fs,
+                        });
+                    }
+                    Err(_) => {
+                        rec.error =
+                            Some("no filesystem recognised; its space will be carved".into())
+                    }
+                }
+            }
             None => rec.error = Some("no filesystem recognised; its space will be carved".into()),
+        }
+        obs.event(Event::Volume(rec.clone()));
+        records.push(rec);
+    }
+    // A card or stick without a partition table whose boot sector is
+    // destroyed: try a FAT rebuild over the whole source.
+    if parsed.is_empty() && found_ntfs.is_empty() && scan_lost && !cancel.load(Ordering::Relaxed) {
+        if let Ok(fs) = crate::fsopen::open_fat_rebuilding(src.clone()) {
+            let info = fs.info();
+            let index = records.len() as u32 + 1;
+            let size = info.total_size.min(src.size());
+            let mut rec = VolumeRecord {
+                index,
+                start: 0,
+                size,
+                fs: Some(info.kind),
+                label: info.label.clone(),
+                origin: "fat-rebuild".into(),
+                files_listed: 0,
+                deleted_listed: 0,
+                warnings: vec![
+                    "boot sector missing; rebuilt from the file allocation tables".into(),
+                ],
+                error: None,
+            };
+            rec.warnings.extend(info.warnings.iter().cloned());
+            let dir = OutputTree::volume_dir(index, Some(info.kind), rec.label.as_deref());
+            obs.event(Event::Volume(rec.clone()));
+            records.push(rec);
+            parsed.push(ParsedVolume {
+                index,
+                start: 0,
+                size,
+                dir,
+                fs,
+            });
+        }
+    }
+    for found in found_ntfs {
+        let range = Range::with_len(
+            found.start,
+            found.size.min(src.size().saturating_sub(found.start)),
+        );
+        let overlaps = parsed
+            .iter()
+            .any(|p: &ParsedVolume| Range::with_len(p.start, p.size).overlaps(range));
+        if overlaps {
+            continue;
+        }
+        let index = records.len() as u32 + 1;
+        let mut rec = VolumeRecord {
+            index,
+            start: range.start,
+            size: range.len(),
+            fs: Some(FsKind::Ntfs),
+            label: None,
+            origin: "mft-scan".into(),
+            files_listed: 0,
+            deleted_listed: 0,
+            warnings: vec![format!(
+                "boot sector missing; volume rebuilt from its file table ({})",
+                found.evidence.join("; ")
+            )],
+            error: None,
+        };
+        obs.event(Event::Stage(Stage::Listing {
+            volume: index,
+            fs: FsKind::Ntfs,
+        }));
+        match diskrescue_ntfs::open_found(
+            src.clone(),
+            &found,
+            &diskrescue_ntfs::NtfsOptions::default(),
+        ) {
+            Ok(fs) => {
+                let info = fs.info();
+                rec.label = info.label.clone();
+                rec.warnings.extend(info.warnings.iter().cloned());
+                let dir = OutputTree::volume_dir(index, Some(FsKind::Ntfs), rec.label.as_deref());
+                parsed.push(ParsedVolume {
+                    index,
+                    start: range.start,
+                    size: range.len(),
+                    dir,
+                    fs: Box::new(fs),
+                });
+            }
+            Err(e) => rec.error = Some(e.to_string()),
         }
         obs.event(Event::Volume(rec.clone()));
         records.push(rec);
@@ -344,6 +482,14 @@ pub fn discover(
         parsed,
         warnings,
     }
+}
+
+/// MBR types and GPT type GUIDs that hold NTFS volumes.
+fn is_ntfs_partition_type(type_id: &str) -> bool {
+    let t = type_id.trim().to_ascii_uppercase();
+    matches!(t.as_str(), "0X07" | "0X17" | "0X27")
+        || t == "EBD0A0A2-B9E5-4433-87C0-68B6B72699C7"
+        || t == "DE94BBA4-06D1-4D40-A16A-BFD50179D6AC"
 }
 
 /// A filesystem entry chosen for extraction.
@@ -357,6 +503,44 @@ pub struct Candidate {
     pub category: MediaCategory,
     /// Format id when sniffed.
     pub format: Option<String>,
+    /// For deleted FAT entries whose first letter was lost: the name with
+    /// the letter restored from neighbouring files (used for the output
+    /// name only; the entry itself is read unchanged).
+    pub restored_name: Option<String>,
+}
+
+/// Restore the first letter of a deleted FAT short name (`_MG_0004.JPG`)
+/// from live files in the same folder (`IMG_0003.JPG`, `IMG_0005.JPG`).
+/// Only when the neighbours agree clearly; otherwise `None`.
+pub fn restore_first_letter(name: &str, siblings: &[String]) -> Option<String> {
+    let rest = name.strip_prefix('_')?;
+    if rest.is_empty() {
+        return None;
+    }
+    let ext = |n: &str| n.rsplit_once('.').map(|(_, e)| e.to_ascii_lowercase());
+    let k = rest
+        .char_indices()
+        .nth(3)
+        .map(|(i, _)| i)
+        .unwrap_or(rest.len());
+    let mut counts: std::collections::BTreeMap<char, usize> = std::collections::BTreeMap::new();
+    for sib in siblings {
+        let mut chars = sib.chars();
+        let Some(first) = chars.next() else { continue };
+        let srest = chars.as_str();
+        if srest.len() != rest.len() || !srest.is_char_boundary(k) || ext(srest) != ext(rest) {
+            continue;
+        }
+        if srest[..k].eq_ignore_ascii_case(&rest[..k]) {
+            *counts.entry(first).or_default() += 1;
+        }
+    }
+    let total: usize = counts.values().sum();
+    let (&best, &n) = counts.iter().max_by_key(|(_, n)| **n)?;
+    if best == '_' || n * 3 < total * 2 {
+        return None;
+    }
+    Some(format!("{best}{rest}"))
 }
 
 /// Walk every parsed volume and pick entries the selection wants.
@@ -371,6 +555,10 @@ pub fn select_entries(
 ) -> Vec<Candidate> {
     let mut picked = Vec::new();
     let mut to_sniff: Vec<(usize, FileEntry)> = Vec::new();
+    // Live file names per folder, to restore lost first letters of deleted
+    // FAT short names.
+    let mut live_names: std::collections::HashMap<(usize, Option<u64>), Vec<String>> =
+        std::collections::HashMap::new();
     for (vi, pv) in parsed.iter().enumerate() {
         let mut listed = 0u64;
         let mut deleted = 0u64;
@@ -384,6 +572,11 @@ pub fn select_entries(
             listed += 1;
             if e.deleted {
                 deleted += 1;
+            } else {
+                live_names
+                    .entry((vi, e.parent_id))
+                    .or_default()
+                    .push(e.name.clone());
             }
             if !sel.wants_entry_state(e) || !sel.wants_size(e.size) {
                 return WalkControl::Continue;
@@ -394,6 +587,7 @@ pub fn select_entries(
                     entry: e.clone(),
                     category: cat,
                     format: None,
+                    restored_name: None,
                 }),
                 Some(_) => {}
                 None if sel.wants_everything() => picked.push(Candidate {
@@ -401,6 +595,7 @@ pub fn select_entries(
                     entry: e.clone(),
                     category: MediaCategory::Other,
                     format: None,
+                    restored_name: None,
                 }),
                 None if sel.sniff_unknown && e.size >= 16 => to_sniff.push((vi, e.clone())),
                 None => {}
@@ -449,10 +644,20 @@ pub fn select_entries(
                 category: fmt.category(),
                 format: Some(fmt.id().to_string()),
                 entry,
+                restored_name: None,
             })
         })
         .collect();
     picked.extend(sniffed);
+    for c in &mut picked {
+        let lost_first =
+            c.entry.deleted && c.entry.flags.iter().any(|f| f == "first character lost");
+        if lost_first {
+            if let Some(sibs) = live_names.get(&(c.volume, c.entry.parent_id)) {
+                c.restored_name = restore_first_letter(&c.entry.name, sibs);
+            }
+        }
+    }
     picked
 }
 
@@ -632,7 +837,21 @@ fn extract_fs_entry(ctx: &Ctx<'_>, pv: &ParsedVolume, c: &Candidate) -> FileReco
         e.size,
     );
     rec.format = c.format.clone();
-    let rel = OutputTree::fs_relative(&pv.dir, e);
+    let rel = match &c.restored_name {
+        Some(name) => {
+            let mut shown = e.clone();
+            shown.path = match e.path.rsplit_once('/') {
+                Some((dir, _)) => format!("{dir}/{name}"),
+                None => name.clone(),
+            };
+            shown.name = name.clone();
+            rec.notes.push(format!(
+                "the first letter of this deleted file's name was lost; restored as \"{name}\" from the other files in its folder"
+            ));
+            OutputTree::fs_relative(&pv.dir, &shown)
+        }
+        None => OutputTree::fs_relative(&pv.dir, e),
+    };
     let (file, rel) = match ctx.tree.create_new(&rel) {
         Ok(x) => x,
         Err(err) => {
@@ -689,6 +908,13 @@ fn extract_fs_entry(ctx: &Ctx<'_>, pv: &ParsedVolume, c: &Candidate) -> FileReco
                 rec.output = None;
             }
         }
+    }
+    if e.flags.iter().any(|f| f.starts_with("valid_data_length=")) {
+        rec.notes.push(
+            "the file's recorded valid length is shorter than its size (typical when a camera lost power while \
+             recording); the rest was read as found on the card"
+                .into(),
+        );
     }
     if e.confidence == EntryConfidence::DeletedGuessed {
         rec.notes
@@ -1445,6 +1671,43 @@ pub fn survey(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn first_letter_restoration() {
+        let sibs: Vec<String> = [
+            "IMG_0001.JPG",
+            "IMG_0002.JPG",
+            "IMG_0003.JPG",
+            "MVI_0004.MOV",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        assert_eq!(
+            restore_first_letter("_MG_0009.JPG", &sibs).as_deref(),
+            Some("IMG_0009.JPG")
+        );
+        assert_eq!(
+            restore_first_letter("_VI_0010.MOV", &sibs).as_deref(),
+            Some("MVI_0010.MOV")
+        );
+        // Nothing similar: leave it.
+        assert_eq!(restore_first_letter("_OC_0001.PDF", &sibs), None);
+        // Neighbours use a real underscore (Nikon Adobe RGB names): leave it.
+        let nikon: Vec<String> = ["_DSC1000.JPG", "_DSC1001.JPG"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(restore_first_letter("_DSC1002.JPG", &nikon), None);
+        // Disagreement without a clear majority: leave it.
+        let mixed: Vec<String> = ["IMG_0001.JPG", "XMG_0002.JPG"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(restore_first_letter("_MG_0003.JPG", &mixed), None);
+        assert_eq!(restore_first_letter("NOPREFIX.JPG", &sibs), None);
+        assert_eq!(restore_first_letter("_", &sibs), None);
+    }
 
     #[test]
     fn rank_order() {

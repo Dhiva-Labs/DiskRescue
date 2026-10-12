@@ -134,16 +134,28 @@ pub(crate) fn exfat_name_hash(upcased: &[u16]) -> u16 {
 /// files whose cluster number is incomplete.
 pub(crate) fn looks_like_media(head: &[u8]) -> bool {
     let starts = |p: &[u8]| head.len() >= p.len() && &head[..p.len()] == p;
+    let at = |off: usize, p: &[u8]| head.len() >= off + p.len() && &head[off..off + p.len()] == p;
     starts(&[0xFF, 0xD8, 0xFF])
         || starts(&[0x89, b'P', b'N', b'G'])
         || starts(b"RIFF")
         || starts(b"II*\0")
         || starts(b"MM\0*")
+        || starts(b"IIRO")
+        || starts(b"IIRS")
+        || starts(b"IIU\0")
+        || starts(b"II\x1a\0\0\0HEAPCCDR")
+        || starts(b"FOVb")
         || starts(b"FUJIFILM")
         || starts(b"GIF8")
         || starts(&[0x1A, 0x45, 0xDF, 0xA3])
         || starts(&[0x00, 0x00, 0x01, 0xBA])
-        || (head.len() >= 8 && &head[4..8] == b"ftyp")
+        // ISO BMFF / QuickTime: a top-level box type at offset 4.
+        || [&b"ftyp"[..], b"moov", b"mdat", b"wide", b"free", b"skip", b"pnot"]
+            .iter()
+            .any(|t| at(4, t))
+        // MPEG-TS (188-byte packets) and AVCHD/M2TS (192-byte packets).
+        || (at(0, &[0x47]) && at(188, &[0x47]))
+        || (at(4, &[0x47]) && at(196, &[0x47]))
 }
 
 /// True when a file name has a photo/video extension (used to decide

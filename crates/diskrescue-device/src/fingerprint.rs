@@ -16,7 +16,10 @@
 //!   no serial, a generic serial shared by a whole product line
 //!   (`0123456789ABCDEF`), or the serial vanished. The caller should
 //!   confirm with the first-sector hash before resuming.
-//! * [`Match::Mismatch`]: size, sector size, serial or model differ. A
+//! * [`Match::Mismatch`]: size, sector size, serial or model differ (a
+//!   candidate reporting no model at all while we have one counts as a
+//!   different model: real hardware always names its product, a loop
+//!   device over an image of it does not). A
 //!   device whose serial matches but whose size changed is a controller in
 //!   a failure mode (or a different card in the same reader); resuming on
 //!   it would mix data, so the device layer refuses.
@@ -181,7 +184,11 @@ impl Fingerprint {
         }
         let my_model = norm(&self.model);
         let their_model = norm(&info.model);
-        let model_conflict = my_model.is_some() && their_model.is_some() && my_model != their_model;
+        // A candidate without any model string while we have one is not a
+        // reset of the same hardware (INQUIRY/CID always name the product)
+        // but typically a loop device over an image of it, which has the
+        // same size and first sector.
+        let model_conflict = my_model.is_some() && my_model != their_model;
 
         if let Some(mine) = &my_serial {
             match &their_serial {
@@ -225,11 +232,16 @@ impl Fingerprint {
             return Match::Mismatch("candidate reports a different serial number".into());
         }
         if model_conflict {
-            return Match::Mismatch(format!(
-                "model differs ({} vs {})",
-                info.model.as_deref().unwrap_or(""),
-                self.model.as_deref().unwrap_or("")
-            ));
+            return Match::Mismatch(match &their_model {
+                Some(_) => format!(
+                    "model differs ({} vs {})",
+                    info.model.as_deref().unwrap_or(""),
+                    self.model.as_deref().unwrap_or("")
+                ),
+                None => {
+                    "the candidate reports no model (a loop device or other virtual device?)".into()
+                }
+            });
         }
         let my_vendor = norm(&self.vendor);
         let their_vendor = norm(&info.vendor);
@@ -355,6 +367,28 @@ mod tests {
             Match::Probable(r) => assert!(r.contains("stable id")),
             m => panic!("{m:?}"),
         }
+    }
+
+    #[test]
+    fn candidates_without_a_model_are_not_our_hardware() {
+        // A loop device over an image of the stick: same size, same first
+        // sector, but no model and no serial.
+        let stick = info(None, Some("USB DISK"), 8 << 30);
+        let fp = Fingerprint::of(&stick, Some(&[1u8; 512]));
+        let mut lo = info(None, None, 8 << 30);
+        lo.vendor = None;
+        lo.name = "loop0".into();
+        assert!(fp.matches(&lo).is_mismatch());
+        // With a unique serial the missing model demotes to probable (so
+        // the first sector must confirm it).
+        let strong = info(Some("4C530001231012345678"), Some("Cruzer Blade"), 1 << 30);
+        let fp = Fingerprint::of(&strong, None);
+        let mut no_model = strong.clone();
+        no_model.model = None;
+        assert!(matches!(fp.matches(&no_model), Match::Probable(_)));
+        // A fingerprint without a model accepts candidates without one.
+        let fp = Fingerprint::of(&lo, None);
+        assert!(matches!(fp.matches(&lo), Match::Probable(_)));
     }
 
     #[test]

@@ -23,7 +23,8 @@
 //! 2. **Trimming** (`trim`): for each non-trimmed block read sector by
 //!    sector forwards from its start until a read fails, then backwards
 //!    from its end until a read fails; failed sectors become bad, the
-//!    untouched middle becomes non-scraped.
+//!    untouched middle becomes non-scraped. As in ddrescue, an edge next
+//!    to a bad sector is not trimmed (it goes to scraping).
 //! 3. **Dividing** (`divide`): read non-scraped (and non-trimmed) areas in
 //!    `max(block_size / 8, 4 KiB)` pieces; failed pieces stay non-scraped.
 //! 4. **Scraping** (`scrape`): read every remaining non-scraped (and
@@ -54,9 +55,18 @@
 //!   No read crosses a boundary between map blocks of different status
 //!   (apart from that sector widening).
 //! * A vanished device (`DeviceGone`, or a read that returns no data before
-//!   the end) never marks anything bad: the mapfile is saved and
-//!   `Source::reopen` is polled until the device is back (or the wait,
-//!   `max_reattaches`, or the user ends it); then the same read is retried.
+//!   the end, also during a verification read) never marks anything bad:
+//!   the mapfile is saved and `Source::reopen` is polled until the device
+//!   is back (or the wait, `max_reattaches`, or the user ends it); then the
+//!   same read is retried. A device that vanishes again right after every
+//!   re-open is re-opened at most `MAX_FLAPS` (5) times in a row without a
+//!   single answered read, `reattach_poll` apart, and the
+//!   `wait_for_reattach` budget spans those flaps; then the run stops
+//!   (resumable) instead of spinning.
+//! * Refused up front: an output image or source file at one of the paths
+//!   kept next to the mapfile (`.tmp`, `.bak`, `.dr.json`,
+//!   `.dr.json.tmp`), a sector size above 1 MiB, and resuming with an
+//!   `output_offset` other than the one the sidecar records.
 //! * `Source` errors only count bytes before the reported failing offset as
 //!   good after reading them again on their own (the trait does not promise
 //!   that a failed read filled the buffer). A short read before the end of
@@ -71,12 +81,20 @@
 //!   nothing. The first good read after an error that no check read
 //!   absorbed, and any all-0x00/0xFF block while errors persist, is only
 //!   accepted after a second read returns the same bytes (or, when it
-//!   differs, after a third read agrees with the second).
+//!   differs, after a third read agrees with the second). The first data
+//!   read of every run and after every re-attach is treated the same way
+//!   (the previous run may have ended right after an error). Profiles
+//!   without `check_on_error` (HDD, SSD, NVMe, generic) trust every
+//!   successful read, like ddrescue without `-J`.
 //!
 //! # Persistence
 //!
 //! The mapfile is saved every `save_interval`, at every phase change, on
-//! cancel, before waiting for a vanished device and at the end. A small
+//! cancel, before waiting for a vanished device and at the end. A failed
+//! save is a warning (the rescue goes on) and is retried within 5 s; if
+//! the final save fails, `run` returns the error and the complete map is
+//! still available through [`Imager::mapfile`] and
+//! [`Imager::save_mapfile_to`]. A small
 //! JSON sidecar `<mapfile>.dr.json` (not read by ddrescue) records the
 //! profile, the domain, counters and warnings.
 //!
@@ -110,6 +128,20 @@ const MAX_WARNINGS: usize = 200;
 /// Read errors logged at `warn` level before switching to `debug`.
 const LOUD_ERRORS: u64 = 20;
 const NO_SKIP: u64 = u64::MAX;
+/// Largest sector size accepted from a source. Real devices use 512,
+/// 2048 or 4096; anything far larger is a bogus answer from a failing
+/// controller and would make every read allocate that much.
+const MAX_SECTOR: u64 = MIB;
+/// Consecutive re-attaches without a single successful read after which a
+/// device that keeps vanishing is given up on (resumable).
+const MAX_FLAPS: u32 = 5;
+/// A failed mapfile save is retried after at most this long.
+const SAVE_RETRY: Duration = Duration::from_secs(5);
+/// Files written next to the mapfile (`.bak` is also deleted and
+/// re-created): none of them may be the output image or the source.
+const MAP_SIDE_SUFFIXES: [&str; 4] = [".tmp", ".bak", ".dr.json", ".dr.json.tmp"];
+/// Largest sidecar read back on resume.
+const MAX_SIDECAR_BYTES: u64 = 16 * MIB;
 
 /// Read sizes and skip distances the engine derived from the profile and
 /// the source.
@@ -143,6 +175,9 @@ pub struct Imager {
     domain: Range,
     whole_domain: bool,
     resumed: bool,
+    /// `run` was called before: the status line is this engine's own and
+    /// a further `run` continues from it.
+    ran: bool,
     setup_warnings: Vec<String>,
 }
 
@@ -268,6 +303,16 @@ struct Ctx<'a> {
     /// read is the one a misbehaving bridge may answer with stale data.
     unverified_error: bool,
     slow_active: bool,
+    /// Re-attaches since the device last answered a read (data or a media
+    /// error). A device that keeps vanishing right after every successful
+    /// re-open is given up on after [`MAX_FLAPS`] of them instead of being
+    /// re-opened forever.
+    flaps: u32,
+    /// When the device was lost without answering a read since; the
+    /// `wait_for_reattach` budget runs from here, across flaps.
+    lost_since: Option<Instant>,
+    /// The last mapfile save failed: retry sooner than `save_interval`.
+    save_failed: bool,
     buf: Vec<u8>,
     check_buf: Vec<u8>,
 }
@@ -306,9 +351,28 @@ impl<'a> Ctx<'a> {
             after_error: false,
             unverified_error: false,
             slow_active: false,
+            flaps: 0,
+            lost_since: None,
+            save_failed: false,
             buf: Vec::new(),
             check_buf: Vec::new(),
         }
+    }
+
+    /// The device just answered a read (data or a media error): it is
+    /// present, so a later loss starts a new re-attach budget.
+    fn device_answered(&mut self) {
+        self.flaps = 0;
+        self.lost_since = None;
+    }
+
+    /// From now on, the next data read must be confirmed before it is
+    /// trusted (with `check_on_error`): it follows an error, a re-attach,
+    /// or the start of a run whose predecessor may have ended right after
+    /// an error.
+    fn distrust_next_read(&mut self) {
+        self.after_error = true;
+        self.unverified_error = true;
     }
 
     fn emit(&mut self, ev: Event) {
@@ -463,6 +527,9 @@ enum Verify {
     Different,
     /// The second read failed: proves nothing about the data.
     Failed,
+    /// The device vanished during the second read: proves nothing either,
+    /// and must go through the re-attach path, not count as a read error.
+    Gone,
 }
 
 /// Outcome of verifying the first read after an error.
@@ -476,6 +543,8 @@ enum Fresh {
     Inconsistent,
     /// A verification read failed.
     Unverified,
+    /// The device vanished during a verification read.
+    Gone,
 }
 
 fn is_uniform(data: &[u8]) -> bool {
@@ -501,7 +570,32 @@ fn same_file(a: &Path, b: &Path) -> bool {
             return ma.dev() == mb.dev() && ma.ino() == mb.ino();
         }
     }
-    false
+    // Paths that do not exist (yet): compare the resolved directory and
+    // the file name, so "./x.map.tmp" and "x.map.tmp" are recognised.
+    let resolved = |p: &Path| {
+        let dir = match p.parent() {
+            Some(d) if !d.as_os_str().is_empty() => d.to_path_buf(),
+            _ => PathBuf::from("."),
+        };
+        Some((fs::canonicalize(dir).ok()?, p.file_name()?.to_os_string()))
+    };
+    match (resolved(a), resolved(b)) {
+        (Some(x), Some(y)) => x == y,
+        _ => false,
+    }
+}
+
+/// The `output_offset` recorded in the sidecar next to `mapfile`, when
+/// there is a readable one.
+pub(crate) fn sidecar_output_offset(mapfile: &Path) -> Option<u64> {
+    let path = mapfile::with_suffix(mapfile, ".dr.json");
+    let meta = fs::metadata(&path).ok()?;
+    if !meta.is_file() || meta.len() > MAX_SIDECAR_BYTES {
+        return None;
+    }
+    let bytes = fs::read(&path).ok()?;
+    let v: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+    v.get("output_offset")?.as_u64()
 }
 
 fn write_all_at(file: &File, data: &[u8], offset: u64) -> std::io::Result<()> {
@@ -606,7 +700,11 @@ impl Imager {
     ///   regular file. Resuming is refused when the output is missing or
     ///   shorter than the rescued data the map records.
     /// * Refused outright: output, mapfile and source paths that refer to
-    ///   the same file; a source of size 0; an empty domain.
+    ///   the same file; an output or source at one of the mapfile's side
+    ///   paths (`<mapfile>.tmp`, `.bak`, `.dr.json`, `.dr.json.tmp`); a
+    ///   source of size 0 or with a sector size of 0 or above 1 MiB; an
+    ///   empty domain; resuming with an `output_offset` that differs from
+    ///   the one recorded in the sidecar `<mapfile>.dr.json`.
     pub fn new(
         source: SharedSource,
         output: &Path,
@@ -626,9 +724,10 @@ impl Imager {
             )));
         }
         let sector = source.sector_size() as u64;
-        if sector == 0 {
+        if sector == 0 || sector > MAX_SECTOR {
             return Err(Error::InvalidArgument(format!(
-                "{} reports a sector size of 0",
+                "{} reports a sector size of {sector} bytes; refusing to image with that \
+                 (expected 512, 2048 or 4096; is the controller failing?)",
                 source.describe()
             )));
         }
@@ -665,6 +764,25 @@ impl Imager {
                 if same_file(sp, p) {
                     return Err(Error::Refused(format!(
                         "the {what} {} is the source itself",
+                        p.display()
+                    )));
+                }
+            }
+        }
+        // The files kept next to the mapfile are created, replaced and
+        // deleted freely; the output image or the source at one of those
+        // paths would be destroyed.
+        for suffix in MAP_SIDE_SUFFIXES {
+            let side = mapfile::with_suffix(mapfile, suffix);
+            let mut victims = vec![("output image", output)];
+            if let Some(sp) = source.path() {
+                victims.push(("source", sp));
+            }
+            for (what, p) in victims {
+                if same_file(p, &side) {
+                    return Err(Error::Refused(format!(
+                        "the {what} {} is where the mapfile's {suffix} file is kept; choose \
+                         another mapfile name",
                         p.display()
                     )));
                 }
@@ -722,6 +840,20 @@ impl Imager {
             mf.current_pos = mf.current_pos.min(size);
             if opts.command_line.is_some() {
                 mf.command_line = opts.command_line.clone();
+            }
+            // The rescued data sits at the offset the previous run used.
+            // With another offset the map would call finished what the
+            // output does not hold there.
+            if let Some(prev) = sidecar_output_offset(mapfile) {
+                if prev != opts.output_offset {
+                    return Err(Error::Refused(format!(
+                        "the previous run wrote the rescued data at output offset {prev}, this \
+                         one would use {}; resume with the same offset (or delete {} if the \
+                         image really was moved)",
+                        opts.output_offset,
+                        mapfile::with_suffix(mapfile, ".dr.json").display()
+                    )));
+                }
             }
         } else {
             mf.command_line = opts.command_line.clone();
@@ -821,6 +953,7 @@ impl Imager {
             geo,
             domain,
             resumed,
+            ran: false,
             setup_warnings,
         };
         if !resumed {
@@ -889,6 +1022,21 @@ impl Imager {
         self.write_map()
     }
 
+    /// fsync the output and write the current map to `path` instead of the
+    /// configured mapfile (same atomic procedure). Meant as an emergency
+    /// copy when [`Imager::run`] failed because the mapfile could not be
+    /// saved (disk full, read-only directory): the in-memory map is
+    /// complete, and resuming from this copy loses nothing.
+    pub fn save_mapfile_to(&self, path: &Path) -> Result<()> {
+        self.flush_output()?;
+        self.mf.save_atomic(
+            path,
+            &self.opts.tool_name,
+            &self.opts.tool_version,
+            Timestamp::now(),
+        )
+    }
+
     fn flush_output(&self) -> Result<()> {
         self.out.sync_data().map_err(|e| {
             Error::Io(std::io::Error::new(
@@ -955,8 +1103,16 @@ impl Imager {
         on_event: &mut dyn FnMut(Event),
     ) -> Result<Summary> {
         let mut ctx = Ctx::new(control, on_event);
-        for w in self.setup_warnings.clone() {
-            ctx.warn(w);
+        if self.opts.profile.check_on_error {
+            // The previous run (or process) may have ended right after a
+            // read error, and a bridge's first answer after an error can be
+            // stale: confirm the first data read of this run too.
+            ctx.distrust_next_read();
+        }
+        if !self.ran {
+            for w in self.setup_warnings.clone() {
+                ctx.warn(w);
+            }
         }
         if self.opts.profile.direct_io && !self.source.requires_alignment() {
             log::debug!(
@@ -969,9 +1125,10 @@ impl Imager {
             status: self.mf.current_status,
             pass: self.mf.current_pass,
             pos: self.mf.current_pos,
-            active: self.resumed,
+            active: self.resumed || self.ran,
         };
-        if self.resumed {
+        self.ran = true;
+        if resume.active {
             ctx.info(format!(
                 "resuming: status '{}' pass {} at 0x{:X}",
                 self.mf.current_status.as_char(),
@@ -1016,7 +1173,15 @@ impl Imager {
                 .push(format!("{n} further warnings were only written to the log"));
         }
         self.flush_output()?;
-        self.write_map()?;
+        if let Err(e) = self.write_map() {
+            let msg = format!(
+                "could not save the mapfile {}: {e}; the rescue state is still in memory \
+                 (Imager::save_mapfile_to can write it elsewhere)",
+                self.mapfile_path.display()
+            );
+            log::error!("{msg}");
+            return Err(Error::Io(std::io::Error::other(msg)));
+        }
         self.write_sidecar(&ctx);
         ctx.emit(Event::Saved);
         let stats = self.stats();
@@ -1114,13 +1279,17 @@ impl Imager {
         ctx.last_save = now;
         match self.write_map() {
             Ok(()) => {
+                ctx.save_failed = false;
                 self.write_sidecar(ctx);
                 ctx.emit(Event::Saved);
             }
-            Err(e) => ctx.warn(format!(
-                "could not save the mapfile {}: {e}; will retry",
-                self.mapfile_path.display()
-            )),
+            Err(e) => {
+                ctx.save_failed = true;
+                ctx.warn(format!(
+                    "could not save the mapfile {}: {e}; will retry",
+                    self.mapfile_path.display()
+                ))
+            }
         }
         Ok(())
     }
@@ -1172,9 +1341,12 @@ impl Imager {
             ctx.info("resumed".into());
         }
         let now = Instant::now();
-        if ctx.control.take_save_request()
-            || now.duration_since(ctx.last_save) >= self.opts.save_interval
-        {
+        let interval = if ctx.save_failed {
+            self.opts.save_interval.min(SAVE_RETRY)
+        } else {
+            self.opts.save_interval
+        };
+        if ctx.control.take_save_request() || now.duration_since(ctx.last_save) >= interval {
             self.save_map(ctx)?;
         } else if now.duration_since(ctx.last_fsync) >= self.opts.fsync_interval {
             self.flush_output()?;
@@ -1612,9 +1784,15 @@ impl Imager {
 
     fn trim_block(&mut self, ctx: &mut Ctx, r: Range) -> Result<Option<StopReason>> {
         let unit = self.geo.unit;
+        // ddrescue: an edge next to a known bad sector is not trimmed (its
+        // first read would almost certainly fail again, costing a timeout
+        // and wear); a block between two bad sectors goes straight to
+        // scraping.
+        let lbad = r.start > 0 && self.mf.map.get(r.start - 1) == Some(BlockStatus::BadSector);
+        let rbad = self.mf.map.get(r.end) == Some(BlockStatus::BadSector);
         let mut pos = r.start;
-        let mut lo = None;
-        while pos < r.end {
+        let mut lo = lbad.then_some(r.start);
+        while lo.is_none() && pos < r.end {
             if let Some(stop) = self.checkpoint(ctx)? {
                 return Ok(Some(stop));
             }
@@ -1634,7 +1812,7 @@ impl Imager {
             return Ok(None);
         };
         let mut end = r.end;
-        while end > lo {
+        while !rbad && end > lo {
             if let Some(stop) = self.checkpoint(ctx)? {
                 return Ok(Some(stop));
             }
@@ -1931,6 +2109,7 @@ impl Imager {
                                     "inconsistent data at 0x{cur:X} right after a read error; \
                                      not trusting it"
                                 ));
+                                ctx.unverified_error = true;
                                 failure = Some(Failure {
                                     at: cur,
                                     kind: ReadErrorKind::Io,
@@ -1939,6 +2118,9 @@ impl Imager {
                                 break;
                             }
                             Fresh::Unverified => {
+                                // The failed verification read is itself an
+                                // error: the next answer is suspect again.
+                                ctx.unverified_error = true;
                                 failure = Some(Failure {
                                     at: cur,
                                     kind: ReadErrorKind::Io,
@@ -1947,6 +2129,20 @@ impl Imager {
                                         .into(),
                                 });
                                 break;
+                            }
+                            Fresh::Gone => {
+                                // Not a read error: wait for the device and
+                                // read the range again (nothing was kept).
+                                match self.device_gone(ctx, cur, "lost while verifying a read")? {
+                                    None => {
+                                        ctx.distrust_next_read();
+                                        continue;
+                                    }
+                                    Some(stop) => {
+                                        res.stop = Some(stop);
+                                        break;
+                                    }
+                                }
                             }
                         }
                     }
@@ -1961,6 +2157,7 @@ impl Imager {
                     if check {
                         ctx.remember_good(cur, data);
                     }
+                    ctx.device_answered();
                     ctx.after_error = false;
                     ctx.consecutive_errors = 0;
                     ctx.phase_processed += len as u64;
@@ -1988,7 +2185,10 @@ impl Imager {
                 }
                 Raw::Failed { at, kind, detail } => match kind {
                     ReadErrorKind::DeviceGone => match self.device_gone(ctx, cur, &detail)? {
-                        None => continue,
+                        None => {
+                            ctx.distrust_next_read();
+                            continue;
+                        }
                         Some(stop) => {
                             res.stop = Some(stop);
                             break;
@@ -1997,6 +2197,8 @@ impl Imager {
                     ReadErrorKind::Io | ReadErrorKind::Timeout => {
                         if kind == ReadErrorKind::Timeout {
                             ctx.timeouts += 1;
+                        } else {
+                            ctx.device_answered();
                         }
                         // Everything read from now on follows an error.
                         ctx.after_error = true;
@@ -2006,10 +2208,14 @@ impl Imager {
                             // else, so a stale answer lands on the check.
                             self.check_last_good(ctx);
                         }
-                        let at = if kind == ReadErrorKind::Io {
-                            align_down(at, self.geo.sector).clamp(cur, limit)
-                        } else {
-                            cur
+                        // Only an offset strictly inside the request says
+                        // anything about a good prefix; anything else
+                        // (garbage, the request end, before the start) is
+                        // treated as "failed at the start", never as a
+                        // reason to read the whole block again.
+                        let at = match align_down(at, self.geo.sector) {
+                            a if kind == ReadErrorKind::Io && a > cur && a < limit => a,
+                            _ => cur,
                         };
                         if at > cur && pending.is_none() {
                             // The source says the bytes before `at` were
@@ -2044,7 +2250,10 @@ impl Imager {
                     let detail = "the source returned no data before its end (device removed or \
                                   shrunk)";
                     match self.device_gone(ctx, cur, detail)? {
-                        None => continue,
+                        None => {
+                            ctx.distrust_next_read();
+                            continue;
+                        }
                         Some(stop) => {
                             res.stop = Some(stop);
                             break;
@@ -2190,7 +2399,12 @@ impl Imager {
                     Verify::Different
                 }
             }
-            _ => Verify::Failed,
+            Raw::Failed {
+                kind: ReadErrorKind::DeviceGone,
+                ..
+            }
+            | Raw::Eof => Verify::Gone,
+            Raw::Failed { .. } => Verify::Failed,
         };
         ctx.check_buf = cb;
         v
@@ -2209,6 +2423,7 @@ impl Imager {
         match self.confirm_read(ctx, range, data, timeout) {
             Verify::Same => return Fresh::Confirmed,
             Verify::Failed => return Fresh::Unverified,
+            Verify::Gone => return Fresh::Gone,
             Verify::Different => {}
         }
         // The second read is in check_buf; keep it and read a third time.
@@ -2227,6 +2442,7 @@ impl Imager {
             }
             Verify::Different => Fresh::Inconsistent,
             Verify::Failed => Fresh::Unverified,
+            Verify::Gone => Fresh::Gone,
         }
     }
 
@@ -2255,20 +2471,23 @@ impl Imager {
             return;
         }
         let timeout = self.phase_timeout(ctx.phase);
-        ctx.unverified_error = false;
         match self.confirm_read(ctx, r, &data, timeout) {
             Verify::Same => {
+                // This read took the answer a bridge may have got wrong.
+                ctx.unverified_error = false;
                 ctx.last_good = Some((pos, data));
                 return;
             }
-            Verify::Failed => {
+            Verify::Failed | Verify::Gone => {
                 // A failed re-read says nothing about data that was read
-                // successfully before (flaky media); keep it.
+                // successfully before (flaky media); keep it. It was an
+                // error itself, so the next data read stays unverified (a
+                // vanished device is noticed by that next read).
                 log::debug!("check read of the last good block at 0x{pos:X} failed");
                 ctx.last_good = Some((pos, data));
                 return;
             }
-            Verify::Different => {}
+            Verify::Different => ctx.unverified_error = false,
         }
         let msg = format!(
             "check read of the last good block at 0x{pos:X} returned different data; reading it \
@@ -2340,6 +2559,13 @@ impl Imager {
     /// The device vanished while reading `at`: save, then poll
     /// `Source::reopen` until it is back. `Ok(None)` = back (retry the
     /// read); `Ok(Some(_))` = give up or cancelled.
+    ///
+    /// A device that keeps vanishing right after every successful re-open
+    /// (the node is back but the device behind it is dead) is not re-opened
+    /// forever: every further attempt first waits `reattach_poll`, the
+    /// `wait_for_reattach` budget runs from the first loss without a
+    /// successful read in between, and after [`MAX_FLAPS`] such re-attaches
+    /// the engine gives up (the map is saved; the rescue can be resumed).
     fn device_gone(&mut self, ctx: &mut Ctx, at: u64, detail: &str) -> Result<Option<StopReason>> {
         let p = &self.opts.profile;
         let max_reattaches = p.max_reattaches as u64;
@@ -2356,7 +2582,29 @@ impl Imager {
                 ctx.reattaches + 1
             ))));
         }
+        if ctx.flaps >= MAX_FLAPS {
+            return Ok(Some(StopReason::Halt(format!(
+                "the device came back {} times in a row but vanished again before a single \
+                 read succeeded; giving up. Try another port, cable or card reader, then resume",
+                ctx.flaps
+            ))));
+        }
         let t0 = Instant::now();
+        let since = *ctx.lost_since.get_or_insert(t0);
+        if ctx.flaps > 0 {
+            if let Some(w) = wait {
+                if since.elapsed() >= w {
+                    return Ok(Some(StopReason::Halt(format!(
+                        "the device has not delivered data for {w:?} (it keeps vanishing); \
+                         resume when it is back"
+                    ))));
+                }
+            }
+            // It vanished again right after coming back: let it settle.
+            if ctx.sleep(poll) {
+                return Ok(Some(StopReason::Cancelled));
+            }
+        }
         loop {
             if ctx.control.is_cancelled() {
                 return Ok(Some(StopReason::Cancelled));
@@ -2373,6 +2621,7 @@ impl Imager {
                         ))));
                     }
                     ctx.reattaches += 1;
+                    ctx.flaps += 1;
                     let after = t0.elapsed();
                     ctx.emit(Event::DeviceBack { after });
                     ctx.info(format!(
@@ -2389,7 +2638,7 @@ impl Imager {
                 Err(e) => log::debug!("re-open failed: {e}"),
             }
             if let Some(w) = wait {
-                if t0.elapsed() >= w {
+                if since.elapsed() >= w {
                     return Ok(Some(StopReason::Halt(format!(
                         "the device did not come back within {w:?}; resume when it is back"
                     ))));
@@ -2397,7 +2646,10 @@ impl Imager {
             }
             let mut nap = poll;
             if let Some(w) = wait {
-                nap = nap.min(w.saturating_sub(t0.elapsed()).max(Duration::from_millis(1)));
+                nap = nap.min(
+                    w.saturating_sub(since.elapsed())
+                        .max(Duration::from_millis(1)),
+                );
             }
             if ctx.sleep(nap) {
                 return Ok(Some(StopReason::Cancelled));

@@ -38,13 +38,13 @@ mod walk;
 pub use boot::BootSector;
 
 use std::io::Write;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use diskrescue_core::fs::{FileEntry, FileReadReport, FileSystem, FsKind, VolumeInfo, WalkControl};
 use diskrescue_core::util::bytes::{u32le, u64le, u8_at};
 use diskrescue_core::{Error, Range, RangeSet, Result, SharedSource};
 
-use crate::common::{self, ClusterMap, ClusterState, DirData};
+use crate::common::{self, ClaimIndex, ClusterMap, ClusterState, DirData};
 use crate::io::MetaReader;
 use crate::table::{FatEntry, FatTable, FatWidth, Runs};
 use crate::util::{div_ceil, exfat_table_checksum};
@@ -74,6 +74,8 @@ pub struct ExFatFs {
     upcase: Option<Vec<u16>>,
     info: VolumeInfo,
     opts: FatOptions,
+    /// Clusters claimed by deleted entries (first walk pass, computed once).
+    claims: OnceLock<ClaimIndex>,
 }
 
 impl std::fmt::Debug for ExFatFs {
@@ -229,6 +231,7 @@ pub fn open_exfat(src: SharedSource, opts: &FatOptions) -> Result<ExFatFs> {
             warnings: Vec::new(),
         },
         opts: opts.clone(),
+        claims: OnceLock::new(),
     };
     let label = fs.load_root_metadata(&mut warnings);
     fs.info = VolumeInfo {
@@ -430,6 +433,11 @@ impl ExFatFs {
         &self.opts
     }
 
+    /// Deleted-entry cluster claims, collected by a silent first walk.
+    pub(crate) fn claims(&self) -> &ClaimIndex {
+        self.claims.get_or_init(|| walk::collect_claims(self))
+    }
+
     pub(crate) fn meta(&self) -> &MetaReader {
         &self.meta
     }
@@ -585,7 +593,13 @@ impl FileSystem for ExFatFs {
     }
 
     fn read_file(&self, entry: &FileEntry, sink: &mut dyn Write) -> Result<FileReadReport> {
-        common::read_entry(&self.src, self, entry, sink)
+        common::read_entry(
+            &self.src,
+            self,
+            entry,
+            sink,
+            self.opts.read_past_valid_data_length,
+        )
     }
 
     fn unallocated(&self) -> Result<RangeSet> {

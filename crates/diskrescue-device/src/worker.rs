@@ -25,6 +25,7 @@
 //! Several callers may read concurrently; each gets its own worker, so a
 //! hung read never blocks an unrelated one beyond its own deadline.
 
+use std::cell::RefCell;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError};
@@ -48,6 +49,24 @@ pub const DEFAULT_MAX_HUNG: u64 = 32;
 
 /// Idle workers kept for reuse.
 const MAX_IDLE: usize = 4;
+
+thread_local! {
+    /// The abandonment flag of the worker running on this thread.
+    static ABANDONED: RefCell<Option<Arc<AtomicBool>>> = const { RefCell::new(None) };
+}
+
+/// True when called on a worker thread whose current read was abandoned
+/// by its caller (the caller timed out and moved on). Backends that issue
+/// several system calls per read (narrowing an error down sector by
+/// sector) check it between calls and stop early: nobody will use the
+/// result, and more reads on a struggling device only make it worse.
+pub fn current_read_abandoned() -> bool {
+    ABANDONED.with(|a| {
+        a.borrow()
+            .as_ref()
+            .is_some_and(|f| f.load(Ordering::SeqCst))
+    })
+}
 
 struct Job {
     offset: u64,
@@ -106,6 +125,15 @@ impl WorkerPool {
     /// Change the hung-read limit.
     pub fn with_max_hung(mut self, max: u64) -> Self {
         self.max_hung = max.max(1);
+        self
+    }
+
+    /// Count hung reads in `counter`, shared with other pools, so that the
+    /// limit set by [`WorkerPool::with_max_hung`] applies to all of them
+    /// together (used for short-lived probe pools, which would otherwise
+    /// each start from zero).
+    pub fn with_shared_hung_counter(mut self, counter: Arc<AtomicU64>) -> Self {
+        self.hung = counter;
         self
     }
 
@@ -200,6 +228,7 @@ impl WorkerPool {
         std::thread::Builder::new()
             .name(format!("dr-read-{}", self.name))
             .spawn(move || {
+                ABANDONED.with(|a| *a.borrow_mut() = Some(flag.clone()));
                 while let Ok(mut job) = job_rx.recv() {
                     let len = job.len.min(job.buf.capacity());
                     let result = catch_unwind(AssertUnwindSafe(|| {
@@ -453,6 +482,96 @@ mod tests {
             delay_at_zero: Duration::ZERO,
         }));
         assert_eq!(pool.read(8, 8, &mut out, Duration::MAX).unwrap(), 8);
+    }
+
+    /// Reads `pieces` pieces of 50 ms each, like an error being narrowed
+    /// down sector by sector, and stops when the read was abandoned.
+    struct Narrowing {
+        pieces: u64,
+        done: Arc<AtomicU64>,
+    }
+
+    impl ReadBackend for Narrowing {
+        fn read(&self, offset: u64, buf: &mut [u8]) -> Result<usize, ReadError> {
+            for _ in 0..self.pieces {
+                if current_read_abandoned() {
+                    return Err(ReadError::new(
+                        offset,
+                        buf.len(),
+                        ReadErrorKind::Timeout,
+                        "x",
+                    ));
+                }
+                std::thread::sleep(Duration::from_millis(50));
+                self.done.fetch_add(1, Ordering::SeqCst);
+            }
+            Ok(buf.len())
+        }
+    }
+
+    #[test]
+    fn abandoned_reads_stop_hitting_the_device() {
+        let done = Arc::new(AtomicU64::new(0));
+        let pool = WorkerPool::new(
+            "n",
+            Arc::new(Narrowing {
+                pieces: 100,
+                done: done.clone(),
+            }),
+            64,
+        );
+        let mut out = [0u8; 8];
+        assert!(pool
+            .read(0, 8, &mut out, Duration::from_millis(120))
+            .is_err());
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while pool.hung() > 0 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(pool.hung(), 0, "the abandoned worker returned early");
+        let n = done.load(Ordering::SeqCst);
+        assert!(n < 10, "{n} pieces read after the caller gave up");
+        // Not on a worker thread: never abandoned.
+        assert!(!current_read_abandoned());
+    }
+
+    #[test]
+    fn shared_hung_counter_bounds_short_lived_pools() {
+        let shared = Arc::new(AtomicU64::new(0));
+        let make = || {
+            WorkerPool::new(
+                "probe",
+                Arc::new(Slow {
+                    delay_at_zero: Duration::from_millis(600),
+                }),
+                64,
+            )
+            .with_shared_hung_counter(shared.clone())
+            .with_max_hung(2)
+        };
+        let mut out = [0u8; 8];
+        for _ in 0..2 {
+            let p = make();
+            assert_eq!(
+                p.read(0, 8, &mut out, Duration::from_millis(20))
+                    .unwrap_err()
+                    .kind,
+                ReadErrorKind::Timeout
+            );
+        }
+        assert_eq!(shared.load(Ordering::SeqCst), 2);
+        // A third probe pool refuses at once instead of adding a thread.
+        let t = Instant::now();
+        let e = make()
+            .read(8, 8, &mut out, Duration::from_secs(5))
+            .unwrap_err();
+        assert!(e.detail.contains("still hung"), "{}", e.detail);
+        assert!(t.elapsed() < Duration::from_millis(100));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while shared.load(Ordering::SeqCst) > 0 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(shared.load(Ordering::SeqCst), 0);
     }
 
     #[test]

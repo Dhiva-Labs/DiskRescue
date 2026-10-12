@@ -208,11 +208,16 @@ fn valid_data_length(entry: &FileEntry) -> Option<u64> {
 }
 
 /// Shared implementation of `FileSystem::read_file`.
+///
+/// `past_vdl`: read the bytes between exFAT's ValidDataLength and the size
+/// from the medium instead of writing zeros (see
+/// [`crate::FatOptions::read_past_valid_data_length`]).
 pub(crate) fn read_entry(
     src: &SharedSource,
     map: &dyn ClusterMap,
     entry: &FileEntry,
     sink: &mut dyn Write,
+    past_vdl: bool,
 ) -> Result<FileReadReport> {
     if entry.is_dir {
         return Err(Error::InvalidArgument(format!(
@@ -227,8 +232,15 @@ pub(crate) fn read_entry(
         )));
     }
     let size = entry.size;
-    let vdl = valid_data_length(entry).unwrap_or(size).min(size);
+    let recorded_vdl = valid_data_length(entry).unwrap_or(size).min(size);
+    let vdl = if past_vdl { size } else { recorded_vdl };
     let mut report = FileReadReport::default();
+    if past_vdl && recorded_vdl < size {
+        report.notes.push(format!(
+            "bytes {recorded_vdl}..{size} lie past ValidDataLength (never written according to the \
+             filesystem) and were read as stored: an interrupted recording, or stale data"
+        ));
+    }
     for f in &entry.flags {
         if !ATTRIBUTE_FLAGS.contains(&f.as_str()) && !f.starts_with(VDL_FLAG) {
             report.notes.push(f.clone());
@@ -462,15 +474,136 @@ pub(crate) struct DirData {
 }
 
 impl DirData {
-    /// Volume offset of directory byte `rel`.
+    /// Volume offset of directory byte `rel` (segments are in directory
+    /// order, so this is a binary search: a directory spread over tens of
+    /// thousands of fragments must not cost a scan per entry).
     pub(crate) fn vol_offset(&self, rel: u64) -> u64 {
-        for &(d, v, l) in &self.segments {
+        let i = self.segments.partition_point(|&(d, _, l)| d + l <= rel);
+        if let Some(&(d, v, l)) = self.segments.get(i) {
             if rel >= d && rel < d + l {
                 return v + (rel - d);
             }
         }
         // Not reachable for offsets inside `bytes`; keep a unique value.
         u64::MAX - rel
+    }
+}
+
+/// Note attached to deleted entries whose clusters overlap those of
+/// another deleted entry.
+pub(crate) const SHARED_NOTE: &str = "some of its clusters are also claimed by another deleted file or directory; one of them was written over the other";
+
+/// Most claims recorded in the first pass (24 bytes each).
+const MAX_CLAIMS: usize = 4_000_000;
+
+/// Clusters claimed by deleted entries, collected in a silent first pass
+/// over the directory tree so that every deleted entry sharing clusters
+/// with another one can be flagged before it is reported (filesystems spec
+/// 4.2: both are listed, with a shared-cluster note, and neither is
+/// "intact"). Also caches the outcome of expensive first-cluster guesses so
+/// the second pass does not repeat their reads.
+#[derive(Debug, Default)]
+pub(crate) struct ClaimIndex {
+    /// `(first cluster, end cluster exclusive, entry id)` sorted by start.
+    claims: Vec<(u64, u64, u64)>,
+    /// Running maximum of the end over `claims[..=i]`.
+    prefix_end: Vec<u64>,
+    /// Entries that overlap another entry.
+    shared: std::collections::HashSet<u64>,
+    /// Resolved first clusters (entry id -> cluster, flags).
+    resolved: std::collections::HashMap<u64, (u32, Vec<String>)>,
+    /// The first pass hit [`MAX_CLAIMS`].
+    pub truncated: bool,
+}
+
+impl ClaimIndex {
+    /// Record the clusters of a deleted entry.
+    pub(crate) fn record(&mut self, id: u64, runs: &[(u32, u32)]) {
+        for &(s, n) in runs {
+            if n == 0 {
+                continue;
+            }
+            if self.claims.len() >= MAX_CLAIMS {
+                self.truncated = true;
+                return;
+            }
+            self.claims.push((s as u64, s as u64 + n as u64, id));
+        }
+    }
+
+    /// Remember a resolved first cluster.
+    pub(crate) fn remember(&mut self, id: u64, cluster: u32, flags: &[String]) {
+        if self.resolved.len() < MAX_CLAIMS {
+            self.resolved.insert(id, (cluster, flags.to_vec()));
+        }
+    }
+
+    /// A first cluster resolved in the first pass.
+    pub(crate) fn resolved(&self, id: u64) -> Option<&(u32, Vec<String>)> {
+        self.resolved.get(&id)
+    }
+
+    /// Sort the claims and find every entry that overlaps another one.
+    pub(crate) fn finish(&mut self) {
+        self.claims.sort_unstable();
+        let n = self.claims.len();
+        let mut max_end = 0u64;
+        let mut max_id = None;
+        self.prefix_end = Vec::with_capacity(n);
+        for i in 0..n {
+            let (s, e, id) = self.claims[i];
+            if s < max_end {
+                if let Some(m) = max_id.filter(|&m| m != id) {
+                    self.shared.insert(id);
+                    self.shared.insert(m);
+                }
+            }
+            if let Some(&(ns, _, nid)) = self.claims.get(i + 1) {
+                if ns < e && nid != id {
+                    self.shared.insert(id);
+                    self.shared.insert(nid);
+                }
+            }
+            if e > max_end {
+                max_end = e;
+                max_id = Some(id);
+            }
+            self.prefix_end.push(max_end);
+        }
+    }
+
+    /// True when the entry overlapped another deleted entry in the first
+    /// pass.
+    pub(crate) fn is_shared(&self, id: u64) -> bool {
+        self.shared.contains(&id)
+    }
+
+    /// True when `runs` overlap any recorded claim of another entry (used
+    /// for entries the first pass did not see, such as orphans).
+    pub(crate) fn overlaps(&self, id: u64, runs: &[(u32, u32)]) -> bool {
+        for &(s, n) in runs {
+            let (s, e) = (s as u64, s as u64 + n as u64);
+            let k = self.claims.partition_point(|c| c.0 < e);
+            if k == 0 || self.prefix_end[k - 1] <= s {
+                continue;
+            }
+            // Some claim starting before `e` ends after `s`; make sure it is
+            // not this entry's own (scan back a little, then assume so).
+            let mut j = k;
+            let mut seen = 0;
+            while j > 0 && seen < 64 {
+                j -= 1;
+                seen += 1;
+                let c = self.claims[j];
+                if c.1 > s && c.2 != id {
+                    return true;
+                }
+            }
+            if seen == 64 {
+                return true;
+            }
+        }
+        false
     }
 }
 

@@ -53,8 +53,13 @@ pub fn check(source: &Path, info: &DeviceInfo, output: &Path, allow_mounted: boo
                 info.path.display()
             )),
             Ok(false) => {}
-            Err(e) => r.warnings.push(format!(
-                "could not verify that the output is on a different device ({e}); make sure it is"
+            // Refuse rather than guess: writing to the source can overwrite
+            // the very files being recovered.
+            Err(e) => r.blockers.push(format!(
+                "could not verify that the output directory {} is on a different device than {} ({e}). \
+                 Choose an output directory on another disk that already exists and that you can read.",
+                output.display(),
+                info.path.display()
             )),
         }
         if info.is_mounted() {

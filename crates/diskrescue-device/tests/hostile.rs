@@ -1,6 +1,8 @@
 //! Garbage, truncated and absurd sysfs/udev/mountinfo contents must never
 //! panic or hang enumeration.
 
+#![cfg(target_os = "linux")]
+
 mod common;
 
 use std::time::{Duration, Instant};

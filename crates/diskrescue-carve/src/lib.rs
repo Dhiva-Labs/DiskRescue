@@ -18,14 +18,18 @@
 //!    prefilter) holds the primary bytes of every signature; the search
 //!    resumes one byte after each match and compares all patterns at a
 //!    matching position, so overlapping signatures and signatures at an
-//!    offset inside the file (`ftyp` at 4) are all seen. All-zero 4 KiB
-//!    blocks are skipped (with a margin so patterns straddling them are not
-//!    lost). Bytes the source reports as unreadable are zero-filled and
+//!    offset inside the file (`ftyp` at 4) are all seen. One- and two-byte
+//!    patterns (MPEG-TS sync, MP3 frame sync, `BM`) are compared directly at
+//!    each grid position instead, which keeps the automaton fast. All-zero
+//!    4 KiB blocks are skipped (with a margin so patterns straddling them are
+//!    not lost). Bytes the source reports as unreadable are zero-filled and
 //!    never searched; read errors are retried at sector granularity and the
 //!    failing sectors are skipped, so a bad sector never aborts the scan.
-//! 2. **Filter.** A candidate start must be a multiple of `alignment`, lie in
-//!    the scan area, match its full signature (including the `also`
-//!    pattern) and pass `FileFormat::probe` on the probe window.
+//! 2. **Filter.** A candidate start must be a multiple of `alignment` (and of
+//!    512 for weak signatures with fewer than three fixed bytes, whatever the
+//!    alignment: spec 3.1), lie in the scan area, match its full signature
+//!    (including the `also` pattern) and pass `FileFormat::probe` on the
+//!    probe window.
 //! 3. **Measure** (rayon pool of `workers` threads). One job per candidate
 //!    start measures the matching formats in priority order with a read
 //!    limit of `min(format max_size, max_file_size, bytes to source end)`;
@@ -37,20 +41,27 @@
 //!    objects become `nested`, a new aligned header ends a weak-length file
 //!    (truncated, capped or unknown length), a much stronger aligned header
 //!    splits a file, and a partial overlap goes to the more confident file.
-//!    Each byte is attributed to at most one top-level file.
+//!    A complete file's length field is not trusted over a confident header
+//!    on the grid inside it: such a file that runs past the outer file's end
+//!    cuts it, and one of a format the outer file cannot contain becomes a
+//!    *conflict child* (see the `resolve` module), so a deleted file whose
+//!    size field overruns newer files does not swallow them. Each byte is
+//!    attributed to at most one top-level file.
 //! 5. **Emit.** Confidence is lowered for unreadable bytes inside the file
 //!    ([`PENALTY_UNREADABLE`]), for extending into allocated space
-//!    ([`PENALTY_ALLOCATED`]) and for a header off the cluster grid
-//!    ([`PENALTY_OFF_CLUSTER`]). Valid still images nested in a truncated or
-//!    capped parent (or every nested object with `promote_nested`) are
-//!    emitted as files of their own right after their parent, with `parent`
-//!    set.
+//!    ([`PENALTY_ALLOCATED`]), for a header off the cluster grid
+//!    ([`PENALTY_OFF_CLUSTER`]) and for holding a conflict child
+//!    ([`PENALTY_CONFLICT`]). Conflict children, valid still images nested in
+//!    a truncated or capped parent (or every nested object with
+//!    `promote_nested`) are emitted as files of their own right after their
+//!    parent, with `parent` set.
 //!
-//! Candidates that start inside a file already known to be complete and
-//! highly confident are dropped before measuring, and the scanner skips the
-//! rest of such a file (no search, and no read once the planner knows);
-//! the resolver rules guarantee this shortcut gives the same output as
-//! measuring them, so results never depend on thread timing.
+//! Candidates that start inside a complete, highly confident file off the
+//! allocation grid (or inside one of its reported nested objects) are
+//! dropped before measuring; the resolver rules guarantee this shortcut
+//! gives the same output as measuring them, so results never depend on
+//! thread timing. The scanner still searches such files, because a header on
+//! the grid inside them can matter.
 //!
 //! # Limits
 //!
@@ -70,6 +81,16 @@
 //!   was emitted.
 //! * At most 4096 nested objects per file are measured for promotion, and
 //!   motion-photo trailers are never promoted.
+//! * A weakly measured file (a moov-less MP4 scores 25) whose header lies
+//!   inside a complete, confident file is still suppressed: only confident
+//!   headers count as evidence against an enclosing file's length. A file
+//!   of a format the enclosing file may contain (a JPEG inside an MP4) is
+//!   taken as embedded unless it runs past the enclosing file's end.
+//! * Weak signatures (fewer than three fixed bytes: MPEG-TS, M2TS, bare MP3
+//!   frames, BMP) are only tried at 512-byte multiples, even in a deep scan.
+//! * Alignment is taken from absolute source offsets, not from a partition
+//!   origin; with `alignment` above 512 on a disk image whose partition does
+//!   not start on that grid, use the `cluster` grid instead.
 
 #![warn(missing_docs)]
 
@@ -84,6 +105,7 @@ pub use diskrescue_core as core;
 pub use scan::Carver;
 pub use types::{
     CarveMode, CarveOptions, CarvedFile, ExtractReport, ScanProgress, ScanSummary,
-    DEFAULT_ALIGNMENT, DEFAULT_CHUNK_SIZE, DEFAULT_PROBE_WINDOW, MIN_CHUNK_SIZE, PENALTY_ALLOCATED,
-    PENALTY_OFF_CLUSTER, PENALTY_SPLIT, PENALTY_UNREADABLE, ZERO_BLOCK,
+    DEFAULT_ALIGNMENT, DEFAULT_CHUNK_SIZE, DEFAULT_PROBE_WINDOW, MAX_CHUNK_SIZE, MAX_PROBE_WINDOW,
+    MIN_CHUNK_SIZE, PENALTY_ALLOCATED, PENALTY_CONFLICT, PENALTY_OFF_CLUSTER, PENALTY_SPLIT,
+    PENALTY_UNREADABLE, ZERO_BLOCK,
 };

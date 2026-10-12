@@ -7,8 +7,10 @@
 //! * [`FatFs`] ([`open_fat`]): FAT12/16/32 with long names, deleted entries
 //!   (name from the deleted LFN run when it verifies, else the 8.3 name with
 //!   its lost first character shown as `_`; data assumed contiguous from the
-//!   first cluster), deleted directories, the FAT32 backup boot sector and
-//!   per-sector FAT1 -> FAT2 fallback.
+//!   first cluster), deleted directories, the FAT32 backup boot sector,
+//!   per-sector FAT1 -> FAT2 fallback, and reconstruction of a destroyed
+//!   boot sector from the FAT copies and directories (FAT12/16 have no
+//!   backup boot sector).
 //! * [`ExFatFs`] ([`open_exfat`]): exFAT directory entry sets with checksum
 //!   verification, NoFatChain and FAT-chained files, ValidDataLength,
 //!   deleted sets (exact extents for NoFatChain files), the allocation
@@ -58,11 +60,22 @@ pub struct FatOptions {
     /// with `include_deleted`. Default true.
     pub scan_orphans: bool,
     /// Fall back to the backup boot sector (FAT32 sector 6, exFAT sector 12)
-    /// when the primary is unreadable or invalid. Default true.
+    /// when the primary is unreadable or invalid, and when no backup is
+    /// usable (FAT12/16 have none) reconstruct the FAT geometry from the
+    /// two FAT copies and the directory structure. Default true.
     pub use_backup_boot_sector: bool,
     /// Maximum number of entries a walk reports (guard against hostile
     /// volumes). Default 10 million.
     pub max_entries: usize,
+    /// exFAT: when a file's ValidDataLength is below its DataLength, read
+    /// the bytes in between from the medium instead of writing zeros. The
+    /// filesystem calls them unwritten, but after a camcorder lost power
+    /// mid-recording they hold the end of the video (the directory entry
+    /// was not updated); otherwise they hold stale data. The read report
+    /// notes the range either way. Default false (zeros, reported as
+    /// holes).
+    #[serde(default)]
+    pub read_past_valid_data_length: bool,
 }
 
 impl Default for FatOptions {
@@ -72,6 +85,7 @@ impl Default for FatOptions {
             scan_orphans: true,
             use_backup_boot_sector: true,
             max_entries: 10_000_000,
+            read_past_valid_data_length: false,
         }
     }
 }
@@ -101,7 +115,9 @@ pub fn probe(head: &[u8]) -> Option<FsKind> {
 }
 
 /// Open a FAT or exFAT volume, detecting which. Tries the primary boot
-/// sector first and falls back to each parser's backup handling.
+/// sector first and falls back to each parser's backup handling; the
+/// heuristic FAT boot sector reconstruction comes last, after exFAT's
+/// backup boot region had its chance.
 pub fn open(src: SharedSource, opts: &FatOptions) -> Result<Box<dyn FileSystem>> {
     let head = src.read_vec(0, 4096).unwrap_or_default();
     let exfat_first = head.len() >= 11 && &head[3..11] == b"EXFAT   ";
@@ -111,12 +127,17 @@ pub fn open(src: SharedSource, opts: &FatOptions) -> Result<Box<dyn FileSystem>>
             Err(e) => log::debug!("exFAT open failed: {e}"),
         }
     }
-    let fat_err = match open_fat(src.clone(), opts) {
+    let fat_err = match fat::open_fat_impl(src.clone(), opts, false) {
         Ok(fs) => return Ok(Box::new(fs)),
         Err(e) => e,
     };
     if !exfat_first {
         if let Ok(fs) = open_exfat(src.clone(), opts) {
+            return Ok(Box::new(fs));
+        }
+    }
+    if opts.use_backup_boot_sector {
+        if let Ok(fs) = fat::open_fat_impl(src.clone(), opts, true) {
             return Ok(Box::new(fs));
         }
     }

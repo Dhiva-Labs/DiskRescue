@@ -8,6 +8,10 @@ repository.workspace = true
 authors.workspace = true
 rust-version.workspace = true
 
+[[bin]]
+name = "diskrescue"
+path = "src/main.rs"
+
 [dependencies]
 diskrescue-core.workspace = true
 thiserror.workspace = true
@@ -25,5 +29,13 @@ ratatui.workspace = true
 crossterm.workspace = true
 ctrlc.workspace = true
 
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys.workspace = true
+
 [dev-dependencies]
 tempfile.workspace = true
+rand.workspace = true
+diskrescue-fixtures.workspace = true

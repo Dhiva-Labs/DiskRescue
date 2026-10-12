@@ -131,7 +131,7 @@ fn invalid_short_char(b: u8) -> bool {
 }
 
 /// True when `e` is the `.` or `..` entry; returns which.
-fn dot_kind(e: &[u8]) -> Option<u8> {
+pub(crate) fn dot_kind(e: &[u8]) -> Option<u8> {
     if e[11] & ATTR_DIRECTORY == 0 || e[11] == ATTR_LONG_NAME {
         return None;
     }
@@ -144,12 +144,16 @@ fn dot_kind(e: &[u8]) -> Option<u8> {
     }
 }
 
-/// Structural plausibility of a short entry (used to drop junk).
-fn short_plausible(e: &[u8], deleted: bool) -> bool {
+/// Structural plausibility of a short entry (used to drop junk). With
+/// `strict`, reserved bits of DIR_NTRes must be clear too; live entries of a
+/// directory reached through the tree are not dropped for those bits alone
+/// (some implementations leave junk there, and dropping a live file is
+/// worse than listing a strange one).
+fn short_plausible(e: &[u8], deleted: bool, strict: bool) -> bool {
     if e[11] & 0xC0 != 0 {
         return false;
     }
-    if e[12] & !0x18 != 0 {
+    if strict && e[12] & !0x18 != 0 {
         return false;
     }
     let start = if deleted { 1 } else { 0 };
@@ -243,7 +247,7 @@ pub(crate) fn sniff_dir(head: &[u8], fat32: bool, max_cluster: u32) -> Sniff {
             continue;
         }
         let deleted = b0 == 0xE5;
-        if !short_plausible(e, deleted) {
+        if !short_plausible(e, deleted, true) {
             return s;
         }
         if dot_kind(e).is_some() {
@@ -431,11 +435,36 @@ fn deleted_long_name(bytes: &[u8], lfn_idx: &[usize], short: &[u8; 11]) -> Optio
     if !plausible_first(b) {
         return None;
     }
-    // When the long name starts with a plain letter/digit, the generated
-    // short name starts with its upper-case form.
+    // Any run of deleted LFN entries "matches" some first byte, so the
+    // checksum alone proves nothing here; check that the short name could
+    // have been generated from the long one. When the long name starts with
+    // a plain letter/digit, the short name starts with its upper-case form.
     let lead = name.trim_start_matches(['.', ' ']).chars().next()?;
     if lead.is_ascii_alphanumeric() && lead.to_ascii_uppercase() as u8 != b {
         return None;
+    }
+    // A plain ASCII extension is kept (upper-cased, at most 3 characters)
+    // by every short-name generator.
+    if !name.starts_with('.') {
+        let short_ext: Vec<u8> = short[8..11]
+            .iter()
+            .copied()
+            .filter(|&c| c != b' ')
+            .collect();
+        match name.rsplit_once('.') {
+            Some((_, ext)) if !ext.is_empty() && ext.bytes().all(|c| c.is_ascii_alphanumeric()) => {
+                let want: Vec<u8> = ext
+                    .bytes()
+                    .take(3)
+                    .map(|c| c.to_ascii_uppercase())
+                    .collect();
+                if short_ext != want {
+                    return None;
+                }
+            }
+            None if !short_ext.is_empty() => return None,
+            _ => {}
+        }
     }
     Some((name, b))
 }
@@ -582,7 +611,7 @@ pub(crate) fn parse_dir(d: &DirData, fat32: bool, max_cluster: u32) -> ParsedDir
             i += 1;
             continue;
         }
-        if !short_plausible(e, b0 == 0xE5) {
+        if !short_plausible(e, b0 == 0xE5, deleted) {
             junk += 1;
             run.reset();
             del_lfn.clear();
@@ -771,6 +800,53 @@ pub(crate) mod tests {
             p.items[0].modified.unwrap().to_rfc3339(),
             "2024-05-01T12:30:00Z"
         );
+    }
+
+    #[test]
+    fn deleted_lfn_of_another_file_is_not_attached() {
+        // The LFN run of "Holiday.jpg" survives in front of the deleted
+        // short entry of a different, LFN-less file (its own short entry
+        // slot was reused): the extension does not match, so the long name
+        // must not be attached.
+        let mut ents = lfn_entries("Holiday.jpg", b"HOLIDAY JPG");
+        for e in &mut ents {
+            e[0] = 0xE5;
+        }
+        // Pick a short name whose brute-forced first byte is 'H' with the
+        // same checksum but a different extension.
+        let chk = crate::util::lfn_checksum(b"HOLIDAY JPG");
+        let mut found = None;
+        'outer: for a in b'A'..=b'Z' {
+            for c in b'A'..=b'Z' {
+                for d in b'0'..=b'9' {
+                    let mut cand = *b"HXXXXX~1MOV";
+                    cand[1] = a;
+                    cand[2] = c;
+                    cand[5] = d;
+                    if crate::util::lfn_checksum(&cand) == chk {
+                        found = Some(cand);
+                        break 'outer;
+                    }
+                }
+            }
+        }
+        let short = found.expect("a colliding short name exists");
+        let mut e = short_entry(&short, 0x20, 30, 100);
+        e[0] = 0xE5;
+        ents.push(e);
+        let p = parse_dir(&dir(&ents), false, 1000);
+        assert_eq!(p.items.len(), 1);
+        assert!(p.items[0].name.starts_with('_'), "{}", p.items[0].name);
+        assert!(p.items[0].name.ends_with(".MOV"));
+    }
+
+    #[test]
+    fn live_entry_with_reserved_ntres_bits_is_kept() {
+        let mut e = short_entry(b"IMG_0001JPG", 0x20, 5, 10);
+        e[12] = 0x01;
+        let p = parse_dir(&dir(&[e]), false, 1000);
+        assert_eq!(p.items.len(), 1);
+        assert_eq!(p.items[0].name, "IMG_0001.JPG");
     }
 
     #[test]
