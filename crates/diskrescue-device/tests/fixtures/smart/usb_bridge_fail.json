@@ -1,0 +1,16 @@
+{
+  "json_format_version": [1, 0],
+  "smartctl": {
+    "version": [7, 4],
+    "svn_revision": "5530",
+    "platform_info": "x86_64-linux-6.8.0",
+    "build_info": "(local build)",
+    "argv": ["smartctl", "-j", "-a", "/dev/sdc"],
+    "messages": [
+      {"string": "/dev/sdc: Unknown USB bridge [0x0781:0x5567 (0x126)]", "severity": "error"},
+      {"string": "Please specify device type with the -d option.", "severity": "information"}
+    ],
+    "exit_status": 1
+  },
+  "local_time": {"time_t": 1760256000, "asctime": "Sun Oct 12 10:00:00 2026 IST"}
+}
