@@ -33,7 +33,7 @@ diskrescue scan SOURCE                  list what can be recovered, write nothin
 diskrescue recover SOURCE -o DIR        recover photos and videos
 diskrescue carve SOURCE -o DIR          carving only (ignore filesystems)
 diskrescue repair FILE... -o DIR        repair damaged photos and videos
-diskrescue verify FILE...               check whether files are intact
+diskrescue verify FILE...               check whether files are intact (exit 1 if any is damaged)
 diskrescue map MAPFILE                  show the progress map of an image
 ```
 
@@ -64,7 +64,14 @@ type; override it with `--profile`:
 
 Useful options: `--timeout SECS`, `--block-size SIZE`, `--retries N`,
 `--no-trim`, `--no-scrape`, `--reverse`, `--start OFFSET --size LEN` (image
-part of a device), `--no-tui` (plain progress lines), `--json-progress`.
+part of a device), `--no-tui` (plain progress lines), `--json-progress`,
+`--map MAPFILE` (keep the progress map elsewhere).
+
+DiskRescue records which device it was copying (serial number, model, size,
+first sector) next to the mapfile. Resuming onto a different device is
+refused, so a second card plugged into the same reader can never be mixed
+into the image. It also refuses to overwrite an existing image that has no
+mapfile. `--force` overrides both, when you are sure.
 
 In the full-screen view, `q` stops and saves (resume later), `p` pauses.
 
@@ -87,6 +94,10 @@ What to recover: `--photos`, `--videos`, `--raw`, `--audio`, `--all-files`
 Carving: `--carve auto` (default: free space plus anything the filesystem
 does not cover, or everything when no filesystem is readable), `free`,
 `all`, `off`.
+
+Other options: `--map MAPFILE` (the mapfile of an image made elsewhere, for
+example by GNU ddrescue; `IMAGE.map` is found automatically), `-j N` (worker
+threads), `--json` (one JSON event per line, for scripts and front-ends).
 
 Repair: on by default. `--donor FILE` adds a healthy file from the same
 camera or phone as a reference (several allowed); `--no-repair` turns it off;
