@@ -354,10 +354,72 @@ pub fn discover(
                 rec.error =
                     Some("filesystem recognised but not supported; its space will be carved".into())
             }
+            None if crate::fsopen::is_fat_partition_type(&vol.entry.type_id) => {
+                // The table says FAT/exFAT but no boot sector was recognised:
+                // try rebuilding it from the FAT copies and directories.
+                match crate::fsopen::open_fat_rebuilding(vol.source.clone()) {
+                    Ok(fs) => {
+                        let info = fs.info();
+                        rec.fs = Some(info.kind);
+                        rec.label = info.label.clone();
+                        rec.warnings.push(
+                            "boot sector missing; rebuilt from the file allocation tables".into(),
+                        );
+                        rec.warnings.extend(info.warnings.iter().cloned());
+                        let dir =
+                            OutputTree::volume_dir(index, Some(info.kind), rec.label.as_deref());
+                        parsed.push(ParsedVolume {
+                            index,
+                            start: vol.entry.start,
+                            size: vol.entry.size,
+                            dir,
+                            fs,
+                        });
+                    }
+                    Err(_) => {
+                        rec.error =
+                            Some("no filesystem recognised; its space will be carved".into())
+                    }
+                }
+            }
             None => rec.error = Some("no filesystem recognised; its space will be carved".into()),
         }
         obs.event(Event::Volume(rec.clone()));
         records.push(rec);
+    }
+    // A card or stick without a partition table whose boot sector is
+    // destroyed: try a FAT rebuild over the whole source.
+    if parsed.is_empty() && found_ntfs.is_empty() && scan_lost && !cancel.load(Ordering::Relaxed) {
+        if let Ok(fs) = crate::fsopen::open_fat_rebuilding(src.clone()) {
+            let info = fs.info();
+            let index = records.len() as u32 + 1;
+            let size = info.total_size.min(src.size());
+            let mut rec = VolumeRecord {
+                index,
+                start: 0,
+                size,
+                fs: Some(info.kind),
+                label: info.label.clone(),
+                origin: "fat-rebuild".into(),
+                files_listed: 0,
+                deleted_listed: 0,
+                warnings: vec![
+                    "boot sector missing; rebuilt from the file allocation tables".into(),
+                ],
+                error: None,
+            };
+            rec.warnings.extend(info.warnings.iter().cloned());
+            let dir = OutputTree::volume_dir(index, Some(info.kind), rec.label.as_deref());
+            obs.event(Event::Volume(rec.clone()));
+            records.push(rec);
+            parsed.push(ParsedVolume {
+                index,
+                start: 0,
+                size,
+                dir,
+                fs,
+            });
+        }
     }
     for found in found_ntfs {
         let range = Range::with_len(
@@ -772,6 +834,13 @@ fn extract_fs_entry(ctx: &Ctx<'_>, pv: &ParsedVolume, c: &Candidate) -> FileReco
                 rec.output = None;
             }
         }
+    }
+    if e.flags.iter().any(|f| f.starts_with("valid_data_length=")) {
+        rec.notes.push(
+            "the file's recorded valid length is shorter than its size (typical when a camera lost power while \
+             recording); the rest was read as found on the card"
+                .into(),
+        );
     }
     if e.confidence == EntryConfidence::DeletedGuessed {
         rec.notes
