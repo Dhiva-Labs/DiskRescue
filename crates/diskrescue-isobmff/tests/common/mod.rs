@@ -151,6 +151,119 @@ fn recipe(name: &str) -> Option<(Vec<&'static str>, &'static str)> {
             a.extend(AAC);
             "mp4"
         }
+        // Phone-like recordings (stereo AAC, open GOP, two audio tracks,
+        // variable frame rate, a text track interleaved, long PCM); each
+        // has a `_ref` twin with other content and the same settings.
+        n if n.starts_with("hevc_open") => {
+            let r = n.ends_with("_ref");
+            a.extend(if r { V_REF } else { V });
+            a.extend(if r { A_REF } else { A });
+            a.extend([
+                "-t",
+                "3",
+                "-c:v",
+                "libx265",
+                "-preset",
+                "ultrafast",
+                "-x265-params",
+                "keyint=30:min-keyint=30:bframes=3:open-gop=1:log-level=none",
+                "-tag:v",
+                "hvc1",
+                "-pix_fmt",
+                "yuv420p",
+                "-c:a",
+                "aac",
+                "-ac",
+                "2",
+            ]);
+            "mp4"
+        }
+        n if n.starts_with("two_aac") => {
+            let r = n.ends_with("_ref");
+            a.extend(if r { V_REF } else { V });
+            a.extend(if r { A_REF } else { A });
+            a.extend([
+                "-f",
+                "lavfi",
+                "-i",
+                if r {
+                    "sine=frequency=350:sample_rate=48000"
+                } else {
+                    "sine=frequency=300:sample_rate=48000"
+                },
+                "-t",
+                "3",
+                "-map",
+                "0:v",
+                "-map",
+                "1:a",
+                "-map",
+                "2:a",
+            ]);
+            a.extend(H264);
+            a.extend(["-c:a", "aac", "-ac:a:0", "2"]);
+            a.extend(["-ac:a:1", if n.contains("mono") { "1" } else { "2" }]);
+            "mp4"
+        }
+        n if n.starts_with("vfr_hevc") => {
+            let r = n.ends_with("_ref");
+            a.extend(if r { V_REF } else { V });
+            a.extend(if r { A_REF } else { A });
+            a.extend([
+                "-t",
+                "4",
+                "-vf",
+                "select='not(eq(mod(n\\,5)\\,2))'",
+                "-fps_mode",
+                "vfr",
+            ]);
+            a.extend(H265);
+            a.extend(AAC);
+            "mov"
+        }
+        n if n.starts_with("subs") => {
+            let r = n.ends_with("_ref");
+            a.extend(if r { V_REF } else { V });
+            a.extend(if r { A_REF } else { A });
+            a.extend([
+                "-i", "SUBS", "-t", "3", "-map", "0:v", "-map", "1:a", "-map", "2:s",
+            ]);
+            a.extend(H264);
+            a.extend(AAC);
+            a.extend(["-c:s", "mov_text"]);
+            "mp4"
+        }
+        n if n.starts_with("long_pcm") => {
+            let r = n.ends_with("_ref");
+            a.extend([
+                "-f",
+                "lavfi",
+                "-i",
+                if r {
+                    "testsrc=size=64x64:rate=2"
+                } else {
+                    "testsrc2=size=64x64:rate=2"
+                },
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=frequency=440:sample_rate=48000",
+                "-t",
+                "25",
+                "-c:v",
+                "libx264",
+                "-pix_fmt",
+                "yuv420p",
+                "-c:a",
+                "pcm_u8",
+                "-f",
+                "mov",
+            ]);
+            if n.contains("_fs") {
+                a.extend(["-movflags", "+faststart"]);
+            }
+            "mov"
+        }
         "h264_annexb" => {
             a.extend(V);
             a.extend(["-t", "1"]);
@@ -180,6 +293,25 @@ pub fn fixture(name: &str) -> PathBuf {
     }
     let (args, ext) = recipe(name).unwrap_or_else(|| panic!("unknown fixture {name}"));
     let path = workdir().join(format!("{name}.{ext}"));
+    let subs = workdir().join("subs.srt");
+    if args.contains(&"SUBS") && !subs.exists() {
+        let mut srt = String::new();
+        for i in 0..6 {
+            srt.push_str(&format!(
+                "{}\n00:00:0{},000 --> 00:00:0{},400\nline {}\n\n",
+                i + 1,
+                i / 2,
+                i / 2,
+                i
+            ));
+        }
+        std::fs::write(&subs, srt).expect("write srt");
+    }
+    let subs_s = subs.to_string_lossy().into_owned();
+    let args: Vec<&str> = args
+        .iter()
+        .map(|a| if *a == "SUBS" { subs_s.as_str() } else { a })
+        .collect();
     let out = Command::new("ffmpeg")
         .args(["-hide_banner", "-v", "error", "-y"])
         .args(&args)
@@ -384,6 +516,86 @@ pub fn packets(path: &Path, sel: &str) -> Vec<Packet> {
             key: p["flags"].as_str().unwrap_or("").starts_with('K'),
         })
         .collect()
+}
+
+/// Packets of the first video and first audio stream matched by content
+/// between `original` and `rebuilt` (ffprobe MD5 data hashes): per video
+/// packet, (shift of its presentation time) - (shift of the audio packet
+/// nearest in the original). Returns (largest absolute error, median
+/// absolute error, matched video packets, matched audio packets).
+pub fn av_sync_error(original: &Path, rebuilt: &Path) -> (f64, f64, usize, usize) {
+    type Hashed = Vec<(String, f64)>;
+    fn hashed(p: &Path) -> (Hashed, Hashed) {
+        let j = ffprobe_json(
+            p,
+            &[
+                "-show_data_hash",
+                "MD5",
+                "-show_entries",
+                "packet=stream_index,pts_time,data_hash:stream=index,codec_type",
+            ],
+        );
+        let streams = j["streams"].as_array().cloned().unwrap_or_default();
+        let first = |k: &str| {
+            streams
+                .iter()
+                .find(|s| s["codec_type"] == k)
+                .and_then(|s| s["index"].as_i64())
+        };
+        let (vi, ai) = (first("video"), first("audio"));
+        let (mut v, mut a) = (Vec::new(), Vec::new());
+        for pk in j["packets"].as_array().cloned().unwrap_or_default() {
+            let idx = pk["stream_index"].as_i64();
+            let h = pk["data_hash"].as_str().unwrap_or("").to_string();
+            let t: f64 = pk["pts_time"]
+                .as_str()
+                .and_then(|x| x.parse().ok())
+                .unwrap_or(f64::NAN);
+            if idx == vi {
+                v.push((h, t));
+            } else if idx == ai {
+                a.push((h, t));
+            }
+        }
+        (v, a)
+    }
+    fn shifts(o: &[(String, f64)], r: &[(String, f64)]) -> Vec<(f64, f64)> {
+        let mut map: HashMap<&str, Vec<f64>> = HashMap::new();
+        for (h, t) in o {
+            map.entry(h.as_str()).or_default().push(*t);
+        }
+        for v in map.values_mut() {
+            v.reverse();
+        }
+        let mut out: Vec<(f64, f64)> = r
+            .iter()
+            .filter_map(|(h, t)| {
+                let ot = map.get_mut(h.as_str())?.pop()?;
+                Some((ot, t - ot))
+            })
+            .collect();
+        out.sort_by(|x, y| x.0.total_cmp(&y.0));
+        out
+    }
+    let (ov, oa) = hashed(original);
+    let (rv, ra) = hashed(rebuilt);
+    let v = shifts(&ov, &rv);
+    let a = shifts(&oa, &ra);
+    let mut errs: Vec<f64> = Vec::new();
+    if !a.is_empty() {
+        for (ot, dv) in &v {
+            let near = a
+                .iter()
+                .min_by(|x, y| (x.0 - ot).abs().total_cmp(&(y.0 - ot).abs()))
+                .map(|x| x.1)
+                .unwrap_or(0.0);
+            errs.push((dv - near).abs());
+        }
+    }
+    errs.sort_by(|x, y| x.total_cmp(y));
+    let worst = errs.last().copied().unwrap_or(0.0);
+    let median = errs.get(errs.len() / 2).copied().unwrap_or(0.0);
+    (worst, median, v.len(), a.len())
 }
 
 /// Presentation times of decoded video frames, in output order.

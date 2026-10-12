@@ -427,7 +427,24 @@ fn template_for(trak: &Trak, notes: &mut Vec<String>) -> Option<TrackTemplate> {
         }
         _ => return None,
     };
-    let samples = sample_table(trak).ok()?;
+    // Constant-size tracks (PCM) are not listed sample by sample: every
+    // audio frame is a sample.
+    let (sizes, first_cts) = match trak.stsz {
+        boxes::SampleSizes::Constant { size, .. } => (
+            SizeStats {
+                min: size,
+                max: size,
+                median: size,
+                p99: size,
+            },
+            0,
+        ),
+        _ => {
+            let samples = sample_table(trak).ok()?;
+            let first = samples.first().map_or(0, |s| s.cts_offset);
+            (size_stats(samples.iter().map(|s| s.size).collect()), first)
+        }
+    };
     let sample_delta = mode_of(trak.stts.iter().map(|&(n, d)| (d, n as u64)));
     let distinct: std::collections::BTreeSet<u32> = trak
         .stts
@@ -435,9 +452,10 @@ fn template_for(trak: &Trak, notes: &mut Vec<String>) -> Option<TrackTemplate> {
         .take(trak.stts.len().saturating_sub(1).max(1))
         .map(|e| e.1)
         .collect();
-    let reorder_delay = match (samples.first(), sample_delta) {
-        (Some(s), d) if d > 0 && s.cts_offset > 0 => (s.cts_offset as u32) / d,
-        _ => 0,
+    let reorder_delay = if sample_delta > 0 && first_cts > 0 {
+        first_cts as u32 / sample_delta
+    } else {
+        0
     };
     let edit_media_time = trak
         .elst
@@ -448,7 +466,7 @@ fn template_for(trak: &Trak, notes: &mut Vec<String>) -> Option<TrackTemplate> {
         trak: trak.clone(),
         codec,
         sample_delta: sample_delta.max(1),
-        sizes: size_stats(samples.iter().map(|s| s.size).collect()),
+        sizes,
         chunk: chunk_stats(trak),
         reorder_delay,
         variable_rate: distinct.len() > 1,
@@ -637,26 +655,29 @@ impl<'a> Window<'a> {
 /// caught this way; a few trailing zeros (left by some Annex B to
 /// length-prefix converters) are tolerated.
 pub(crate) fn nal_bytes_damaged(b: &[u8]) -> bool {
+    nal_damage_offset(b).is_some()
+}
+
+/// Where [`nal_bytes_damaged`] finds damage: the offset of the first
+/// forbidden three-byte sequence, or of the over-long trailing zero run.
+pub(crate) fn nal_damage_offset(b: &[u8]) -> Option<usize> {
     let end = b.iter().rposition(|&x| x != 0).map_or(0, |i| i + 1);
-    if b.len() - end > 32 {
-        return true;
-    }
     let body = &b[..end];
     let mut i = 0usize;
     while i + 2 < body.len() {
         match body[i..].iter().position(|&x| x == 0) {
-            None => return false,
+            None => break,
             Some(k) => i += k,
         }
         if i + 2 >= body.len() {
-            return false;
+            break;
         }
         if body[i + 1] == 0 && body[i + 2] <= 2 {
-            return true;
+            return Some(i);
         }
         i += 1;
     }
-    false
+    (b.len() - end > 32).then_some(end)
 }
 
 fn be_uint(b: &[u8]) -> u64 {
@@ -1486,6 +1507,9 @@ struct Scanner<'a> {
     /// Data was skipped since the last video sample (the next one may
     /// follow lost pictures).
     video_gap: bool,
+    /// A video sample the PCM placement ended at: accept it there even
+    /// when nothing confirms it (the bytes before it were taken as audio).
+    pending_video: Option<u64>,
     unclassified: Vec<Range>,
     run: Option<(Track, u32)>,
     /// Audio track of the current run of audio samples and its length.
@@ -1937,6 +1961,7 @@ pub fn rebuild_to_splice(
         epoch: 0,
         gap_pending: false,
         video_gap: false,
+        pending_video: None,
         unclassified: Vec::new(),
         run: None,
         lane_run: None,
@@ -1992,6 +2017,15 @@ pub fn rebuild_to_splice(
             if frames > 0 && frames.saturating_mul(adur) >= m {
                 notes.push("stopped at the duration limit".into());
                 break;
+            }
+        }
+        if sc.pending_video.take() == Some(pos) {
+            if let Some(v) = sc.video_at(pos) {
+                if let Some(us) = unclassified_run_start.take() {
+                    sc.unclassified.push(Range::new(us, pos));
+                }
+                pos += sc.accept(pos, Pick::Video(v));
+                continue;
             }
         }
         if let Some(pick) = sc.classify(pos) {
@@ -2050,6 +2084,9 @@ pub fn rebuild_to_splice(
                     // which reads as silence).
                     sc.gap_pending = !continuous;
                     sc.video_gap |= !continuous;
+                    if n < end {
+                        sc.pending_video = Some(n);
+                    }
                     if pos + len < n {
                         sc.unclassified.push(Range::new(pos + len, n));
                     }

@@ -169,7 +169,7 @@ fn cr3_meta(src: &dyn Source, start: u64, w: &Cr3Walk) -> (MediaMeta, Vec<Nested
     let mut nested = Vec::new();
     meta.extra.insert("extension".into(), "cr3".into());
     let rel = |off: u64, len: u64| -> Option<Range> {
-        (off >= start && off - start + len <= w.len && len > 0)
+        (off >= start && (off - start).saturating_add(len) <= w.len && len > 0)
             .then(|| Range::with_len(off - start, len))
     };
     if let Some(m) = &w.moov {
@@ -295,7 +295,7 @@ impl FileFormat for Cr3Format {
     }
 
     fn may_contain(&self, inner: &str) -> bool {
-        inner == "jpeg"
+        matches!(inner, "jpeg" | "tiff")
     }
 
     fn measure(&self, src: &SharedSource, start: u64, limit: u64) -> Result<Option<Measured>> {

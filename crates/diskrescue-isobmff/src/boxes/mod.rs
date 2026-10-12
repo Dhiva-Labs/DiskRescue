@@ -34,7 +34,10 @@ mod table;
 
 pub use meta::{parse_ilst_cover, CoverArt, MetaInfo};
 pub use moov::*;
-pub use table::{sample_table, sample_table_checked, Sample, TableCheck, MAX_SAMPLES};
+pub use table::{
+    chunk_runs, sample_table, sample_table_checked, track_extent, ChunkRun, Sample, TableCheck,
+    MAX_SAMPLES,
+};
 
 /// Maximum nesting depth followed by any recursive walk.
 pub const MAX_DEPTH: usize = 32;

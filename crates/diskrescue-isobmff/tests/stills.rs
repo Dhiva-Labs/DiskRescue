@@ -57,7 +57,16 @@ fn heic(mdat_size_zero: bool) -> Vec<u8> {
         ));
         e
     };
-    let image = noise(3000, 42);
+    // A length-prefixed IDR slice NAL unit (measure checks that item data
+    // looks like its type); the payload avoids the zero runs no encoder
+    // writes inside a NAL unit.
+    let image = {
+        let body: Vec<u8> = noise(2994, 42).into_iter().map(|b| b.max(1)).collect();
+        let mut v = ((body.len() + 2) as u32).to_be_bytes().to_vec();
+        v.extend_from_slice(&[19 << 1, 0x01]);
+        v.extend(body);
+        v
+    };
     let thumb = jpeg(64, 48, "heic_thumb");
     let build_meta = |offs: [u32; 3]| -> Vec<u8> {
         let mut b = BoxBuf::new();

@@ -15,6 +15,11 @@ use super::Trak;
 /// Upper bound on the samples a single table may describe.
 pub const MAX_SAMPLES: u64 = 50_000_000;
 
+/// Largest constant-size track (`stsz` with one size for all samples)
+/// that [`sample_table`] lists sample by sample; longer ones (PCM audio)
+/// go through [`chunk_runs`].
+pub const MAX_CONSTANT_LISTED: u64 = 1 << 20;
+
 /// One sample of a track.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Sample {
@@ -73,6 +78,14 @@ pub fn sample_table_checked(trak: &Trak) -> Result<(Vec<Sample>, TableCheck)> {
         return Err(Error::corrupt(
             "stsz box",
             format!("{declared} samples exceeds the {MAX_SAMPLES} limit"),
+        ));
+    }
+    if matches!(trak.stsz, super::SampleSizes::Constant { .. }) && declared > MAX_CONSTANT_LISTED {
+        // A few bytes of stsz can declare millions of equal-size samples
+        // (uncompressed PCM has one per audio frame): use chunk_runs.
+        return Err(Error::corrupt(
+            "stsz box",
+            format!("{declared} constant-size samples: too many to list one by one"),
         ));
     }
     let mut check = TableCheck {
@@ -205,6 +218,75 @@ pub fn sample_table_checked(trak: &Trak) -> Result<(Vec<Sample>, TableCheck)> {
             .push("chunk offsets are not monotone".to_string());
     }
     Ok((out, check))
+}
+
+/// One chunk of a track, without its samples expanded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChunkRun {
+    /// Absolute file offset of the chunk.
+    pub offset: u64,
+    /// Index (0-based) of its first sample.
+    pub first_sample: u64,
+    /// Samples in the chunk (clipped to the declared sample count).
+    pub samples: u32,
+}
+
+/// The chunks of a track (`stsc` x `stco`) without expanding the samples,
+/// for tracks whose samples are too many to list (uncompressed PCM, where
+/// every audio frame is a sample: an hour at 48 kHz is 173 million).
+/// Chunks after the declared sample count is reached are not listed.
+pub fn chunk_runs(trak: &Trak) -> Result<Vec<ChunkRun>> {
+    let declared = trak.stsz.count() as u64;
+    let mut prev_first = 0u32;
+    for (i, &(first, _, _)) in trak.stsc.iter().enumerate() {
+        if first == 0 || first <= prev_first {
+            return Err(Error::corrupt(
+                "stsc box",
+                format!("entry {i} first_chunk {first} not increasing"),
+            ));
+        }
+        prev_first = first;
+    }
+    let mut out = Vec::with_capacity(trak.stco.len().min(1 << 20));
+    let mut stsc_i = 0usize;
+    let mut n = 0u64;
+    for (c, &off) in trak.stco.iter().enumerate() {
+        if n >= declared {
+            break;
+        }
+        let chunk_no = c as u32 + 1;
+        while stsc_i + 1 < trak.stsc.len() && trak.stsc[stsc_i + 1].0 <= chunk_no {
+            stsc_i += 1;
+        }
+        let Some(&(first, spc, _)) = trak.stsc.get(stsc_i) else {
+            break;
+        };
+        if first > chunk_no {
+            continue;
+        }
+        let k = (spc as u64).min(declared - n) as u32;
+        out.push(ChunkRun {
+            offset: off,
+            first_sample: n,
+            samples: k,
+        });
+        n += k as u64;
+    }
+    Ok(out)
+}
+
+/// End (absolute) of the last byte any sample of `trak` occupies, without
+/// listing more than [`MAX_SAMPLES`] samples: constant-size tracks are
+/// measured chunk by chunk. `None` when the tables are unusable.
+pub fn track_extent(trak: &Trak) -> Option<u64> {
+    match trak.stsz {
+        super::SampleSizes::Constant { size, .. } => chunk_runs(trak)
+            .ok()?
+            .iter()
+            .map(|c| c.offset.saturating_add(c.samples as u64 * size as u64))
+            .max(),
+        _ => sample_table(trak).ok()?.iter().map(Sample::end).max(),
+    }
 }
 
 #[cfg(test)]

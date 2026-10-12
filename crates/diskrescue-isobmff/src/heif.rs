@@ -118,6 +118,10 @@ fn parse_iloc(p: &[u8], out: &mut BTreeMap<u32, Item>, problems: &mut Vec<String
         (u32be(p, 6), 10usize)
     };
     let count = count.unwrap_or(0).min(65_536);
+    // Extents with all field sizes 0 take no bytes: without a bound a
+    // tiny box could declare 65 536 items x 65 535 extents.
+    let empty_extents = off_size + len_size + idx_size == 0;
+    let mut total_extents = 0usize;
     for _ in 0..count {
         let (id, np) = if version < 2 {
             (u16be(p, pos).map(u32::from), pos + 2)
@@ -141,6 +145,16 @@ fn parse_iloc(p: &[u8], out: &mut BTreeMap<u32, Item>, problems: &mut Vec<String
             break;
         };
         pos += 2;
+        let ext_count = if empty_extents {
+            ext_count.min(1)
+        } else {
+            ext_count
+        };
+        total_extents += ext_count as usize;
+        if total_extents > 1 << 20 {
+            problems.push("iloc declares too many extents".into());
+            return;
+        }
         let mut extents = Vec::new();
         for _ in 0..ext_count {
             pos += idx_size;
@@ -403,11 +417,143 @@ fn walk_heif(src: &dyn Source, start: u64, limit: u64) -> Result<Option<HeifWalk
             w.notes.push(p.clone());
         }
     }
+    // The item locations may point at data that is not there (the file
+    // was cut and other data follows): item data must look like its type.
+    if w.status == ExtentStatus::Complete {
+        if let Some(m) = &w.meta {
+            if let Some(bad) = implausible_item(src, m, start, end) {
+                if bad > start && bad < end {
+                    w.notes.push(format!(
+                        "item data from offset {} on does not match the item types: file cut",
+                        bad - start
+                    ));
+                    end = bad;
+                    w.status = ExtentStatus::Truncated;
+                    w.err_offset = Some(bad - start);
+                }
+            }
+        }
+    }
     w.len = end - start;
     if w.len == 0 {
         return Ok(None);
     }
     Ok(Some(w))
+}
+
+/// Where the data of one item extent stops looking like its item type:
+/// `None` when the type gives nothing to check, `Some(None)` when it looks
+/// right, `Some(Some(rel))` when it fails at `rel` bytes into the extent
+/// (0: already the first bytes). HEVC items are walked NAL unit by NAL
+/// unit (lengths must tile the extent; no damaged bytes inside, see
+/// [`crate::rebuild::nal_bytes_damaged`]); JPEG items must start with SOI
+/// and end with EOI.
+fn item_extent_check(kind: &[u8; 4], data: &[u8]) -> Option<Option<u64>> {
+    match kind {
+        b"hvc1" | b"hev1" | b"hvt1" => {
+            // 4-byte NAL lengths (hvcC allows 2 and 1, but writers use 4;
+            // shorter lengths match random bytes too easily).
+            let mut best: Option<u64> = Some(0);
+            for l in [4usize] {
+                let mut p = 0usize;
+                let fail = loop {
+                    if p == data.len() {
+                        break None;
+                    }
+                    let Some(len) = data.get(p..p + l) else {
+                        break Some(p as u64);
+                    };
+                    let n = len.iter().fold(0usize, |a, &b| (a << 8) | b as usize);
+                    let Some(nal) = data.get(p + l..p + l + n).filter(|x| x.len() >= 2) else {
+                        break Some(p as u64);
+                    };
+                    let ok = crate::hevc::parse_nal_header(nal)
+                        .is_some_and(|h| h.nal_type <= 40 && !(22..=31).contains(&h.nal_type));
+                    if !ok {
+                        break Some(p as u64);
+                    }
+                    // Damage inside a NAL unit whose header is fine: the
+                    // data stops being this item there.
+                    if let Some(at) = crate::rebuild::nal_damage_offset(nal) {
+                        break Some((p + l + at.max(1)) as u64);
+                    }
+                    p += l + n;
+                };
+                match fail {
+                    None => return Some(None),
+                    Some(f) => best = best.max(Some(f)),
+                }
+            }
+            Some(best)
+        }
+        b"av01" => data.first().map(|&b| {
+            let obu_type = (b >> 3) & 0xF;
+            (b & 0x80 != 0 || b & 1 != 0 || !(1..=8).contains(&obu_type)).then_some(0)
+        }),
+        b"jpeg" => {
+            if !data.starts_with(&[0xFF, 0xD8, 0xFF]) {
+                return Some(Some(0));
+            }
+            let tail = &data[data.len().saturating_sub(32)..];
+            let eoi = tail.windows(2).any(|w| w == [0xFF, 0xD9]);
+            Some((!eoi).then_some(2))
+        }
+        b"Exif" => {
+            let skip = u32be(data, 0)? as usize;
+            let tiff = data.get(4 + skip..4 + skip + 4)?;
+            Some((tiff != b"II*\0" && tiff != b"MM\0*").then_some(0))
+        }
+        _ => None,
+    }
+}
+
+/// The absolute offset where item data stops looking like its item type
+/// (the file was cut there and other data follows). Extents are checked
+/// in file order, whole when at most 16 MiB (64 MiB in all). A failure at
+/// the very start of an extent counts only after an earlier extent looked
+/// right (otherwise the check may simply not fit the writer). `None` when
+/// everything checked looks fine or nothing could be checked.
+fn implausible_item(src: &dyn Source, m: &HeifMeta, start: u64, end: u64) -> Option<u64> {
+    let mut extents: Vec<(u64, u64, [u8; 4])> = m
+        .items
+        .iter()
+        .filter(|i| i.construction_method == 0)
+        .flat_map(|i| i.extents.iter().map(move |&(o, l)| (o, l, i.kind)))
+        .filter_map(|(o, l, k)| {
+            let a = start.checked_add(o)?;
+            (a < end).then_some((a, l.min(end - a), k))
+        })
+        .collect();
+    extents.sort_unstable();
+    let mut seen_good = false;
+    let mut budget: u64 = 64 << 20;
+    for (abs, len, kind) in extents.into_iter().take(4096) {
+        let want = if len == 0 || len > 16 << 20 || len > budget {
+            64
+        } else {
+            len
+        };
+        budget = budget.saturating_sub(want);
+        let data = src.read_vec(abs, want as usize).unwrap_or_default();
+        let whole = want == len;
+        let verdict = if whole {
+            item_extent_check(&kind, &data)
+        } else {
+            // Only the start was read: a failure past it means nothing.
+            item_extent_check(&kind, &data).map(|v| v.filter(|&r| r == 0))
+        };
+        match verdict {
+            Some(None) => seen_good = true,
+            Some(Some(0)) => {
+                if seen_good {
+                    return Some(abs);
+                }
+            }
+            Some(Some(rel)) => return Some(abs + rel),
+            None => {}
+        }
+    }
+    None
 }
 
 fn heif_meta(src: &dyn Source, start: u64, w: &HeifWalk) -> (MediaMeta, Vec<Nested>) {
@@ -442,8 +588,9 @@ fn heif_meta(src: &dyn Source, start: u64, w: &HeifWalk) -> (MediaMeta, Vec<Nest
             continue;
         }
         let (off, len) = item.extents[0];
-        if &item.kind == b"Exif" && (8..=1 << 20).contains(&len) && off + len <= w.len {
-            if let Ok(b) = src.read_vec(start + off, len as usize) {
+        if &item.kind == b"Exif" && (8..=1 << 20).contains(&len) && off.saturating_add(len) <= w.len
+        {
+            if let Ok(b) = src.read_vec(start.saturating_add(off), len as usize) {
                 let skip = u32be(&b, 0).unwrap_or(0) as usize;
                 if let Some(t) = b.get(4 + skip..).and_then(tiff::parse_tiff) {
                     meta.make = t.make.clone();
@@ -454,7 +601,7 @@ fn heif_meta(src: &dyn Source, start: u64, w: &HeifWalk) -> (MediaMeta, Vec<Nest
                 }
             }
         }
-        if &item.kind == b"jpeg" && off + len <= w.len && len > 0 {
+        if &item.kind == b"jpeg" && off.saturating_add(len) <= w.len && len > 0 {
             let role = if Some(item.id) == m.primary {
                 NestedRole::Preview
             } else {
@@ -509,7 +656,7 @@ impl FileFormat for HeifFormat {
     }
 
     fn may_contain(&self, inner: &str) -> bool {
-        inner == "jpeg"
+        matches!(inner, "jpeg" | "tiff")
     }
 
     fn measure(&self, src: &SharedSource, start: u64, limit: u64) -> Result<Option<Measured>> {
@@ -570,7 +717,7 @@ impl FileFormat for HeifFormat {
                     .items
                     .iter()
                     .filter(|i| i.construction_method == 0 && !i.extents.is_empty())
-                    .filter(|i| i.extents.iter().all(|&(o, l)| o + l <= w.len))
+                    .filter(|i| i.extents.iter().all(|&(o, l)| o.saturating_add(l) <= w.len))
                     .count();
                 let total = m
                     .items
