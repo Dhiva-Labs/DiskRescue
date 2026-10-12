@@ -1,0 +1,21 @@
+[package]
+name = "diskrescue-tui"
+description = "Interactive terminal app for DiskRescue"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+diskrescue-core.workspace = true
+diskrescue-app.workspace = true
+ratatui.workspace = true
+crossterm.workspace = true
+log.workspace = true
+ctrlc.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+diskrescue-fixtures.workspace = true

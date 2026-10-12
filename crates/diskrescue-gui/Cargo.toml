@@ -1,0 +1,26 @@
+[package]
+name = "diskrescue-gui"
+description = "DiskRescue desktop app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+diskrescue-core.workspace = true
+diskrescue-app.workspace = true
+eframe.workspace = true
+egui.workspace = true
+egui_extras.workspace = true
+rfd.workspace = true
+log.workspace = true
+env_logger.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+diskrescue-fixtures.workspace = true
+egui_kittest.workspace = true

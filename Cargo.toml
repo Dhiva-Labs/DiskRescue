@@ -16,7 +16,10 @@ members = [
     "crates/diskrescue-carve",
     "crates/diskrescue-recover",
     "crates/diskrescue-fixtures",
+    "crates/diskrescue-app",
     "crates/diskrescue",
+    "crates/diskrescue-tui",
+    "crates/diskrescue-gui",
 ]
 
 [workspace.package]
@@ -43,6 +46,7 @@ diskrescue-video = { path = "crates/diskrescue-video" }
 diskrescue-carve = { path = "crates/diskrescue-carve" }
 diskrescue-recover = { path = "crates/diskrescue-recover" }
 diskrescue-fixtures = { path = "crates/diskrescue-fixtures" }
+diskrescue-app = { path = "crates/diskrescue-app" }
 
 thiserror = "2"
 log = "0.4"
@@ -66,6 +70,12 @@ png = "0.17"
 tempfile = "3"
 rand = "0.8"
 ctrlc = { version = "3", features = ["termination"] }
+eframe = "0.36"
+egui = "0.36"
+egui_extras = { version = "0.36", features = ["image"] }
+egui_kittest = { version = "0.36", features = ["snapshot", "wgpu"] }
+rfd = "0.17"
+crossbeam-channel = "0.5"
 windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_IO", "Win32_System_Ioctl", "Win32_Security"] }
 
 # Never set `panic = "abort"`: format validators wrap third-party decoders

@@ -1,0 +1,30 @@
+[package]
+name = "diskrescue-app"
+description = "Shared front-end layer for DiskRescue: devices, safety checks, background jobs, results"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+diskrescue-core.workspace = true
+diskrescue-device.workspace = true
+diskrescue-imaging.workspace = true
+diskrescue-partition.workspace = true
+diskrescue-recover.workspace = true
+diskrescue-jpeg.workspace = true
+diskrescue-stills.workspace = true
+diskrescue-isobmff.workspace = true
+log.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+image = { workspace = true, features = ["gif", "bmp", "webp", "tiff"] }
+
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+diskrescue-fixtures.workspace = true
