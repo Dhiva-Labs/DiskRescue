@@ -365,7 +365,8 @@ impl Results {
         }
         let side = 132.0;
         let cell_w = side + 12.0;
-        let cell_h = side + 22.0 + 12.0;
+        // Row height without the spacing (egui adds it): one tile.
+        let cell_h = side + 22.0;
         let cols = ((ui.available_width() + 12.0) / cell_w).floor().max(1.0) as usize;
         let rows = visible.len().div_ceil(cols);
         egui::ScrollArea::vertical()
@@ -765,7 +766,7 @@ impl Results {
         let mut close = false;
         let mut browse = false;
         let target_item = self.items[target].clone();
-        egui::Modal::new(egui::Id::new("donor_picker")).show(ui.ctx(), |ui| {
+        let modal = egui::Modal::new(egui::Id::new("donor_picker")).show(ui.ctx(), |ui| {
             ui.set_width(520.0);
             ui.heading("Repair with a reference file");
             ui.label(format!(
@@ -856,7 +857,7 @@ impl Results {
                 }));
             }
         }
-        if close {
+        if close || (modal.should_close() && !busy) {
             self.donor = None;
             return None;
         }
