@@ -286,10 +286,14 @@ fn card_reader_hint(input: &ClassifyInput<'_>) -> Option<Classification> {
         || product
             .split(|c: char| !c.is_ascii_alphanumeric())
             .any(|w| w == "sd");
+    // Alcor and Genesys also make pen-drive controllers ("058f:6387 Flash
+    // Disk"): a flash-drive name wins over the vendor id.
+    let flash_named = looks_like_flash_model(input.vendor, input.model)
+        || looks_like_flash_model(input.vendor, input.usb_product);
     if let Some(vid) = input.usb_vendor_id {
         let vid = vid.trim().to_ascii_lowercase();
         if let Some((_, maker)) = CARD_READER_VIDS.iter().find(|(v, _)| *v == vid) {
-            if input.removable || readerish {
+            if readerish || (input.removable && !flash_named) {
                 return Some(Classification::reader(
                     Confidence::Medium,
                     format!(
@@ -670,6 +674,17 @@ mod tests {
         b1.product_type = 0;
         i.vpd_b1 = Some(b1);
         assert!(!classify(&i).card_reader);
+        // An Alcor-controller pen drive is not a card reader.
+        let mut i = usb("Flash Disk", true, Some(true), 8 * GIB);
+        i.usb_vendor_id = Some("058f");
+        i.usb_product = Some("Mass Storage Device");
+        let c = classify(&i);
+        assert!(!c.card_reader, "{c:?}");
+        assert_eq!(c.kind, DeviceKind::UsbFlash);
+        // ...while an Alcor reader still is.
+        let mut i = usb("Mass-Storage", true, Some(true), 0);
+        i.usb_vendor_id = Some("058f");
+        assert!(classify(&i).card_reader);
     }
 
     #[test]

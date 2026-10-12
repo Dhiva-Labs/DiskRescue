@@ -671,6 +671,32 @@ enum Attempt {
     Refuse(String),
 }
 
+/// Identity of the node a path resolves to: `(st_dev, st_ino, st_rdev)`.
+#[cfg(unix)]
+fn node_id(path: &Path) -> Option<(u64, u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::metadata(path)
+        .ok()
+        .map(|m| (m.dev(), m.ino(), m.rdev()))
+}
+
+#[cfg(not(unix))]
+fn node_id(_path: &Path) -> Option<(u64, u64, u64)> {
+    None
+}
+
+/// Identity of an open handle, comparable with [`node_id`].
+#[cfg(unix)]
+fn file_node_id(file: &std::fs::File) -> Option<(u64, u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    file.metadata().ok().map(|m| (m.dev(), m.ino(), m.rdev()))
+}
+
+#[cfg(not(unix))]
+fn file_node_id(_file: &std::fs::File) -> Option<(u64, u64, u64)> {
+    None
+}
+
 fn open_error(path: &Path, e: std::io::Error) -> Error {
     if let Some(hint) = crate::privilege_hint(&e, path) {
         return Error::Io(std::io::Error::new(
@@ -726,6 +752,7 @@ impl std::fmt::Debug for DeviceSource {
 impl DeviceSource {
     /// Open with an explicit description context (sysfs roots on Linux).
     pub(crate) fn open_with_ctx(path: &Path, opts: &OpenOptions, ctx: Ctx) -> Result<Self> {
+        let node_before = node_id(path);
         let mut info = ctx.describe(path)?;
         if info.is_mounted() && !opts.allow_mounted {
             let list: Vec<String> = info
@@ -742,6 +769,15 @@ impl DeviceSource {
         }
         let opened = platform::open_for_read(path, opts.direct, opts.fallback_buffered)
             .map_err(|e| open_error(path, e))?;
+        // The description must be of the device actually opened: a
+        // `/dev/disk/by-id` link can be re-pointed by udev in between (USB
+        // re-enumeration).
+        if node_before.is_some() && node_before != file_node_id(&opened.file) {
+            return Err(Error::Other(format!(
+                "{} changed while it was being opened (the device was re-attached?); try again",
+                path.display()
+            )));
+        }
         if opened.is_block {
             if opened.size == 0 {
                 return Err(Error::NotFound(format!(

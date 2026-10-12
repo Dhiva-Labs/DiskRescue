@@ -67,6 +67,12 @@ pub fn query_with_timeout(path: &Path, timeout: Duration) -> Option<HealthInfo> 
         log::debug!("smartctl not found on PATH; no SMART data");
         return None;
     };
+    query_with_binary(&bin, path, timeout)
+}
+
+/// [`query_with_timeout`] with an explicit `smartctl` executable.
+pub fn query_with_binary(bin: &Path, path: &Path, timeout: Duration) -> Option<HealthInfo> {
+    let bin = bin.to_path_buf();
     let first = run(&bin, &["-j", "-a"], path, timeout)?;
     if let Some(h) = parse_smartctl_json(&first) {
         return Some(h);
@@ -93,35 +99,62 @@ fn run(bin: &Path, args: &[&str], dev: &Path, timeout: Duration) -> Option<Strin
         .spawn()
         .map_err(|e| log::debug!("cannot run smartctl: {e}"))
         .ok()?;
-    let mut stdout = child.stdout.take()?;
-    let reader = std::thread::spawn(move || {
-        let mut v = Vec::new();
-        let _ = (&mut stdout).take(MAX_OUTPUT).read_to_end(&mut v);
-        v
-    });
+    let Some(mut stdout) = child.stdout.take() else {
+        abandon(child);
+        return None;
+    };
+    let (tx, rx) = std::sync::mpsc::channel();
+    // Detached: it ends when the pipe closes (the process and anything it
+    // left behind exited) or the output limit is reached.
+    let _ = std::thread::Builder::new()
+        .name("dr-smartctl-out".into())
+        .spawn(move || {
+            let mut v = Vec::new();
+            let _ = (&mut stdout).take(MAX_OUTPUT).read_to_end(&mut v);
+            let _ = tx.send(v);
+        });
     let start = Instant::now();
     loop {
         match child.try_wait() {
             Ok(Some(_)) => break,
             Ok(None) if start.elapsed() < timeout => std::thread::sleep(Duration::from_millis(50)),
-            Ok(None) => {
+            Ok(None) | Err(_) => {
                 log::warn!(
                     "smartctl on {} did not finish within {:?}; killed",
                     dev.display(),
                     timeout
                 );
-                let _ = child.kill();
-                let _ = child.wait();
-                return None;
-            }
-            Err(_) => {
-                let _ = child.kill();
+                abandon(child);
                 return None;
             }
         }
     }
-    let out = reader.join().ok()?;
+    // smartctl exited; its output is complete once the pipe closes. A
+    // helper it left running could keep the pipe open: do not wait for it.
+    let out = rx.recv_timeout(OUTPUT_GRACE).ok()?;
     Some(String::from_utf8_lossy(&out).into_owned())
+}
+
+/// How long to wait for the output pipe to close after smartctl exited.
+const OUTPUT_GRACE: Duration = Duration::from_secs(2);
+
+/// Kill a smartctl that ran too long without ever blocking on it: a
+/// process stuck in uninterruptible I/O on a dying drive does not die
+/// until the kernel gives up on the command, which can take minutes. It is
+/// reaped by a background thread so no zombie is left behind.
+fn abandon(mut child: std::process::Child) {
+    let _ = child.kill();
+    for _ in 0..20 {
+        if matches!(child.try_wait(), Ok(Some(_))) {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let _ = std::thread::Builder::new()
+        .name("dr-smartctl-reap".into())
+        .spawn(move || {
+            let _ = child.wait();
+        });
 }
 
 fn exit_status(json: &str) -> Option<u64> {

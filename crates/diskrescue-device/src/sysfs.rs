@@ -1522,8 +1522,12 @@ pub(crate) fn resolve_output_path(path: &Path) -> Result<(PathBuf, PathBuf)> {
                 push_components(&mut pending, &target);
             }
             Ok(_) => cur = cand,
+            // Not there yet, below a file, or below a directory we may not
+            // search (then nothing can be created there by us either): the
+            // rest is judged by the deepest directory we could reach.
             Err(e)
                 if e.kind() == std::io::ErrorKind::NotFound
+                    || e.kind() == std::io::ErrorKind::PermissionDenied
                     || e.raw_os_error() == Some(libc::ENOTDIR) =>
             {
                 missing.push(c)
