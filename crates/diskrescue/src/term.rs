@@ -140,8 +140,15 @@ impl Paint {
     }
 }
 
-/// Terminal width in columns (80 when unknown), clamped to a sane range.
+/// Terminal width in columns, clamped to a sane range. When standard output
+/// is not a terminal (redirected to a file, piped into another program) and
+/// `COLUMNS` is not set, nothing is shortened: such output usually ends up in
+/// a file or a support request where every character matters.
 pub fn width() -> usize {
+    use std::io::IsTerminal;
+    if !std::io::stdout().is_terminal() && std::env::var_os("COLUMNS").is_none() {
+        return 400;
+    }
     let w = crossterm::terminal::size()
         .ok()
         .map(|(w, _)| w as usize)
