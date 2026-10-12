@@ -94,6 +94,49 @@ pub struct OutSample {
     pub keyframe: bool,
     /// Number of table samples this entry stands for (PCM runs), else 1.
     pub count: u32,
+    /// Bytes appended to the sample in the output (an end-of-sequence NAL
+    /// unit that makes decoders flush before a restart after lost data).
+    pub suffix: Option<NalSuffix>,
+}
+
+impl OutSample {
+    /// Bytes the sample occupies in the output.
+    pub fn stored_size(&self) -> u64 {
+        self.size as u64 + self.suffix.map_or(0, |s| s.len as u64)
+    }
+}
+
+/// A few bytes appended to a sample (see [`OutSample::suffix`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NalSuffix {
+    /// The bytes; only the first `len` are used.
+    pub bytes: [u8; 8],
+    /// Number of bytes used (at most 8).
+    pub len: u8,
+}
+
+impl NalSuffix {
+    /// A length-prefixed NAL unit (`nal_length_size` bytes of length, then
+    /// `nal`); `None` when it does not fit in 8 bytes.
+    pub fn nal(nal_length_size: usize, nal: &[u8]) -> Option<NalSuffix> {
+        let total = nal_length_size.checked_add(nal.len())?;
+        if !(1..=4).contains(&nal_length_size) || total > 8 {
+            return None;
+        }
+        let mut bytes = [0u8; 8];
+        let len = (nal.len() as u32).to_be_bytes();
+        bytes[..nal_length_size].copy_from_slice(&len[4 - nal_length_size..]);
+        bytes[nal_length_size..total].copy_from_slice(nal);
+        Some(NalSuffix {
+            bytes,
+            len: total as u8,
+        })
+    }
+
+    /// The used bytes.
+    pub fn as_slice(&self) -> &[u8] {
+        &self.bytes[..(self.len as usize).min(8)]
+    }
 }
 
 /// A track to write.
@@ -148,10 +191,18 @@ pub struct MovieOut {
 struct Layout {
     /// Per track: chunks as (relative offset in mdat payload, table samples).
     chunks: Vec<Vec<(u64, u32)>>,
-    /// Source ranges in output order: (src offset, len).
-    ranges: Vec<(u64, u64)>,
+    /// Media pieces in output order.
+    ranges: Vec<Piece>,
     /// Total mdat payload bytes.
     total: u64,
+}
+
+/// One piece of the output `mdat`.
+enum Piece {
+    /// `(offset, len)` in the source.
+    Src(u64, u64),
+    /// Bytes from memory.
+    Mem(Vec<u8>),
 }
 
 fn layout(movie: &MovieOut) -> Layout {
@@ -174,7 +225,7 @@ fn layout(movie: &MovieOut) -> Layout {
         order.sort_by_key(|&(off, t, i)| (off, t, i));
     }
     let mut chunks: Vec<Vec<(u64, u32)>> = vec![Vec::new(); movie.tracks.len()];
-    let mut ranges: Vec<(u64, u64)> = Vec::new();
+    let mut ranges: Vec<Piece> = Vec::new();
     let mut rel = 0u64;
     let mut cur: Option<usize> = None;
     let cap = movie.max_chunk_samples.max(1);
@@ -194,10 +245,13 @@ fn layout(movie: &MovieOut) -> Layout {
         }
         cur = Some(t);
         match ranges.last_mut() {
-            Some(r) if r.0 + r.1 == off => r.1 += s.size as u64,
-            _ => ranges.push((off, s.size as u64)),
+            Some(Piece::Src(o, l)) if *o + *l == off => *l += s.size as u64,
+            _ => ranges.push(Piece::Src(off, s.size as u64)),
         }
-        rel += s.size as u64;
+        if let Some(sfx) = &s.suffix {
+            ranges.push(Piece::Mem(sfx.as_slice().to_vec()));
+        }
+        rel += s.stored_size();
     }
     Layout {
         chunks,
@@ -497,7 +551,7 @@ fn write_stbl(b: &mut BoxBuf, t: &TrackOut, chunks: &[(u64, u32)], base: u64, co
             b.u32(0);
             b.u32(t.samples.len() as u32);
             for s in &t.samples {
-                b.u32(s.size);
+                b.u32(s.stored_size().min(u32::MAX as u64) as u32);
             }
         }
     }
@@ -613,8 +667,11 @@ pub fn assemble(movie: &MovieOut, src: SharedSource) -> Result<SpliceSource> {
     }
     let mut sp = SpliceSource::new(src, "rebuilt movie");
     sp.push_mem(head);
-    for (off, len) in lay.ranges {
-        sp.push_src(off, len);
+    for piece in lay.ranges {
+        match piece {
+            Piece::Src(off, len) => sp.push_src(off, len),
+            Piece::Mem(b) => sp.push_mem(b),
+        }
     }
     Ok(sp)
 }

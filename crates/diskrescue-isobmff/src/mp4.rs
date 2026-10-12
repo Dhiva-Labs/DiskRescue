@@ -141,7 +141,88 @@ pub fn parse_ftyp(head: &[u8]) -> Option<(BoxHeader, [u8; 4], Vec<[u8; 4]>)> {
 #[derive(Debug, Default, Clone, Copy)]
 pub struct Mp4Format;
 
-const SIGS: &[Signature] = &[Signature::at(b"ftyp", 4)];
+/// `ftyp` files, and QuickTime movies without `ftyp` (old cameras) whose
+/// first box is `moov`, `mdat`, `wide`, `free` or `skip`; [`Mp4Format`]'s
+/// `probe` rejects implausible hits of the latter, and their measurements
+/// get a lower confidence.
+const SIGS: &[Signature] = &[
+    Signature::at(b"ftyp", 4),
+    Signature::at(b"moov", 4),
+    Signature::at(b"mdat", 4),
+    Signature::at(b"wide", 4),
+    Signature::at(b"free", 4),
+    Signature::at(b"skip", 4),
+];
+
+/// Box types that can follow the first box of an `ftyp`-less movie.
+const QT_TOP: &[&[u8; 4]] = &[
+    b"moov", b"mdat", b"wide", b"free", b"skip", b"pnot", b"PICT",
+];
+
+/// Does a box header that is not `ftyp` start a QuickTime movie? Checked
+/// on the first bytes only: the size must be plausible and what follows
+/// the box (or, for `mdat`, its first payload bytes) must fit.
+pub fn quicktime_head_plausible(head: &[u8]) -> bool {
+    let Some(h) = parse_header(head, 0) else {
+        return false;
+    };
+    let hl = h.full_header_len() as usize;
+    match &h.kind {
+        b"moov" => {
+            // The first child is normally mvhd (108+ bytes); allow the
+            // other children QuickTime writers put first.
+            let Some(c) = head.get(hl..).and_then(|b| parse_header(b, hl as u64)) else {
+                return false;
+            };
+            h.size >= 16
+                && c.size >= 8
+                && c.size <= h.size.saturating_sub(hl as u64)
+                && matches!(
+                    &c.kind,
+                    b"mvhd" | b"prfl" | b"udta" | b"iods" | b"meta" | b"trak" | b"cmov" | b"uuid"
+                )
+                && (!c.is(b"mvhd") || c.size >= 100)
+        }
+        b"wide" => {
+            h.size == 8
+                && head
+                    .get(8..)
+                    .and_then(|b| parse_header(b, 8))
+                    .is_some_and(|m| m.is(b"mdat"))
+        }
+        b"free" | b"skip" => {
+            let size = h.size as usize;
+            size >= 8
+                && size + 8 <= head.len()
+                && head
+                    .get(size..)
+                    .and_then(|b| parse_header(b, size as u64))
+                    .is_some_and(|n| QT_TOP.contains(&&n.kind))
+        }
+        b"mdat" => {
+            if h.size != 0 && h.size < 24 {
+                return false;
+            }
+            let Some(p) = head.get(hl..hl + 8) else {
+                return false;
+            };
+            // Motion JPEG, or a 4-byte length-prefixed H.264/HEVC NAL unit.
+            if p.starts_with(&[0xFF, 0xD8, 0xFF]) {
+                return true;
+            }
+            let n = u32::from_be_bytes([p[0], p[1], p[2], p[3]]);
+            if !(2..=8 << 20).contains(&n) || p[4] & 0x80 != 0 {
+                return false;
+            }
+            let avc = matches!(p[4] & 0x1F, 1 | 5 | 6 | 7 | 9);
+            let hevc = crate::hevc::parse_nal_header(&p[4..]).is_some_and(|nh| {
+                crate::hevc::is_slice_type(nh.nal_type) || (32..=40).contains(&nh.nal_type)
+            });
+            avc || hevc
+        }
+        _ => false,
+    }
+}
 
 /// Movie metadata from a parsed `moov` (offsets of nested objects are made
 /// relative to `file_start`).
@@ -263,11 +344,10 @@ impl Mp4Format {
                 _ => return Ok(None),
             },
             None => {
-                // ftyp-less QuickTime: must start with a movie box.
-                let Some(h) = parse_header(&head, start) else {
-                    return Ok(None);
-                };
-                if !matches!(&h.kind, b"moov" | b"mdat" | b"wide" | b"free" | b"skip") {
+                // ftyp-less QuickTime: must start with a plausible movie box.
+                let probe =
+                    s.read_vec(start, (64usize << 10).min((region_end - start) as usize))?;
+                if !quicktime_head_plausible(&probe) {
                     return Ok(None);
                 }
                 confidence_cut = 20;
@@ -353,15 +433,11 @@ impl Mp4Format {
         }
         let walk_end = pos.min(region_end);
         // Real extent from the sample tables (offsets are file-relative).
-        let max_extent = moov.as_ref().and_then(|m| {
-            m.tracks
-                .iter()
-                .filter_map(|t| sample_table(t).ok())
-                .filter_map(|v| v.iter().map(|x| x.end()).max())
-                .max()
-                .map(|e| start.saturating_add(e))
-        });
         let mut notes = Vec::new();
+        let max_extent = moov
+            .as_ref()
+            .and_then(|m| tables_extent(m, &mut notes))
+            .map(|e| start.saturating_add(e));
         let mut status;
         let mut len;
         let mut err_offset = None;
@@ -388,6 +464,12 @@ impl Mp4Format {
                     std::sync::Arc::new(SubSource::new(src.clone(), start, region_end - start));
                 let rel_payload = m.payload_offset() - start;
                 let a = analyze_tail_moov(&window, rel_payload)?;
+                // The trailing moov must describe data that lies before it.
+                let a = a.filter(|(moov_end, m2)| {
+                    let mut ignored = Vec::new();
+                    tables_extent(m2, &mut ignored).is_some_and(|e| e <= *moov_end)
+                        && ignored.is_empty()
+                });
                 match a {
                     Some((moov_end, m2)) => {
                         len = moov_end;
@@ -491,6 +573,30 @@ impl Mp4Format {
             notes.push(format!("moov does not parse: {e}"));
             conf = Confidence::LOW;
         }
+        if let Some(m) = &moov {
+            if !m.problems.is_empty() {
+                notes.push(format!("moov: {}", m.problems.join("; ")));
+            }
+        }
+        // The tables may describe data that is not there (the file was cut
+        // and other data follows): the samples at the end must look like
+        // samples.
+        if status == ExtentStatus::Complete {
+            if let Some(m) = &moov {
+                if let Some(real_end) = implausible_tail(s, m, start, start + len)? {
+                    let real = real_end.saturating_sub(start);
+                    if real > 0 && real < len {
+                        notes.push(format!(
+                            "samples from offset {real} on are not media data: file cut at about {real} bytes"
+                        ));
+                        len = real;
+                        status = ExtentStatus::Truncated;
+                        err_offset = Some(real);
+                        conf = Confidence::MEDIUM;
+                    }
+                }
+            }
+        }
         if status == ExtentStatus::Complete && moov.is_some() && moov_err.is_none() {
             let ok = moov
                 .as_ref()
@@ -525,11 +631,140 @@ impl Mp4Format {
             return Ok(None);
         }
         if s.overlaps_unreadable(start, out.len) {
+            // Noted only: the carver applies its own penalty for holes.
             out.notes.push("contains unreadable sectors".into());
-            out.confidence = out.confidence.lowered(20);
         }
         Ok(Some(out))
     }
+}
+
+/// End (file-relative) of the data every track's sample tables describe.
+/// Tracks whose tables are unusable contribute their largest chunk offset
+/// (and a note), so data they point at still counts.
+fn tables_extent(m: &Moov, notes: &mut Vec<String>) -> Option<u64> {
+    let mut best: Option<u64> = None;
+    for t in &m.tracks {
+        let e = match boxes::track_extent(t) {
+            Some(e) => Some(e),
+            None => {
+                notes.push(format!(
+                    "track {}: sample tables unusable; extent from chunk offsets only",
+                    t.tkhd.track_id
+                ));
+                t.stco.iter().max().map(|o| o.saturating_add(1))
+            }
+        };
+        best = best.max(e);
+    }
+    best
+}
+
+/// Does the stored sample look like a sample of its track? `None` when
+/// the track's codec gives nothing to check (PCM, unknown codecs).
+fn sample_plausible(
+    src: &dyn Source,
+    t: &crate::boxes::Trak,
+    abs: u64,
+    size: u32,
+) -> Result<Option<bool>> {
+    let Some(e) = t.entry() else { return Ok(None) };
+    let video = e
+        .avcc
+        .as_ref()
+        .map(|c| (c.nal_length_size as usize, false))
+        .or_else(|| e.hvcc.as_ref().map(|c| (c.nal_length_size as usize, true)));
+    let aac = e
+        .esds
+        .as_ref()
+        .filter(|es| es.object_type == 0x40)
+        .and_then(|es| crate::aac::parse_audio_specific_config(&es.audio_specific_config))
+        .filter(crate::aac::walk_supported);
+    if let Some((l, hevc_codec)) = video {
+        if size == 0 {
+            return Ok(Some(false));
+        }
+        let want = (size as usize).min(4 << 20);
+        let d = match src.read_vec(abs, want) {
+            Ok(d) => d,
+            Err(_) => return Ok(Some(false)),
+        };
+        if d.len() < want {
+            return Ok(Some(false));
+        }
+        if want < size as usize {
+            // Large sample: check the first NAL header only.
+            let n = d.iter().take(l).fold(0u64, |a, &b| (a << 8) | b as u64);
+            let h = d.get(l).copied().unwrap_or(0x80);
+            return Ok(Some(n > 0 && n + l as u64 <= size as u64 && h & 0x80 == 0));
+        }
+        return Ok(Some(
+            crate::analysis::check_video_sample(&d, l, hevc_codec).0,
+        ));
+    }
+    if let Some(cfg) = aac {
+        if size > 1 << 16 {
+            return Ok(Some(false));
+        }
+        let d = match src.read_vec(abs, size as usize) {
+            Ok(d) => d,
+            Err(_) => return Ok(Some(false)),
+        };
+        return Ok(Some(crate::analysis::aac_sample_intact(
+            &d,
+            size,
+            Some(&cfg),
+        )));
+    }
+    Ok(None)
+}
+
+/// Spot-check the last samples of every checkable track (H.264/HEVC,
+/// AAC). When they do not look like samples although the first sample of
+/// the track does, binary-search the first implausible sample and return
+/// its absolute offset (the smallest over the tracks): the data was cut
+/// there. `None` when everything checked looks fine.
+fn implausible_tail(src: &dyn Source, m: &Moov, start: u64, end: u64) -> Result<Option<u64>> {
+    let mut first_bad: Option<u64> = None;
+    for t in &m.tracks {
+        let Ok(samples) = sample_table(t) else {
+            continue;
+        };
+        let inside: Vec<&crate::boxes::Sample> = samples
+            .iter()
+            .filter(|x| x.size > 0 && start.saturating_add(x.end()) <= end)
+            .collect();
+        let n = inside.len();
+        if n < 2 {
+            continue;
+        }
+        let check = |i: usize| -> Result<Option<bool>> {
+            let x = inside[i];
+            sample_plausible(src, t, start.saturating_add(x.offset), x.size)
+        };
+        let mut tail_ok = true;
+        for i in n.saturating_sub(3)..n {
+            match check(i)? {
+                None => break,
+                Some(v) => tail_ok &= v,
+            }
+        }
+        if tail_ok || check(0)? != Some(true) {
+            // Fine, or the check does not fit this track at all.
+            continue;
+        }
+        let (mut lo, mut hi) = (0usize, n - 1);
+        while hi - lo > 1 {
+            let mid = lo + (hi - lo) / 2;
+            if check(mid)? == Some(true) {
+                lo = mid;
+            } else {
+                hi = mid;
+            }
+        }
+        let bad = start.saturating_add(inside[hi].offset);
+        first_bad = Some(first_bad.map_or(bad, |b| b.min(bad)));
+    }
+    Ok(first_bad)
 }
 
 /// Look for a moov inside `window` after `from` (relative); returns the
@@ -654,12 +889,12 @@ impl FileFormat for Mp4Format {
             Some((_, major, compat)) => {
                 matches!(classify_brands(&major, &compat), BrandClass::Movie(_))
             }
-            None => false,
+            None => quicktime_head_plausible(head),
         }
     }
 
     fn may_contain(&self, inner: &str) -> bool {
-        matches!(inner, "jpeg" | "png" | "heic")
+        matches!(inner, "jpeg" | "png" | "heic" | "tiff")
     }
 
     fn measure(&self, src: &SharedSource, start: u64, limit: u64) -> Result<Option<Measured>> {

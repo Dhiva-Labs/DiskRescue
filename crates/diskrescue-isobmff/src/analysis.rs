@@ -53,8 +53,216 @@ pub struct TrackCheck {
     pub l2_checked: u32,
     /// Content checks that failed.
     pub l2_failed: u32,
+    /// Checked samples whose first bytes are zero-filled or unreadable
+    /// (holes: counted neither as passed nor as failed).
+    pub l2_holes: u32,
+    /// Samples whose content check (L3) found damage: video samples that
+    /// are not made of whole, intact NAL units, AAC frames that are all
+    /// zero, any sample overlapping a known-unreadable range. Indices
+    /// (0-based, decode order), at most [`MAX_DAMAGED_LISTED`].
+    pub damaged_samples: Vec<u32>,
+    /// Samples the L3 check looked at.
+    pub l3_checked: u64,
     /// Problems.
     pub problems: Vec<String>,
+}
+
+/// Largest number of damaged sample indices kept per track.
+pub const MAX_DAMAGED_LISTED: usize = 1 << 20;
+
+/// Bytes of sample data the validation reads for the L3 content check
+/// (larger files are checked on evenly spaced samples).
+pub const L3_BUDGET: u64 = 1 << 30;
+
+/// Largest single sample the L3 check reads.
+const L3_MAX_SAMPLE: u32 = 64 << 20;
+
+/// Content check of one stored video sample: it must be a sequence of
+/// whole length-prefixed NAL units (forbidden bit clear, no damaged bytes,
+/// see [`crate::rebuild::nal_bytes_damaged`]), with at most 16 zero bytes
+/// of padding after the last one. Returns `(intact, random_access)`;
+/// `random_access` is set when it holds an IDR (H.264) / IRAP (HEVC) NAL.
+pub fn check_video_sample(data: &[u8], l: usize, hevc_codec: bool) -> (bool, bool) {
+    if !(1..=4).contains(&l) {
+        return (false, false);
+    }
+    let mut p = 0usize;
+    let mut nals = 0u32;
+    let mut rap = false;
+    while p < data.len() {
+        let rest = &data[p..];
+        if rest.len() <= 16 && rest.iter().all(|&b| b == 0) && nals > 0 {
+            break;
+        }
+        if rest.len() < l + 1 {
+            return (false, rap);
+        }
+        let n = rest[..l].iter().fold(0usize, |a, &b| (a << 8) | b as usize);
+        if n == 0 || n > rest.len() - l {
+            return (false, rap);
+        }
+        let nal = &rest[l..l + n];
+        if nal[0] & 0x80 != 0 || crate::rebuild::nal_bytes_damaged(nal) {
+            return (false, rap);
+        }
+        if hevc_codec {
+            rap |= hevc::is_irap(hevc::nal_type(nal[0]));
+        } else {
+            rap |= h264::nal_type(nal[0]) == 5;
+        }
+        p += l + n;
+        nals += 1;
+        if nals > 100_000 {
+            return (false, rap);
+        }
+    }
+    (nals > 0, rap)
+}
+
+/// Content check of one stored AAC frame: readable, not all zero, and,
+/// when the frame walker supports the configuration, exactly one raw data
+/// block of the stored size.
+pub fn aac_sample_intact(data: &[u8], size: u32, cfg: Option<&aac::AudioSpecificConfig>) -> bool {
+    if data.len() != size as usize || (size > 0 && data.iter().all(|&b| b == 0)) {
+        return false;
+    }
+    match cfg.filter(|c| aac::walk_supported(c)) {
+        Some(c) => aac::frame_length(data, c) == Some(size as usize),
+        None => true,
+    }
+}
+
+/// L3: content check of every sample (or of evenly spaced samples within
+/// `budget` bytes): see [`TrackCheck::damaged_samples`].
+fn level3(
+    src: &dyn Source,
+    t: &crate::boxes::Trak,
+    samples: &[Sample],
+    tc: &mut TrackCheck,
+    budget: u64,
+) {
+    let Some(e) = t.entry() else { return };
+    let size = src.size();
+    let unreadable = src.unreadable();
+    let video = e
+        .avcc
+        .as_ref()
+        .map(|c| (c.nal_length_size as usize, false))
+        .or_else(|| e.hvcc.as_ref().map(|c| (c.nal_length_size as usize, true)));
+    let aac = e.esds.as_ref().is_some_and(|es| es.object_type == 0x40);
+    let aac_cfg = e
+        .esds
+        .as_ref()
+        .and_then(|es| aac::parse_audio_specific_config(&es.audio_specific_config));
+    let total: u64 = samples
+        .iter()
+        .filter(|s| s.end() <= size)
+        .map(|s| s.size as u64)
+        .sum();
+    let step = if total > budget {
+        (total / budget.max(1)).saturating_add(1) as usize
+    } else {
+        1
+    };
+    for s in samples.iter().step_by(step.max(1)) {
+        if s.end() > size {
+            break;
+        }
+        tc.l3_checked += 1;
+        let holed = unreadable.as_ref().is_some_and(|u| {
+            u.intersects(diskrescue_core::Range::with_len(s.offset, s.size as u64))
+        });
+        let damaged = if holed {
+            true
+        } else if let Some((l, hevc_codec)) = video {
+            if s.size > L3_MAX_SAMPLE {
+                false
+            } else {
+                match src.read_vec(s.offset, s.size as usize) {
+                    Ok(d) if d.len() == s.size as usize => !check_video_sample(&d, l, hevc_codec).0,
+                    _ => true,
+                }
+            }
+        } else if aac && s.size <= 1 << 16 {
+            match src.read_vec(s.offset, s.size as usize) {
+                Ok(d) => !aac_sample_intact(&d, s.size, aac_cfg.as_ref()),
+                _ => true,
+            }
+        } else {
+            false
+        };
+        if damaged && tc.damaged_samples.len() < MAX_DAMAGED_LISTED {
+            tc.damaged_samples.push(s.index);
+        }
+    }
+    // When most samples fail, the check does not fit how this file was
+    // written (or the index is stale, which L2 reports): do not call every
+    // sample damaged, which would make a repair drop them.
+    let n = tc.damaged_samples.len() as u64;
+    if n > 8 && n * 2 > tc.l3_checked && unreadable.is_none() {
+        tc.damaged_samples.clear();
+        tc.problems.push(format!(
+            "content check inconclusive: {n} of {} samples are not whole NAL units / frames",
+            tc.l3_checked
+        ));
+    }
+}
+
+/// L1 checks of a constant-size track (uncompressed PCM) chunk by chunk,
+/// for tracks with more samples than [`boxes::MAX_SAMPLES`] (every PCM
+/// frame is a sample). Returns false when the tables are unusable.
+fn constant_size_check(src: &dyn Source, t: &crate::boxes::Trak, tc: &mut TrackCheck) -> bool {
+    let crate::boxes::SampleSizes::Constant { size: sz, count } = t.stsz else {
+        return false;
+    };
+    let Ok(chunks) = boxes::chunk_runs(t) else {
+        return false;
+    };
+    let size = src.size();
+    let unreadable = src.unreadable();
+    tc.samples = count as u64;
+    tc.min_chunk_offset = t.stco.iter().copied().min();
+    tc.chunk_beyond_eof = t.stco.iter().any(|&o| o >= size);
+    let mut placed = 0u64;
+    let mut inside = 0u64;
+    let mut cut = false;
+    for c in &chunks {
+        let end = c.offset.saturating_add(c.samples as u64 * sz as u64);
+        tc.max_extent = tc.max_extent.max(end);
+        placed += c.samples as u64;
+        if cut {
+            continue;
+        }
+        let holed = unreadable
+            .as_ref()
+            .is_some_and(|u| u.intersects(diskrescue_core::Range::new(c.offset, end)));
+        if end <= size && !holed {
+            inside += c.samples as u64;
+        } else {
+            if !holed && c.offset < size && sz > 0 {
+                inside += ((size - c.offset) / sz as u64).min(c.samples as u64);
+            }
+            cut = true;
+        }
+    }
+    tc.inside = inside;
+    if inside < tc.samples {
+        tc.first_outside = Some(inside);
+    }
+    if placed < tc.samples {
+        tc.problems.push(format!(
+            "chunk map places {placed} of {} samples",
+            tc.samples
+        ));
+    }
+    let stts: u64 = t.stts.iter().map(|e| e.0 as u64).sum();
+    if stts != tc.samples {
+        tc.problems.push(format!(
+            "stts covers {stts} samples, stsz declares {}",
+            tc.samples
+        ));
+    }
+    true
 }
 
 /// Findings for a whole file.
@@ -215,8 +423,14 @@ fn level2(src: &dyn Source, moov: &Moov, idx: usize, samples: &[Sample], tc: &mu
         }
         let step = firsts.len().div_ceil(256).max(1);
         for s in firsts.iter().step_by(step) {
-            tc.l2_checked += 1;
             let head = src.read_vec(s.offset, 8).unwrap_or_default();
+            if head.len() < 8 || head.iter().all(|&b| b == 0) {
+                // A zero-filled or unreadable region is damage, not
+                // evidence that the index belongs to another recording.
+                tc.l2_holes += 1;
+                continue;
+            }
+            tc.l2_checked += 1;
             if !nal_start_ok(&head, l, is_hevc, s.size) {
                 tc.l2_failed += 1;
             }
@@ -228,9 +442,20 @@ fn level2(src: &dyn Source, moov: &Moov, idx: usize, samples: &[Sample], tc: &mu
         .filter(aac::walk_supported)
     {
         let step = inside.len().div_ceil(64).max(1);
+        // No AAC frame exceeds 6144 bits per channel.
+        let max_frame = 768 * (cfg.channels.max(1) as usize) + 64;
         for s in inside.iter().step_by(step) {
-            tc.l2_checked += 1;
+            if s.size as usize > max_frame {
+                tc.l2_checked += 1;
+                tc.l2_failed += 1;
+                continue;
+            }
             let data = src.read_vec(s.offset, s.size as usize).unwrap_or_default();
+            if data.len() < s.size as usize || data.iter().all(|&b| b == 0) {
+                tc.l2_holes += 1;
+                continue;
+            }
+            tc.l2_checked += 1;
             if aac::frame_length(&data, &cfg) != Some(s.size as usize) {
                 tc.l2_failed += 1;
             }
@@ -361,8 +586,13 @@ pub fn analyze(src: &dyn Source) -> Result<Analysis> {
                     }
                 }
                 level2(src, moov, i, &samples, &mut tc);
+                level3(src, t, &samples, &mut tc, L3_BUDGET);
             }
-            Err(e) => tc.problems.push(format!("sample table: {e}")),
+            Err(e) => {
+                if !constant_size_check(src, t, &mut tc) {
+                    tc.problems.push(format!("sample table: {e}"));
+                }
+            }
         }
         tracks.push(tc);
     }
@@ -398,6 +628,18 @@ pub fn analyze(src: &dyn Source) -> Result<Analysis> {
         if t.chunk_beyond_eof {
             a.problems
                 .push(format!("stco offsets beyond EOF (track {})", t.track_id));
+        }
+        if !t.damaged_samples.is_empty() {
+            a.problems.push(format!(
+                "track {}: {} {kind} sample(s) damaged (zero-filled, unreadable or broken data)",
+                t.track_id,
+                t.damaged_samples.len()
+            ));
+        } else if t.l2_holes > 0 {
+            a.problems.push(format!(
+                "track {}: {} sampled {kind} sample(s) start in zero-filled or unreadable data",
+                t.track_id, t.l2_holes
+            ));
         }
         for p in &t.problems {
             a.problems.push(format!("track {}: {p}", t.track_id));

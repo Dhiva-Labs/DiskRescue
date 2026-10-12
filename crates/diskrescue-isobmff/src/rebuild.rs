@@ -11,12 +11,13 @@
 //! # Algorithm
 //!
 //! 1. [`learn`] parses the reference's `moov`: the first video track
-//!    (H.264 `avc1`/`avc3`, HEVC `hvc1`/`hev1`) and the first audio track
-//!    (AAC `mp4a`, or PCM `sowt`/`twos`/`lpcm`/`in24`...), their parameter
-//!    sets, the frame durations (mode of the `stts` deltas), the reorder
-//!    delay (first composition offset), sample-size and chunk statistics,
-//!    and the chunk interleave order. Other tracks (timecode, GoPro
-//!    telemetry, DJI/Sony metadata) are dropped and listed.
+//!    (H.264 `avc1`/`avc3`, HEVC `hvc1`/`hev1`), the first audio track
+//!    (AAC `mp4a`, or PCM `sowt`/`twos`/`lpcm`/`in24`...) and further AAC
+//!    tracks, their parameter sets, the frame durations (mode of the
+//!    `stts` deltas), the reorder delay (first composition offset),
+//!    sample-size and chunk statistics, and the chunk interleave order.
+//!    Other tracks (timecode, GoPro telemetry, DJI/Sony metadata) are
+//!    dropped and listed; their samples become gaps in the scan.
 //! 2. The media region of the damaged file is located: the payload of the
 //!    first `mdat` (to the end of the file when its size is 0 or wrong), or
 //!    everything after the recognisable leading boxes when the `mdat`
@@ -30,11 +31,17 @@
 //!      NALs are grouped into one access unit until a NAL starts the next
 //!      one (AUD, SEI or parameter set after a slice, or a slice that
 //!      [`crate::h264::is_new_picture`] / the HEVC first-slice flag says is
-//!      a new picture). H.264 `frame_num` continuity is tracked; a break
-//!      makes the candidate "weak".
+//!      a new picture). Every NAL of the unit must be readable and free of
+//!      the byte sequences `00 00 00/01/02` that no encoder writes inside a
+//!      NAL unit, so a sample hit by a zero-filled or unreadable hole is
+//!      rejected instead of being written with garbage inside. H.264
+//!      `frame_num` continuity is tracked; a break makes the candidate
+//!      "weak".
 //!    * audio: AAC frames are delimited exactly by walking their syntax
-//!      ([`crate::aac::frame_length`]); PCM has no structure and is placed
-//!      as the bytes between video samples (a multiple of the frame size).
+//!      ([`crate::aac::frame_length`]); a frame that fits several AAC
+//!      tracks is attributed by the reference's chunk sizes. PCM has no
+//!      structure and is placed as the bytes between video samples (a
+//!      multiple of the frame size).
 //!
 //!    When both match, or the only match is weak, the candidate whose end
 //!    is followed by another valid sample (or the end of the data) wins;
@@ -47,18 +54,33 @@
 //!    duration limit, or at the end of the data. Container structure found
 //!    inside the region (`free`/`skip`/`wide` boxes, a nested `mdat`
 //!    header, a stale `moov`) is skipped.
-//! 4. Composition offsets: each video sample's picture order count is
-//!    derived from its slice header (H.264 §8.2.1, HEVC §8.3.1) and an
-//!    "epoch" counter that increases at every IDR (HEVC: every IRAP with
-//!    NoRaslOutputFlag) and after every gap. Display rank = position in the
-//!    stream sorted by (epoch, POC). `cts = (rank + shift) * frame
-//!    duration`, `dts = decode index * frame duration`, with one global
-//!    `shift` (the largest reorder depth, at least the reference's) so
-//!    every offset is non-negative and presentation order is monotonic. An
-//!    edit list with `media_time = shift * frame duration` makes the first
-//!    displayed frame start at 0. No `ctts` is written when every offset is
-//!    zero.
-//! 5. The output is `ftyp` (copied from the reference) + a new `moov` +
+//! 4. Lost pictures. A gap only matters when pictures were lost in it
+//!    (gaps that held other tracks' samples do not): H.264 shows it as a
+//!    `frame_num` break, HEVC as a reference picture set naming a picture
+//!    that was never seen. Decoding then restarts at the next usable
+//!    random access picture and everything a decoder cannot reconstruct is
+//!    dropped (see `decodable`): the pictures before it, its leading
+//!    pictures, and HEVC pictures referencing lost ones. An HEVC
+//!    end-of-sequence NAL unit is appended before an HEVC restart so the
+//!    decoder resets its picture order count there too.
+//! 5. Timing. Decode times step by the reference's frame duration, and
+//!    dropped samples keep their place in time. When the stream has audio
+//!    its clock is the time base (it is constant-rate and reliable): the
+//!    number of audio frames before each video sample in the file gives
+//!    the video sample's time, and whenever the video falls behind it
+//!    (variable frame rate, frames lost in a hole) the next frame is moved
+//!    to the audio time; with a variable-frame-rate reference every frame
+//!    follows the audio clock. Display order: each sample's picture order
+//!    count (H.264 §8.2.1, HEVC §8.3.1) and an "epoch" counter that
+//!    increases at every IDR (HEVC: every IRAP with NoRaslOutputFlag and
+//!    every restart) give the display rank; the picture of rank r is shown
+//!    at the r-th decode time plus one global shift (the largest reorder
+//!    depth, at least the reference's), so every composition offset is
+//!    non-negative and presentation order is monotonic. An edit list
+//!    starts the presentation at the first displayed frame (plus an empty
+//!    edit when the head of the recording was lost). No `ctts` is written
+//!    when every offset is zero.
+//! 6. The output is `ftyp` (copied from the reference) + a new `moov` +
 //!    an `mdat` that holds exactly the classified bytes in their original
 //!    order; unclassified gaps are dropped and every chunk offset points
 //!    into the new `mdat`.
@@ -67,11 +89,18 @@
 //!
 //! * Video codecs other than H.264/HEVC and audio codecs other than AAC
 //!   (Main/LC/LTP and the LC core of HE-AAC) and PCM are not rebuilt; such
-//!   tracks are dropped with a note.
-//! * Constant frame rate is assumed (the reference's dominant frame
-//!   duration). When the reference itself is variable-frame-rate and the
-//!   rebuilt video and audio durations differ by more than 0.5 s, the video
-//!   frame duration is stretched to match the audio.
+//!   tracks are dropped with a note. Only one PCM track is rebuilt.
+//! * After lost pictures, H.264 restarts at an IDR picture, or at an
+//!   open-GOP intra picture only when decoders can still order it (its
+//!   picture order count is within half the POC range of the last kept
+//!   reference picture) and no leading reference picture has to be
+//!   dropped. In open-GOP streams with pyramid B-frames and a small POC
+//!   range (x264 `--open-gop`) that means everything up to the next IDR
+//!   is lost.
+//! * With a variable frame rate and B-frames, presentation times of
+//!   individual B-frames can be off by a few frames (their display time
+//!   is not stored in the bitstream); the audio clock keeps the average
+//!   in sync.
 //! * Interlaced H.264 field pairs are grouped into one sample when the two
 //!   fields share `frame_num` and have opposite parity.
 
@@ -82,7 +111,7 @@ use diskrescue_core::{Error, Range, Result, SharedSource, Source, SourceExt};
 
 use crate::aac::{self, AudioSpecificConfig};
 use crate::boxes::{self, is_pcm_kind, parse_moov, sample_table, walk_top_level, Elst, Moov, Trak};
-use crate::writer::{assemble, MovieOut, OutSample, SpliceSource, TrackOut};
+use crate::writer::{assemble, MovieOut, NalSuffix, OutSample, SpliceSource, TrackOut};
 use crate::{h264, hevc};
 
 /// Largest NAL unit accepted while scanning.
@@ -181,6 +210,10 @@ pub struct Reference {
     pub video: Option<TrackTemplate>,
     /// Audio template.
     pub audio: Option<TrackTemplate>,
+    /// Further AAC audio tracks (second language, separate microphone),
+    /// rebuilt alongside the first one when it is AAC too. Frames that fit
+    /// several tracks are attributed by the reference's chunk sizes.
+    pub extra_audio: Vec<TrackTemplate>,
     /// Handler (or sample entry) types of tracks that will not be rebuilt.
     pub other_tracks_dropped: Vec<[u8; 4]>,
     /// Video samples per chunk.
@@ -394,7 +427,24 @@ fn template_for(trak: &Trak, notes: &mut Vec<String>) -> Option<TrackTemplate> {
         }
         _ => return None,
     };
-    let samples = sample_table(trak).ok()?;
+    // Constant-size tracks (PCM) are not listed sample by sample: every
+    // audio frame is a sample.
+    let (sizes, first_cts) = match trak.stsz {
+        boxes::SampleSizes::Constant { size, .. } => (
+            SizeStats {
+                min: size,
+                max: size,
+                median: size,
+                p99: size,
+            },
+            0,
+        ),
+        _ => {
+            let samples = sample_table(trak).ok()?;
+            let first = samples.first().map_or(0, |s| s.cts_offset);
+            (size_stats(samples.iter().map(|s| s.size).collect()), first)
+        }
+    };
     let sample_delta = mode_of(trak.stts.iter().map(|&(n, d)| (d, n as u64)));
     let distinct: std::collections::BTreeSet<u32> = trak
         .stts
@@ -402,9 +452,10 @@ fn template_for(trak: &Trak, notes: &mut Vec<String>) -> Option<TrackTemplate> {
         .take(trak.stts.len().saturating_sub(1).max(1))
         .map(|e| e.1)
         .collect();
-    let reorder_delay = match (samples.first(), sample_delta) {
-        (Some(s), d) if d > 0 && s.cts_offset > 0 => (s.cts_offset as u32) / d,
-        _ => 0,
+    let reorder_delay = if sample_delta > 0 && first_cts > 0 {
+        first_cts as u32 / sample_delta
+    } else {
+        0
     };
     let edit_media_time = trak
         .elst
@@ -415,7 +466,7 @@ fn template_for(trak: &Trak, notes: &mut Vec<String>) -> Option<TrackTemplate> {
         trak: trak.clone(),
         codec,
         sample_delta: sample_delta.max(1),
-        sizes: size_stats(samples.iter().map(|s| s.size).collect()),
+        sizes,
         chunk: chunk_stats(trak),
         reorder_delay,
         variable_rate: distinct.len() > 1,
@@ -443,6 +494,7 @@ pub fn learn(reference: &SharedSource) -> Result<Reference> {
     let mut notes = Vec::new();
     let mut video: Option<TrackTemplate> = None;
     let mut audio: Option<TrackTemplate> = None;
+    let mut extra_audio: Vec<TrackTemplate> = Vec::new();
     let mut dropped = Vec::new();
     for t in &moov.tracks {
         let kind = t.entry().map(|e| e.kind).unwrap_or(t.handler);
@@ -464,6 +516,18 @@ pub fn learn(reference: &SharedSource) -> Result<Reference> {
                 "audio codec '{}' cannot be rebuilt",
                 boxes::fourcc_str(&kind)
             ));
+        } else if t.is_audio() && extra_audio.len() < 7 {
+            let primary_aac = matches!(audio.as_ref().map(|a| &a.codec), Some(Codec::Aac { .. }));
+            if let Some(tt) = template_for(t, &mut notes) {
+                if primary_aac && matches!(tt.codec, Codec::Aac { .. }) {
+                    extra_audio.push(tt);
+                    continue;
+                }
+            }
+            notes.push(format!(
+                "additional audio track '{}' cannot be rebuilt",
+                boxes::fourcc_str(&kind)
+            ));
         }
         dropped.push(if t.handler == [0; 4] { kind } else { t.handler });
     }
@@ -474,7 +538,7 @@ pub fn learn(reference: &SharedSource) -> Result<Reference> {
     }
     // Interleave pattern: chunks of the kept tracks in file order.
     let mut chunks: Vec<(u64, u32, usize)> = Vec::new();
-    for tt in video.iter().chain(audio.iter()) {
+    for tt in video.iter().chain(audio.iter()).chain(extra_audio.iter()) {
         let id = tt.trak.tkhd.track_id;
         let mut i = 0usize;
         for (c, &off) in tt.trak.stco.iter().enumerate().take(4096) {
@@ -497,6 +561,7 @@ pub fn learn(reference: &SharedSource) -> Result<Reference> {
         ftyp,
         video,
         audio,
+        extra_audio,
         other_tracks_dropped: dropped,
         interleave_pattern,
         notes,
@@ -516,6 +581,8 @@ struct Window<'a> {
     end: u64,
     /// The buffer stops early because of a read error or short read.
     short: bool,
+    /// Recent NAL integrity verdicts `(payload offset, length, intact)`.
+    checked: Vec<(u64, u64, bool)>,
 }
 
 impl<'a> Window<'a> {
@@ -526,7 +593,23 @@ impl<'a> Window<'a> {
             buf: Vec::new(),
             end: end.min(src.size()),
             short: false,
+            checked: Vec::new(),
         }
+    }
+
+    /// Are the `n` stored bytes of the NAL unit at `p` (after its length
+    /// prefix) all readable and free of damage (see [`nal_bytes_damaged`])?
+    fn nal_intact(&mut self, p: u64, n: u64) -> bool {
+        if let Some(&(_, _, ok)) = self.checked.iter().find(|c| c.0 == p && c.1 == n) {
+            return ok;
+        }
+        let b = self.get(p, n as usize);
+        let ok = b.len() as u64 == n && !nal_bytes_damaged(b);
+        if self.checked.len() >= 64 {
+            self.checked.remove(0);
+        }
+        self.checked.push((p, n, ok));
+        ok
     }
 
     /// Up to `len` bytes at `pos` (shorter at the end of the region or at
@@ -563,6 +646,40 @@ impl<'a> Window<'a> {
     }
 }
 
+/// True when the stored bytes of one NAL unit (header included, emulation
+/// prevention bytes still in place, as in an `mdat`) contain something no
+/// encoder writes: one of the three-byte sequences `00 00 00`, `00 00 01`,
+/// `00 00 02` (forbidden inside a NAL unit by H.264 §7.4.1 / H.265 §7.4.2)
+/// before the trailing zero bytes, or more than 32 trailing zero bytes.
+/// Zero-filled unreadable sectors and wiped regions inside a sample are
+/// caught this way; a few trailing zeros (left by some Annex B to
+/// length-prefix converters) are tolerated.
+pub(crate) fn nal_bytes_damaged(b: &[u8]) -> bool {
+    nal_damage_offset(b).is_some()
+}
+
+/// Where [`nal_bytes_damaged`] finds damage: the offset of the first
+/// forbidden three-byte sequence, or of the over-long trailing zero run.
+pub(crate) fn nal_damage_offset(b: &[u8]) -> Option<usize> {
+    let end = b.iter().rposition(|&x| x != 0).map_or(0, |i| i + 1);
+    let body = &b[..end];
+    let mut i = 0usize;
+    while i + 2 < body.len() {
+        match body[i..].iter().position(|&x| x == 0) {
+            None => break,
+            Some(k) => i += k,
+        }
+        if i + 2 >= body.len() {
+            break;
+        }
+        if body[i + 1] == 0 && body[i + 2] <= 2 {
+            return Some(i);
+        }
+        i += 1;
+    }
+    (b.len() - end > 32).then_some(end)
+}
+
 fn be_uint(b: &[u8]) -> u64 {
     b.iter().fold(0u64, |a, &x| (a << 8) | x as u64)
 }
@@ -583,6 +700,8 @@ struct VideoCand {
     keyframe: bool,
     /// The primary picture is intra coded (a decoder can start here).
     intra: bool,
+    /// The picture is used for reference (H.264 `nal_ref_idc != 0`).
+    reference: bool,
     slice: SliceRef,
     params: Vec<Vec<u8>>,
 }
@@ -601,6 +720,11 @@ enum VideoState {
         sps: hevc::SpsMap,
         pps: hevc::PpsMap,
         poc: hevc::PocState,
+        /// POCs of the decodable pictures of the current coded video
+        /// sequence (what a decoder's DPB could still hold).
+        avail: std::collections::HashSet<i32>,
+        /// Largest POC accepted since the last reset.
+        max_poc: Option<i32>,
     },
 }
 
@@ -639,6 +763,8 @@ impl VideoState {
                 sps: sps.clone(),
                 pps: pps.clone(),
                 poc: hevc::PocState::new(),
+                avail: std::collections::HashSet::new(),
+                max_poc: None,
             }),
             _ => None,
         }
@@ -720,8 +846,50 @@ impl VideoState {
         }
     }
 
-    /// Commit an accepted candidate: returns (poc, starts_new_epoch).
-    fn accept(&mut self, c: &VideoCand, in_band: bool) -> (i32, bool) {
+    /// After a gap in the data: does `c` show that pictures were lost, so
+    /// that the decoding state has to start over? H.264: `frame_num`
+    /// continuity. HEVC: a picture of its reference picture set was never
+    /// seen, or an IRAP picture whose POC does not continue the sequence.
+    /// Gaps that only held samples of other tracks are not discontinuities.
+    fn discontinuous(&self, c: &VideoCand) -> bool {
+        match (self, &c.slice) {
+            (VideoState::Avc { .. }, SliceRef::Avc(_)) => !self.continuity_ok(c),
+            (
+                VideoState::Hevc {
+                    sps,
+                    pps,
+                    poc,
+                    avail,
+                    max_poc,
+                    ..
+                },
+                SliceRef::Hevc(h),
+            ) => {
+                if hevc::is_irap(h.nal_type) && hevc::no_rasl_output(h.nal_type, poc) {
+                    return false;
+                }
+                let Some(s) = pps.get(&h.pps_id).and_then(|p| sps.get(&p.sps_id)) else {
+                    return false;
+                };
+                let mut st = poc.clone();
+                let v = hevc::poc(s, h, &mut st);
+                if hevc::is_irap(h.nal_type) {
+                    let half = 1i32 << s.log2_max_poc_lsb.saturating_sub(1);
+                    return max_poc.is_some_and(|m| v <= m || v > m.saturating_add(half));
+                }
+                h.ref_deltas
+                    .as_ref()
+                    .is_some_and(|d| d.iter().any(|&dp| !avail.contains(&v.wrapping_add(dp))))
+            }
+            _ => false,
+        }
+    }
+
+    /// Commit an accepted candidate: returns (poc, starts_new_epoch,
+    /// broken). `broken` is set for an HEVC picture whose reference
+    /// picture set names a picture that was lost: a decoder cannot
+    /// reconstruct it.
+    fn accept(&mut self, c: &VideoCand, in_band: bool) -> (i32, bool, bool) {
         match (self, &c.slice) {
             (
                 VideoState::Avc {
@@ -757,11 +925,17 @@ impl VideoState {
                 if h.nal_ref_idc != 0 {
                     *prev_ref_frame_num = Some(h.frame_num);
                 }
-                (value, h.is_idr())
+                (value, h.is_idr(), false)
             }
             (
                 VideoState::Hevc {
-                    vps, sps, pps, poc, ..
+                    vps,
+                    sps,
+                    pps,
+                    poc,
+                    avail,
+                    max_poc,
+                    ..
                 },
                 SliceRef::Hevc(h),
             ) => {
@@ -788,30 +962,68 @@ impl VideoState {
                     }
                 }
                 let new_epoch = hevc::is_irap(h.nal_type) && hevc::no_rasl_output(h.nal_type, poc);
+                if new_epoch {
+                    avail.clear();
+                    *max_poc = None;
+                }
                 let sps_for = pps.get(&h.pps_id).and_then(|p| sps.get(&p.sps_id));
                 let value = match sps_for {
                     Some(s) => hevc::poc(s, h, poc),
                     None => 0,
                 };
-                (value, new_epoch)
+                let broken = !hevc::is_irap(h.nal_type)
+                    && h.ref_deltas.as_ref().is_some_and(|d| {
+                        d.iter().any(|&dp| !avail.contains(&value.wrapping_add(dp)))
+                    });
+                if !broken {
+                    avail.insert(value);
+                    *max_poc = Some(max_poc.map_or(value, |m| m.max(value)));
+                    if avail.len() > 4096 {
+                        let floor = max_poc.unwrap_or(value).saturating_sub(1 << 12);
+                        avail.retain(|&p| p >= floor);
+                    }
+                }
+                (value, new_epoch, broken)
             }
-            _ => (0, false),
+            _ => (0, false, false),
         }
     }
 
-    /// Forget continuity after a gap.
+    /// See [`VSample::poc_window`].
+    fn poc_window(&self, c: &VideoCand) -> i32 {
+        match (self, &c.slice) {
+            (VideoState::Avc { sps, .. }, SliceRef::Avc(h)) => match sps.get(&h.sps_id) {
+                Some(s) if s.pic_order_cnt_type == 0 => {
+                    1i32 << s.log2_max_poc_lsb.saturating_sub(1)
+                }
+                Some(s) => (s.max_frame_num() as i32).saturating_mul(2),
+                None => 0,
+            },
+            (VideoState::Hevc { sps, pps, .. }, SliceRef::Hevc(h)) => pps
+                .get(&h.pps_id)
+                .and_then(|p| sps.get(&p.sps_id))
+                .map_or(0, |s| 1i32 << s.log2_max_poc_lsb.saturating_sub(1)),
+            _ => 0,
+        }
+    }
+
+    /// Forget continuity after lost pictures.
     fn reset_after_gap(&mut self) {
         match self {
             VideoState::Avc {
-                poc,
-                prev_ref_frame_num,
-                ..
+                prev_ref_frame_num, ..
             } => {
-                *poc = h264::PocState::new();
                 *prev_ref_frame_num = None;
             }
-            VideoState::Hevc { poc, .. } => {
+            VideoState::Hevc {
+                poc,
+                avail,
+                max_poc,
+                ..
+            } => {
                 *poc = hevc::PocState::new();
+                avail.clear();
+                *max_poc = None;
             }
         }
     }
@@ -995,6 +1207,11 @@ fn try_avc(
             }
             _ => stop!(),
         }
+        // A NAL of this access unit with damaged bytes makes the whole
+        // unit undecodable: reject it so the bytes become a gap.
+        if !win.nal_intact(p + l as u64, n) {
+            return None;
+        }
         count += 1;
         p += l as u64 + n;
         if last {
@@ -1006,6 +1223,7 @@ fn try_avc(
         len: p - pos,
         keyframe: key,
         intra: matches!(first.kind(), 2 | 4),
+        reference: first.nal_ref_idc != 0,
         slice: SliceRef::Avc(first),
         params,
     })
@@ -1149,6 +1367,9 @@ fn try_hevc(
             }
             _ => stop!(),
         }
+        if !win.nal_intact(p + l as u64, n) {
+            return None;
+        }
         count += 1;
         p += l as u64 + n;
         if last {
@@ -1160,6 +1381,7 @@ fn try_hevc(
         len: p - pos,
         keyframe: key,
         intra: first.slice_type == Some(2),
+        reference: !hevc::is_sub_layer_non_ref(first.nal_type),
         slice: SliceRef::Hevc(first),
         params,
     })
@@ -1236,6 +1458,18 @@ struct VSample {
     intra: bool,
     poc: i32,
     epoch: u32,
+    /// HEVC: a picture of its reference picture set was lost.
+    broken: bool,
+    /// First picture after lost pictures (decoding restarts here).
+    seg_start: bool,
+    /// Samples of the first audio track found before this one (the audio
+    /// clock used to time the video).
+    aclock: u64,
+    /// Used for reference by later pictures.
+    reference: bool,
+    /// Largest POC step a decoder can bridge after lost pictures (half
+    /// the POC LSB range, or twice MaxFrameNum for POC types 1 and 2).
+    poc_window: i32,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1243,6 +1477,16 @@ struct ASample {
     offset: u64,
     len: u32,
     count: u32,
+}
+
+/// One audio track being rebuilt.
+struct AudioLane {
+    state: AudioState,
+    samples: Vec<ASample>,
+    /// Table samples found so far (PCM: frames).
+    frames: u64,
+    /// Most common samples per chunk in the reference (at least 1).
+    chunk: u32,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -1255,14 +1499,21 @@ struct Scanner<'a> {
     win: Window<'a>,
     end: u64,
     video: Option<VideoState>,
-    audio: Option<AudioState>,
+    audio: Vec<AudioLane>,
     in_band: bool,
     vs: Vec<VSample>,
-    aus: Vec<ASample>,
     epoch: u32,
     gap_pending: bool,
+    /// Data was skipped since the last video sample (the next one may
+    /// follow lost pictures).
+    video_gap: bool,
+    /// A video sample the PCM placement ended at: accept it there even
+    /// when nothing confirms it (the bytes before it were taken as audio).
+    pending_video: Option<u64>,
     unclassified: Vec<Range>,
     run: Option<(Track, u32)>,
+    /// Audio track of the current run of audio samples and its length.
+    lane_run: Option<(usize, u32)>,
     video_chunk_max: u32,
     audio_chunk_max: u32,
     notes: Vec<String>,
@@ -1273,7 +1524,8 @@ struct Scanner<'a> {
 #[derive(Clone)]
 enum Pick {
     Video(VideoCand),
-    Audio(u64),
+    /// Audio track index and frame length.
+    Audio(usize, u64),
 }
 
 impl Scanner<'_> {
@@ -1306,10 +1558,43 @@ impl Scanner<'_> {
         v.try_at(&mut self.win, pos, end, in_band)
     }
 
-    fn audio_at(&mut self, pos: u64) -> Option<u64> {
+    /// An audio frame at `pos`: `(track index, length)`. When the frame
+    /// fits several audio tracks (identical configurations), the track is
+    /// chosen from the reference's chunk sizes: stay in the current run
+    /// until it holds a typical chunk, then move to the track with the
+    /// fewest frames.
+    fn audio_at(&mut self, pos: u64) -> Option<(usize, u64)> {
         let end = self.end;
-        let a = self.audio.as_ref()?;
-        a.try_at(&mut self.win, pos, end)
+        let mut hits: Vec<(usize, u64)> = Vec::new();
+        for (i, lane) in self.audio.iter().enumerate() {
+            if let Some(n) = lane.state.try_at(&mut self.win, pos, end) {
+                hits.push((i, n));
+            }
+        }
+        match hits.len() {
+            0 => None,
+            1 => hits.first().copied(),
+            _ => Some(self.pick_lane(&hits)),
+        }
+    }
+
+    fn pick_lane(&self, hits: &[(usize, u64)]) -> (usize, u64) {
+        let fewest = |exclude: Option<usize>| {
+            hits.iter()
+                .copied()
+                .filter(|h| Some(h.0) != exclude)
+                .min_by_key(|h| (self.audio.get(h.0).map_or(0, |l| l.frames), h.0))
+        };
+        if let Some((cur, run)) = self.lane_run {
+            if let Some(h) = hits.iter().copied().find(|h| h.0 == cur) {
+                let chunk = self.audio.get(cur).map_or(1, |l| l.chunk);
+                if run < chunk {
+                    return h;
+                }
+                return fewest(Some(cur)).unwrap_or(h);
+            }
+        }
+        fewest(None).unwrap_or(hits[0])
     }
 
     /// Is something valid at `pos` (a sample start, structure, or the end)?
@@ -1342,15 +1627,15 @@ impl Scanner<'_> {
         let v = self.video_at(pos);
         let a = self.audio_at(pos);
         match (v, a) {
-            (Some(v), Some(a)) => {
+            (Some(v), Some((lane, n))) => {
                 let lv = self.valid_next(pos + v.len);
-                let la = self.valid_next(pos + a);
+                let la = self.valid_next(pos + n);
                 match (lv, la) {
                     (true, false) => Some(Pick::Video(v)),
-                    (false, true) => Some(Pick::Audio(a)),
+                    (false, true) => Some(Pick::Audio(lane, n)),
                     _ => {
                         if self.expected() == Track::Audio {
-                            Some(Pick::Audio(a))
+                            Some(Pick::Audio(lane, n))
                         } else {
                             Some(Pick::Video(v))
                         }
@@ -1366,9 +1651,9 @@ impl Scanner<'_> {
                     None
                 }
             }
-            (None, Some(a)) => {
-                if !self.gap_pending || self.valid_next(pos + a) {
-                    Some(Pick::Audio(a))
+            (None, Some((lane, n))) => {
+                if !self.gap_pending || self.valid_next(pos + n) {
+                    Some(Pick::Audio(lane, n))
                 } else {
                     None
                 }
@@ -1379,7 +1664,7 @@ impl Scanner<'_> {
 
     fn bump_run(&mut self, t: Track, n: u32) {
         self.run = match self.run {
-            Some((rt, c)) if rt == t => Some((t, c + n)),
+            Some((rt, c)) if rt == t => Some((t, c.saturating_add(n))),
             _ => Some((t, n)),
         };
     }
@@ -1388,13 +1673,25 @@ impl Scanner<'_> {
         match pick {
             Pick::Video(c) => {
                 let in_band = self.in_band;
-                let gap = std::mem::take(&mut self.gap_pending);
-                let v = self.video.as_mut().expect("video state");
-                if gap {
+                self.gap_pending = false;
+                let gap = std::mem::take(&mut self.video_gap);
+                let aclock = self.audio.first().map_or(0, |l| l.frames);
+                let Some(v) = self.video.as_mut() else {
+                    return c.len;
+                };
+                // Only a gap that lost pictures restarts the decoding
+                // state; gaps holding other tracks' samples do not.
+                let disc = gap && v.discontinuous(&c);
+                // H.264: decoders keep deriving POC across a frame_num gap
+                // (they conceal the missing frames), so the display order
+                // follows the continued POC; HEVC restarts at an IRAP.
+                let avc = matches!(v, VideoState::Avc { .. });
+                if disc {
                     v.reset_after_gap();
                 }
-                let (poc, new_epoch) = v.accept(&c, in_band);
-                if (new_epoch || gap) && !self.vs.is_empty() {
+                let (poc, new_epoch, broken) = v.accept(&c, in_band);
+                let poc_window = v.poc_window(&c);
+                if (new_epoch || (disc && !avc)) && !self.vs.is_empty() {
                     self.epoch += 1;
                 }
                 self.vs.push(VSample {
@@ -1404,17 +1701,30 @@ impl Scanner<'_> {
                     intra: c.intra,
                     poc,
                     epoch: self.epoch,
+                    broken,
+                    seg_start: disc,
+                    aclock,
+                    reference: c.reference,
+                    poc_window,
                 });
+                self.lane_run = None;
                 self.bump_run(Track::Video, 1);
                 c.len
             }
-            Pick::Audio(n) => {
+            Pick::Audio(lane, n) => {
                 self.gap_pending = false;
-                self.aus.push(ASample {
-                    offset: pos,
-                    len: n as u32,
-                    count: 1,
-                });
+                if let Some(l) = self.audio.get_mut(lane) {
+                    l.samples.push(ASample {
+                        offset: pos,
+                        len: n as u32,
+                        count: 1,
+                    });
+                    l.frames += 1;
+                }
+                self.lane_run = match self.lane_run {
+                    Some((c, r)) if c == lane => Some((c, r.saturating_add(1))),
+                    _ => Some((lane, 1)),
+                };
                 self.bump_run(Track::Audio, 1);
                 n
             }
@@ -1443,7 +1753,7 @@ impl Scanner<'_> {
                 let b = &block[i..];
                 let room = self.end - at;
                 let vq = self.video.as_ref().is_some_and(|v| v.quick_start(b, room));
-                let aq = self.audio.as_ref().is_some_and(|a| a.quick_start(b));
+                let aq = self.audio.iter().any(|a| a.state.quick_start(b));
                 if !vq && !aq {
                     if b.len() >= 8 && boxes::is_top_level_type(&[b[4], b[5], b[6], b[7]]) {
                         if let Some(skip) = self.structure_at(at) {
@@ -1462,7 +1772,7 @@ impl Scanner<'_> {
                     }
                 }
                 if aq {
-                    if let Some(n) = self.audio_at(at) {
+                    if let Some((_, n)) = self.audio_at(at) {
                         if self.valid_next(at + n) {
                             return Some(at);
                         }
@@ -1474,8 +1784,61 @@ impl Scanner<'_> {
         None
     }
 
-    /// Next confirmed *video* start within `limit` bytes (PCM placement).
-    fn next_video(&mut self, from: u64, limit: u64) -> Option<u64> {
+    /// H.264: a candidate that breaks `frame_num` continuity is believed
+    /// when the next video sample within `limit` bytes continues from it
+    /// (pictures were lost before it, it is not a false match inside other
+    /// data). HEVC candidates are always believed.
+    fn chained(&mut self, at: u64, v: &VideoCand, limit: u64) -> bool {
+        let SliceRef::Avc(h) = &v.slice else {
+            return true;
+        };
+        let Some(VideoState::Avc { sps, .. }) = self.video.as_ref() else {
+            return false;
+        };
+        let Some(s) = sps.get(&h.sps_id) else {
+            return false;
+        };
+        let max = s.max_frame_num();
+        let (same, next) = (h.frame_num, (h.frame_num + 1) % max.max(1));
+        let is_ref = h.nal_ref_idc != 0;
+        let from = at + v.len;
+        let stop = from.saturating_add(limit).min(self.end);
+        let mut q = from;
+        while q < stop {
+            let block: Vec<u8> = self.win.get(q, 4096 + 16).to_vec();
+            if block.is_empty() {
+                return false;
+            }
+            let usable = block.len().saturating_sub(16).max(1).min(block.len());
+            for i in 0..usable {
+                let p = q + i as u64;
+                if p >= stop {
+                    return false;
+                }
+                let room = self.end - p;
+                if !self
+                    .video
+                    .as_ref()
+                    .is_some_and(|x| x.quick_start(&block[i..], room))
+                {
+                    continue;
+                }
+                if let Some(n) = self.video_at(p) {
+                    if let SliceRef::Avc(h2) = &n.slice {
+                        return h2.is_idr()
+                            || h2.frame_num == same
+                            || (is_ref && h2.frame_num == next);
+                    }
+                }
+            }
+            q += usable as u64;
+        }
+        false
+    }
+
+    /// Next believable *video* start within `limit` bytes (PCM placement):
+    /// `(position, continues the stream)`.
+    fn next_video(&mut self, from: u64, limit: u64) -> Option<(u64, bool)> {
         let stop = from.saturating_add(limit).min(self.end);
         let mut q = from;
         while q < stop {
@@ -1498,9 +1861,11 @@ impl Scanner<'_> {
                     continue;
                 }
                 if let Some(v) = self.video_at(at) {
-                    let ok = self.video.as_ref().is_some_and(|s| s.continuity_ok(&v));
-                    if ok || v.keyframe {
-                        return Some(at);
+                    if self.video.as_ref().is_some_and(|s| s.continuity_ok(&v)) {
+                        return Some((at, true));
+                    }
+                    if v.keyframe || v.intra || self.chained(at, &v, limit) {
+                        return Some((at, false));
                     }
                 }
             }
@@ -1565,10 +1930,27 @@ pub fn rebuild_to_splice(
         .video
         .as_ref()
         .and_then(|v| VideoState::new(&v.codec));
-    let audio = reference
-        .audio
-        .as_ref()
-        .and_then(|a| AudioState::new(&a.codec));
+    let mut audio: Vec<AudioLane> = Vec::new();
+    if let Some(a) = &reference.audio {
+        if let Some(state) = AudioState::new(&a.codec) {
+            audio.push(AudioLane {
+                state,
+                samples: Vec::new(),
+                frames: 0,
+                chunk: a.chunk.mode.max(1),
+            });
+            for x in &reference.extra_audio {
+                if let Some(state) = AudioState::new(&x.codec) {
+                    audio.push(AudioLane {
+                        state,
+                        samples: Vec::new(),
+                        frames: 0,
+                        chunk: x.chunk.mode.max(1),
+                    });
+                }
+            }
+        }
+    }
     let mut sc = Scanner {
         win: Window::new(src, end),
         end,
@@ -1576,11 +1958,13 @@ pub fn rebuild_to_splice(
         audio,
         in_band: opts.allow_in_band_parameter_sets,
         vs: Vec::new(),
-        aus: Vec::new(),
         epoch: 0,
         gap_pending: false,
+        video_gap: false,
+        pending_video: None,
         unclassified: Vec::new(),
         run: None,
+        lane_run: None,
         video_chunk_max: reference.typical_video_chunk.max,
         audio_chunk_max: reference.typical_audio_chunk.max,
         notes: Vec::new(),
@@ -1605,11 +1989,11 @@ pub fn rebuild_to_splice(
     });
     let vdur = reference.frame_duration.max(1) as u64;
     let adur = reference.audio_frame_duration.max(1) as u64;
-    let is_pcm = matches!(sc.audio, Some(AudioState::Pcm { .. }));
-    let pcm_bpf = match sc.audio {
-        Some(AudioState::Pcm { bpf }) => bpf as u64,
+    let pcm_bpf = match sc.audio.first().map(|l| &l.state) {
+        Some(AudioState::Pcm { bpf }) => *bpf as u64,
         _ => 0,
     };
+    let is_pcm = pcm_bpf > 0;
     let pcm_window = reference
         .audio
         .as_ref()
@@ -1629,10 +2013,19 @@ pub fn rebuild_to_splice(
             }
         }
         if let (Some(m), true) = (max_audio_ticks, sc.vs.is_empty()) {
-            let ticks: u64 = sc.aus.iter().map(|a| a.count as u64).sum::<u64>() * adur;
-            if ticks >= m && !sc.aus.is_empty() {
+            let frames = sc.audio.first().map_or(0, |l| l.frames);
+            if frames > 0 && frames.saturating_mul(adur) >= m {
                 notes.push("stopped at the duration limit".into());
                 break;
+            }
+        }
+        if sc.pending_video.take() == Some(pos) {
+            if let Some(v) = sc.video_at(pos) {
+                if let Some(us) = unclassified_run_start.take() {
+                    sc.unclassified.push(Range::new(us, pos));
+                }
+                pos += sc.accept(pos, Pick::Video(v));
+                continue;
             }
         }
         if let Some(pick) = sc.classify(pos) {
@@ -1655,35 +2048,45 @@ pub fn rebuild_to_splice(
             let next = if sc.video.is_some() {
                 sc.next_video(pos + 1, pcm_window)
             } else {
-                Some(end)
+                Some((end, true))
             };
             let next = match next {
                 Some(n) => Some(n),
-                None if sc.video.is_some() && end - pos <= pcm_window => Some(end),
+                None if sc.video.is_some() && end - pos <= pcm_window => Some((end, true)),
                 None => None,
             };
-            if let Some(n) = next {
+            if let Some((n, continuous)) = next {
                 let frames = (n - pos) / pcm_bpf;
                 if frames > 0 && frames <= u32::MAX as u64 {
                     if let Some(us) = unclassified_run_start.take() {
                         sc.unclassified.push(Range::new(us, pos));
                     }
                     let len = frames * pcm_bpf;
-                    // Split very long runs so sizes stay within u32.
-                    let mut left = frames;
-                    let mut at = pos;
-                    while left > 0 {
-                        let take = left.min((u32::MAX as u64 / pcm_bpf).min(1 << 20));
-                        sc.aus.push(ASample {
-                            offset: at,
-                            len: (take * pcm_bpf) as u32,
-                            count: take as u32,
-                        });
-                        at += take * pcm_bpf;
-                        left -= take;
+                    if let Some(lane) = sc.audio.first_mut() {
+                        // Split very long runs so sizes stay within u32.
+                        let mut left = frames;
+                        let mut at = pos;
+                        while left > 0 {
+                            let take = left.min((u32::MAX as u64 / pcm_bpf).min(1 << 20));
+                            lane.samples.push(ASample {
+                                offset: at,
+                                len: (take * pcm_bpf) as u32,
+                                count: take as u32,
+                            });
+                            at += take * pcm_bpf;
+                            left -= take;
+                        }
+                        lane.frames += frames;
                     }
-                    sc.bump_run(Track::Audio, frames as u32);
-                    sc.gap_pending = false;
+                    sc.bump_run(Track::Audio, frames.min(u32::MAX as u64) as u32);
+                    // A video sample that does not continue the stream
+                    // follows lost pictures (often a zero-filled hole,
+                    // which reads as silence).
+                    sc.gap_pending = !continuous;
+                    sc.video_gap |= !continuous;
+                    if n < end {
+                        sc.pending_video = Some(n);
+                    }
                     if pos + len < n {
                         sc.unclassified.push(Range::new(pos + len, n));
                     }
@@ -1695,6 +2098,7 @@ pub fn rebuild_to_splice(
         // Nothing here: resynchronise.
         let run_start = *unclassified_run_start.get_or_insert(pos);
         sc.gap_pending = true;
+        sc.video_gap = true;
         let mut found = None;
         let mut q = pos + 1;
         while q < end {
@@ -1725,8 +2129,7 @@ pub fn rebuild_to_splice(
         }
     }
     if let Some(us) = unclassified_run_start.take() {
-        sc.unclassified
-            .push(Range::new(us, stopped_at.map_or(end, |_| end)));
+        sc.unclassified.push(Range::new(us, end));
     }
     for r in sc.unclassified.iter().take(16) {
         log::warn!(
@@ -1746,7 +2149,7 @@ pub fn rebuild_to_splice(
             sc.skipped_structure
         ));
     }
-    if sc.vs.is_empty() && sc.aus.is_empty() {
+    if sc.vs.is_empty() && sc.audio.iter().all(|l| l.samples.is_empty()) {
         return Err(Error::corrupt(
             "mdat",
             "no sample matched the reference (different camera, codec or settings?)",
@@ -1767,6 +2170,204 @@ pub fn rebuild_to_splice(
     Ok((splice, report))
 }
 
+/// Which video samples a decoder can reconstruct.
+///
+/// Decoding (re)starts at the beginning of the data and after lost
+/// pictures (`seg_start`). There every sample before a usable random
+/// access picture is dropped:
+///
+/// * HEVC: any IRAP or intra picture; pictures whose reference picture set
+///   names a lost picture (`broken`, which covers the RASL pictures of a
+///   CRA after a gap) are dropped wherever they are.
+/// * H.264: an IDR picture, or a non-IDR intra picture (open GOP) when a
+///   decoder that carries its POC derivation across the gap still orders
+///   it after the pictures before the gap (otherwise decoders discard the
+///   following frames as out of order) and none of the pictures displayed
+///   before it (its leading pictures, which reference pictures before the
+///   gap and are dropped) is a reference picture (dropping one leaves a
+///   `frame_num` gap after the restart that decoders conceal badly). In
+///   open-GOP streams with pyramid B-frames this means the next IDR.
+fn decodable(vs: &[VSample], hevc_codec: bool) -> Vec<bool> {
+    let n = vs.len();
+    let mut keep: Vec<bool> = vs.iter().map(|s| !s.broken).collect();
+    // Largest (epoch, poc) among kept samples so far, and the last kept
+    // reference picture (a decoder derives the next POC from it).
+    let mut max_kept: Option<(u32, i32)> = None;
+    let mut last_ref: Option<(u32, i32)> = None;
+    let mut i = 0usize;
+    while i < n {
+        if !(i == 0 || vs[i].seg_start) {
+            if keep[i] {
+                max_kept = max_kept.max(Some((vs[i].epoch, vs[i].poc)));
+            }
+            i += 1;
+            continue;
+        }
+        // Segment [i, end): up to the next restart.
+        let end = (i + 1..n).find(|&k| vs[k].seg_start).unwrap_or(n);
+        let mut start: Option<usize> = None;
+        for j in i..end {
+            let s = &vs[j];
+            if s.broken {
+                continue;
+            }
+            if hevc_codec {
+                if s.key || s.intra {
+                    start = Some(j);
+                    break;
+                }
+                continue;
+            }
+            if s.key {
+                start = Some(j);
+                break;
+            }
+            if !s.intra {
+                continue;
+            }
+            let ordered = max_kept.is_none_or(|m| (s.epoch, s.poc) > m)
+                && last_ref
+                    .is_none_or(|(e, p)| e != s.epoch || s.poc.saturating_sub(p) < s.poc_window);
+            let lead_end = (j + 1..end)
+                .find(|&k| vs[k].key || vs[k].intra)
+                .unwrap_or(end);
+            let leading_ref = (j + 1..lead_end)
+                .any(|k| vs[k].epoch == s.epoch && vs[k].poc < s.poc && vs[k].reference);
+            if ordered && !leading_ref {
+                start = Some(j);
+                break;
+            }
+        }
+        let Some(j) = start else {
+            for k in keep.iter_mut().take(end).skip(i) {
+                *k = false;
+            }
+            i = end;
+            continue;
+        };
+        for k in keep.iter_mut().take(j).skip(i) {
+            *k = false;
+        }
+        if !hevc_codec && !vs[j].key {
+            let (e, p) = (vs[j].epoch, vs[j].poc);
+            let lead_end = (j + 1..end)
+                .find(|&k| vs[k].key || vs[k].intra)
+                .unwrap_or(end);
+            for k in j + 1..lead_end {
+                if vs[k].epoch == e && vs[k].poc < p {
+                    keep[k] = false;
+                }
+            }
+        }
+        for k in j..end {
+            if keep[k] {
+                max_kept = max_kept.max(Some((vs[k].epoch, vs[k].poc)));
+                if vs[k].reference {
+                    last_ref = Some((vs[k].epoch, vs[k].poc));
+                }
+            }
+        }
+        i = end;
+    }
+    keep
+}
+
+/// The audio clock that times the video: frames of the first audio track,
+/// each `delta` ticks at `timescale`, `total` frames in all.
+#[derive(Debug, Clone, Copy)]
+struct AudioClock {
+    delta: u32,
+    timescale: u32,
+    total: u64,
+}
+
+/// Decode time (video ticks) of every scanned video sample.
+///
+/// Frames are `g` ticks apart (the reference's frame duration), so dropped
+/// samples keep their place in time. When the stream has audio, its clock
+/// is the time base: within each run of video samples with no audio frame
+/// in between, the audio time is interpolated, and whenever the video
+/// falls behind the audio by more than one and a half frames (variable frame rate,
+/// frames lost in a gap) the next frame is moved to the audio time,
+/// rounded to the frame grid. With `follow` (the reference itself has a
+/// variable frame rate) every frame is placed at its audio time on the
+/// frame grid. Returns the times and how many frames were moved.
+fn video_slots(
+    vs: &[VSample],
+    g: i64,
+    ts: u32,
+    clock: Option<AudioClock>,
+    follow: bool,
+) -> (Vec<i64>, u32) {
+    let n = vs.len();
+    let mut s = vec![0i64; n];
+    let Some(ck) = clock.filter(|c| c.total > 0 && c.timescale > 0) else {
+        for i in 1..n {
+            s[i] = s[i - 1].saturating_add(g);
+        }
+        return (s, 0);
+    };
+    let at = |frames: u64| -> i64 {
+        let v = frames as u128 * ck.delta as u128 * ts as u128 / ck.timescale as u128;
+        v.min(i64::MAX as u128 / 4) as i64
+    };
+    let mut target = vec![0i64; n];
+    let mut i = 0usize;
+    while i < n {
+        let a0 = vs[i].aclock;
+        let mut j = i;
+        while j < n && vs[j].aclock == a0 {
+            j += 1;
+        }
+        let a1 = if j < n {
+            vs[j].aclock
+        } else {
+            ck.total.max(a0)
+        };
+        let (t0, t1) = (at(a0), at(a1));
+        let len = (j - i) as i64;
+        for (k, t) in target.iter_mut().enumerate().take(j).skip(i) {
+            *t = t0 + (t1 - t0) * (k - i) as i64 / len;
+        }
+        i = j;
+    }
+    let thr = (3 * g / 2).max(3 * at(1) / 2).max(ts as i64 / 25);
+    // The samples before the first audio frame all read the same clock
+    // (their decode times can even be negative: B-frame delay), so the
+    // origin is taken from the first sample that follows audio, assuming
+    // the frames before it were regular.
+    let Some(first) = (1..n).find(|&i| vs[i].aclock != vs[0].aclock) else {
+        for i in 1..n {
+            s[i] = s[i - 1].saturating_add(g);
+        }
+        return (s, 0);
+    };
+    let base = target[first] - first as i64 * g;
+    let mut moved = 0u32;
+    for i in 1..n {
+        let pred = s[i - 1].saturating_add(g);
+        if i < first {
+            s[i] = pred;
+            continue;
+        }
+        let t = target[i] - base;
+        if follow {
+            // Variable frame rate: every frame goes to the audio time.
+            let grid = ((t + g / 2) / g * g).max(pred);
+            if grid != pred {
+                moved += 1;
+            }
+            s[i] = grid;
+        } else if t - pred > thr {
+            s[i] = ((t + g / 2) / g * g).max(pred);
+            moved += 1;
+        } else {
+            s[i] = pred;
+        }
+    }
+    (s, moved)
+}
+
 fn build_movie(
     reference: &Reference,
     sc: &Scanner<'_>,
@@ -1777,117 +2378,153 @@ fn build_movie(
     let mut next_id = 1u32;
     let mut video_dur_s = 0f64;
     let mut audio_dur_s = 0f64;
-    // A decoder cannot start before the first random-access picture:
-    // drop the video samples before it (head of the recording lost) and
-    // delay the video with an empty edit so audio stays in sync.
-    let first_rap = sc.vs.iter().position(|s| s.key || s.intra);
-    let lead = first_rap.unwrap_or(sc.vs.len());
-    if lead > 0 && !sc.vs.is_empty() {
-        notes.push(format!(
-            "dropped {lead} video sample(s) before the first decodable picture"
-        ));
-    }
-    let vs: Vec<VSample> = sc.vs[lead..].to_vec();
-    if let (Some(vt), false) = (&reference.video, vs.is_empty()) {
-        let n = vs.len();
-        // Display ranks by (epoch, poc), ties by decode order.
-        let mut order: Vec<usize> = (0..n).collect();
-        order.sort_by_key(|&i| (vs[i].epoch, vs[i].poc, i));
-        let mut rank = vec![0i64; n];
-        for (r, &i) in order.iter().enumerate() {
-            rank[i] = r as i64;
+    if let (Some(vt), false) = (&reference.video, sc.vs.is_empty()) {
+        let hevc_codec = matches!(vt.codec, Codec::Hevc { .. });
+        let keep = decodable(&sc.vs, hevc_codec);
+        let kept: Vec<usize> = (0..sc.vs.len()).filter(|&i| keep[i]).collect();
+        let dropped = sc.vs.len() - kept.len();
+        if dropped > 0 {
+            notes.push(format!(
+                "dropped {dropped} video sample(s) a decoder cannot reconstruct (before the first random access picture or depending on lost pictures)"
+            ));
         }
-        let computed_shift = (0..n).map(|i| i as i64 - rank[i]).max().unwrap_or(0).max(0);
-        let reorders = (0..n).any(|i| rank[i] != i as i64);
-        let shift = if reorders {
-            computed_shift.max(vt.reorder_delay as i64)
-        } else {
-            0
-        };
-        let mut dur = vt.sample_delta;
-        let ts = vt.trak.timescale.max(1) as f64;
-        // Variable-frame-rate references: stretch video to the audio length.
-        if vt.variable_rate {
-            if let Some(at) = &reference.audio {
-                let audio_ticks: u64 =
-                    sc.aus.iter().map(|a| a.count as u64).sum::<u64>() * at.sample_delta as u64;
-                let audio_s = audio_ticks as f64 / at.trak.timescale.max(1) as f64;
-                let video_s = n as f64 * dur as f64 / ts;
-                if audio_s > 0.0 && (audio_s - video_s).abs() > 0.5 {
-                    let d = (audio_s * ts / n as f64).round() as u32;
-                    if d > 0 {
-                        notes.push(format!(
-                            "variable frame rate reference: video frame duration stretched from {dur} to {d} ticks to match the audio"
-                        ));
-                        dur = d;
+        if !kept.is_empty() {
+            let ts = vt.trak.timescale.max(1);
+            let g = vt.sample_delta.max(1) as i64;
+            let clock = reference.audio.as_ref().and_then(|at| {
+                sc.audio.first().map(|l| AudioClock {
+                    delta: at.sample_delta.max(1),
+                    timescale: at.trak.timescale,
+                    total: l.frames,
+                })
+            });
+            let (slots, moved) = video_slots(&sc.vs, g, ts, clock, vt.variable_rate);
+            if moved > 0 {
+                notes.push(format!(
+                    "video timing re-anchored to the audio at {moved} frame(s) (variable frame rate or lost frames)"
+                ));
+            }
+            let m = kept.len();
+            let lead = slots[kept[0]];
+            let dts: Vec<i64> = kept.iter().map(|&i| slots[i] - lead).collect();
+            // Display ranks by (epoch, poc), ties by decode order.
+            let mut order: Vec<usize> = (0..m).collect();
+            order.sort_by_key(|&k| (sc.vs[kept[k]].epoch, sc.vs[kept[k]].poc, k));
+            let mut rank = vec![0usize; m];
+            for (r, &k) in order.iter().enumerate() {
+                rank[k] = r;
+            }
+            let reorders = (0..m).any(|k| rank[k] != k);
+            // Presentation time of display rank r: the r-th decode time
+            // plus one constant shift that keeps every composition offset
+            // non-negative (at least the reference's reorder delay).
+            let shift = if reorders {
+                (0..m)
+                    .map(|k| dts[k] - dts[rank[k]])
+                    .max()
+                    .unwrap_or(0)
+                    .max(vt.reorder_delay as i64 * g)
+                    .max(0)
+            } else {
+                0
+            };
+            let pts_of = |r: usize| -> i64 { dts[r] + shift };
+            let clamp32 = |v: i64| v.clamp(1, u32::MAX as i64) as u32;
+            let mut samples: Vec<OutSample> = (0..m)
+                .map(|k| {
+                    let s = &sc.vs[kept[k]];
+                    let duration = if k + 1 < m {
+                        clamp32(dts[k + 1] - dts[k])
+                    } else {
+                        clamp32(g)
+                    };
+                    let off = pts_of(rank[k]) - dts[k];
+                    OutSample {
+                        src_offset: s.offset,
+                        size: s.len,
+                        duration,
+                        cts_offset: off.clamp(i32::MIN as i64, i32::MAX as i64) as i32,
+                        keyframe: s.key,
+                        count: 1,
+                        suffix: None,
                     }
+                })
+                .collect();
+            if let Some(f) = samples.first_mut() {
+                // The first kept picture is where decoding starts.
+                f.keyframe = true;
+            }
+            // Decoding restarts after lost pictures: end the coded video
+            // sequence there so a decoder flushes its reference and
+            // reordering state instead of mixing pictures across the gap.
+            // (HEVC only: after an H.264 end of sequence the next picture
+            // must be an IDR, and the H.264 restarts above may be open-GOP
+            // intra pictures.)
+            let eos = match &vt.codec {
+                Codec::Hevc {
+                    nal_length_size, ..
+                } => NalSuffix::nal(*nal_length_size as usize, &[36 << 1, 0x01]),
+                _ => None,
+            };
+            for k in 0..m.saturating_sub(1) {
+                let restart = (kept[k] + 1..=kept[k + 1]).any(|i| sc.vs[i].seg_start);
+                if restart {
+                    samples[k].suffix = eos;
                 }
             }
-        }
-        let mut samples: Vec<OutSample> = (0..n)
-            .map(|i| {
-                let s = &vs[i];
-                let off = (rank[i] - i as i64 + shift) * dur as i64;
-                OutSample {
-                    src_offset: s.offset,
-                    size: s.len,
-                    duration: dur,
-                    cts_offset: off.clamp(i32::MIN as i64, i32::MAX as i64) as i32,
-                    keyframe: s.key,
-                    count: 1,
-                }
-            })
-            .collect();
-        if let Some(f) = samples.first_mut() {
-            // The first kept picture is where decoding starts.
-            f.keyframe = true;
-        }
-        report.video_samples = n as u64;
-        report.keyframes = samples.iter().filter(|s| s.keyframe).count() as u64;
-        if report.keyframes == 0 {
-            notes.push("no keyframe found in the recovered video".into());
-        }
-        report.bytes_classified += samples.iter().map(|s| s.size as u64).sum::<u64>();
-        video_dur_s = n as f64 * dur as f64 / ts;
-        let mut elst: Vec<Elst> = Vec::new();
-        if lead > 0 {
-            let movie_ts = reference.moov.mvhd.timescale.max(1) as u128;
-            let lead_ticks = lead as u128 * dur as u128;
-            elst.push(Elst {
-                segment_duration: (lead_ticks * movie_ts / ts as u128) as u64,
-                media_time: -1,
-                rate_integer: 1,
-                rate_fraction: 0,
+            report.video_samples = m as u64;
+            report.keyframes = samples.iter().filter(|s| s.keyframe).count() as u64;
+            report.bytes_classified += samples.iter().map(|s| s.size as u64).sum::<u64>();
+            let media_end = dts[m - 1] + g;
+            video_dur_s = (lead + media_end) as f64 / ts as f64;
+            let mut elst: Vec<Elst> = Vec::new();
+            if lead > 0 {
+                let movie_ts = reference.moov.mvhd.timescale.max(1) as u128;
+                elst.push(Elst {
+                    segment_duration: (lead as u128 * movie_ts / ts as u128) as u64,
+                    media_time: -1,
+                    rate_integer: 1,
+                    rate_fraction: 0,
+                });
+            }
+            if shift > 0 || lead > 0 {
+                elst.push(Elst {
+                    segment_duration: 0,
+                    media_time: shift,
+                    rate_integer: 1,
+                    rate_fraction: 0,
+                });
+            }
+            let elst = (!elst.is_empty()).then_some(elst);
+            tracks.push(TrackOut {
+                template: vt.trak.clone(),
+                track_id: next_id,
+                samples,
+                elst,
+                fit_elst: true,
+                constant_size: None,
             });
+            next_id += 1;
+        } else {
+            notes.push("no decodable video sample found".into());
         }
-        if shift > 0 || lead > 0 {
-            elst.push(Elst {
-                segment_duration: 0,
-                media_time: shift * dur as i64,
-                rate_integer: 1,
-                rate_fraction: 0,
-            });
-        }
-        let elst = (!elst.is_empty()).then_some(elst);
-        tracks.push(TrackOut {
-            template: vt.trak.clone(),
-            track_id: next_id,
-            samples,
-            elst,
-            fit_elst: true,
-            constant_size: None,
-        });
-        next_id += 1;
     }
-    if let (Some(at), false) = (&reference.audio, sc.aus.is_empty()) {
+    let templates: Vec<&TrackTemplate> = reference
+        .audio
+        .iter()
+        .chain(reference.extra_audio.iter())
+        .collect();
+    for (lane, at) in sc.audio.iter().zip(templates) {
+        if lane.samples.is_empty() {
+            continue;
+        }
         let dur = at.sample_delta;
-        let pcm = matches!(at.codec, Codec::Pcm { .. });
         let bpf = match at.codec {
             Codec::Pcm { bytes_per_frame } => Some(bytes_per_frame),
             _ => None,
         };
-        let samples: Vec<OutSample> = sc
-            .aus
+        let samples: Vec<OutSample> = lane
+            .samples
             .iter()
             .map(|a| OutSample {
                 src_offset: a.offset,
@@ -1896,12 +2533,13 @@ fn build_movie(
                 cts_offset: 0,
                 keyframe: true,
                 count: a.count,
+                suffix: None,
             })
             .collect();
-        let frames: u64 = sc.aus.iter().map(|a| a.count as u64).sum();
-        report.audio_samples = frames;
+        let frames: u64 = lane.samples.iter().map(|a| a.count as u64).sum();
+        report.audio_samples += frames;
         report.bytes_classified += samples.iter().map(|s| s.size as u64).sum::<u64>();
-        audio_dur_s = frames as f64 * dur as f64 / at.trak.timescale.max(1) as f64;
+        audio_dur_s = audio_dur_s.max(frames as f64 * dur as f64 / at.trak.timescale.max(1) as f64);
         let elst = at.edit_media_time.filter(|&m| m > 0).map(|m| {
             vec![Elst {
                 segment_duration: 0,
@@ -1916,8 +2554,9 @@ fn build_movie(
             samples,
             elst,
             fit_elst: true,
-            constant_size: if pcm { bpf } else { None },
+            constant_size: bpf,
         });
+        next_id += 1;
     }
     if tracks.is_empty() {
         return Err(Error::corrupt("mdat", "no samples recovered"));

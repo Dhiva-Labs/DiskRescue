@@ -13,7 +13,8 @@
 //! |---|---|---|
 //! | `RebuildMoov` | moov missing, corrupt, zeroed or stale | scan the mdat with a reference clip ([`crate::rebuild`]) |
 //! | `RelocateOffsets` | every chunk offset is off by a constant | shift `stco`/`co64` in place |
-//! | `ClipTablesToFile` | moov fine, mdat truncated or holed | keep the samples that are present, rewrite tables and sizes |
+//! | `DropDamagedSamples` | moov fine, samples hit by zero-filled or unreadable holes | drop them and the pictures depending on them, keep every other sample's timing |
+//! | `ClipTablesToFile` | moov fine, mdat truncated | keep the samples that are present, rewrite tables and sizes |
 //! | `FixMdatSize` | `mdat` size 0 / wrong / past EOF, samples all present | patch the size field |
 //! | `StripTrailingGarbage` | bytes after the last box | cut them |
 //! | `MoveMoovFirst` | on request only | fast-start rewrite (moov before mdat) |
@@ -54,6 +55,10 @@ pub enum Strategy {
     /// The chunk offsets are off by a constant (head of the file lost or
     /// boxes inserted): shift them so the first chunk starts at the mdat.
     RelocateOffsets,
+    /// The index is intact but some samples are damaged (zero-filled or
+    /// unreadable holes): drop them and the pictures that depend on them;
+    /// every other sample keeps its timing.
+    DropDamagedSamples,
 }
 
 impl Strategy {
@@ -66,6 +71,7 @@ impl Strategy {
             Strategy::MoveMoovFirst => "move_moov_first",
             Strategy::StripTrailingGarbage => "strip_trailing_garbage",
             Strategy::RelocateOffsets => "relocate_offsets",
+            Strategy::DropDamagedSamples => "drop_damaged_samples",
         }
     }
 }
@@ -104,6 +110,9 @@ pub fn plan(a: &Analysis, ctx: &RepairContext) -> Vec<Strategy> {
     }
     if a.relocation_delta.is_some() {
         v.push(Strategy::RelocateOffsets);
+    }
+    if !a.moov_stale() && a.tracks.iter().any(|t| !t.damaged_samples.is_empty()) {
+        v.push(Strategy::DropDamagedSamples);
     }
     let (declared, inside) = a.sample_counts();
     if inside < declared || a.relocation_delta.is_some() {
@@ -315,6 +324,320 @@ fn move_moov_first(src: &SharedSource, a: &Analysis) -> Result<Option<Step>> {
     }))
 }
 
+/// Append `s` to `out`, merging it into the previous entry when both are
+/// equal-size samples stored back to back (PCM runs).
+fn push_kept(out: &mut Vec<OutSample>, s: OutSample, merge: bool) {
+    if merge {
+        if let Some(last) = out.last_mut() {
+            let contiguous = last.src_offset + last.size as u64 == s.src_offset;
+            if contiguous
+                && last.duration == s.duration
+                && last.cts_offset == s.cts_offset
+                && last.count < 1 << 20
+                && (last.size as u64 + s.size as u64) <= u32::MAX as u64
+            {
+                last.size += s.size;
+                last.count += s.count;
+                return;
+            }
+        }
+    }
+    out.push(s);
+}
+
+/// Drop the damaged samples the analysis found (zero-filled or unreadable
+/// holes inside the media data) and, for video, every picture that
+/// depends on them: up to the next random access picture (H.264 IDR,
+/// HEVC IRAP) and the leading pictures shown before it. Every remaining
+/// sample keeps its decode and presentation time (a dropped sample's
+/// duration goes to the sample before it); an HEVC end-of-sequence NAL
+/// unit marks each restart so decoders reset there.
+fn drop_damaged(src: &SharedSource, a: &Analysis) -> Result<Option<Step>> {
+    let Some(moov) = &a.moov else {
+        return Ok(None);
+    };
+    if a.moov_stale() || a.tracks.iter().all(|t| t.damaged_samples.is_empty()) {
+        return Ok(None);
+    }
+    let size = src.size();
+    let unreadable = src.unreadable();
+    let movie_ts = moov.mvhd.timescale.max(1) as u128;
+    let mut tracks = Vec::new();
+    let (mut damaged_total, mut dependent_total) = (0u64, 0u64);
+    for (t, check) in moov.tracks.iter().zip(&a.tracks) {
+        let samples = match sample_table(t) {
+            Ok(v) => v,
+            Err(e) => {
+                // Too many samples to list (long PCM): keep the readable
+                // prefix, chunk by chunk.
+                if !matches!(t.stsz, SampleSizes::Constant { .. }) {
+                    return Err(e);
+                }
+                let out = first_samples(t, check.inside)?;
+                if !out.is_empty() {
+                    tracks.push(TrackOut {
+                        template: t.clone(),
+                        track_id: t.tkhd.track_id,
+                        samples: out,
+                        elst: t.elst.clone(),
+                        fit_elst: true,
+                        constant_size: match t.stsz {
+                            SampleSizes::Constant { size, .. } => Some(size),
+                            _ => None,
+                        },
+                    });
+                }
+                continue;
+            }
+        };
+        let n = samples.len();
+        let e = t.entry();
+        let video = e.and_then(|e| {
+            e.avcc
+                .as_ref()
+                .map(|c| (c.nal_length_size as usize, false))
+                .or_else(|| e.hvcc.as_ref().map(|c| (c.nal_length_size as usize, true)))
+        });
+        let aac = e
+            .and_then(|e| e.esds.as_ref())
+            .is_some_and(|es| es.object_type == 0x40);
+        let aac_cfg = e
+            .and_then(|e| e.esds.as_ref())
+            .and_then(|es| crate::aac::parse_audio_specific_config(&es.audio_specific_config));
+        let mut damaged = vec![false; n];
+        let mut rap: Vec<bool> = samples.iter().map(|s| s.keyframe).collect();
+        for (i, s) in samples.iter().enumerate() {
+            if s.end() > size {
+                for d in damaged.iter_mut().skip(i) {
+                    *d = true;
+                }
+                break;
+            }
+            if unreadable.as_ref().is_some_and(|u| {
+                u.intersects(diskrescue_core::Range::with_len(s.offset, s.size as u64))
+            }) {
+                damaged[i] = true;
+                continue;
+            }
+            if let Some((l, hevc_codec)) = video {
+                if s.size <= 64 << 20 {
+                    let d = src.read_vec(s.offset, s.size as usize)?;
+                    let (ok, r) = if d.len() == s.size as usize {
+                        crate::analysis::check_video_sample(&d, l, hevc_codec)
+                    } else {
+                        (false, false)
+                    };
+                    damaged[i] = !ok;
+                    rap[i] = r;
+                }
+            } else if aac && s.size > 0 && s.size <= 1 << 16 {
+                let d = src.read_vec(s.offset, s.size as usize)?;
+                damaged[i] = !crate::analysis::aac_sample_intact(&d, s.size, aac_cfg.as_ref());
+            }
+        }
+        let bad = damaged.iter().filter(|&&d| d).count();
+        let past_eof = samples.iter().filter(|s| s.end() > size).count();
+        if bad > 8 && (bad - past_eof) * 2 > n && unreadable.is_none() {
+            // Most samples fail: the check does not fit this track (see
+            // the analysis); keep it as it is.
+            for d in damaged.iter_mut() {
+                *d = false;
+            }
+        }
+        damaged_total += damaged.iter().filter(|&&d| d).count() as u64;
+        let mut drop = damaged.clone();
+        let mut restart = vec![false; n];
+        if video.is_some() {
+            let mut i = 0usize;
+            while i < n {
+                if !damaged[i] {
+                    i += 1;
+                    continue;
+                }
+                let mut j = i + 1;
+                while j < n && !(rap[j] && !damaged[j]) {
+                    drop[j] = true;
+                    j += 1;
+                }
+                if j < n {
+                    restart[j] = true;
+                    let cts = |k: usize| samples[k].dts as i64 + samples[k].cts_offset as i64;
+                    let mut k = j + 1;
+                    while k < n && !rap[k] {
+                        if cts(k) < cts(j) {
+                            drop[k] = true;
+                        }
+                        k += 1;
+                    }
+                }
+                i = j;
+            }
+        }
+        dependent_total += drop
+            .iter()
+            .zip(&damaged)
+            .filter(|(d, x)| **d && !**x)
+            .count() as u64;
+        let constant_size = match t.stsz {
+            SampleSizes::Constant { size, .. } => Some(size),
+            _ => None,
+        };
+        let eos = match video {
+            Some((l, true)) => crate::writer::NalSuffix::nal(l, &[36 << 1, 0x01]),
+            _ => None,
+        };
+        let mut out: Vec<OutSample> = Vec::new();
+        let mut lead: u64 = 0;
+        for (i, s) in samples.iter().enumerate() {
+            if drop[i] {
+                match out.last_mut() {
+                    Some(last) if last.count == 1 => {
+                        last.duration = last.duration.saturating_add(s.duration)
+                    }
+                    Some(last) => {
+                        // Split the last sample off a merged run so it can
+                        // carry the dropped time.
+                        let per = last.size / last.count.max(1);
+                        last.count -= 1;
+                        last.size -= per;
+                        let tail = OutSample {
+                            src_offset: last.src_offset + last.size as u64,
+                            size: per,
+                            duration: last.duration.saturating_add(s.duration),
+                            cts_offset: last.cts_offset,
+                            keyframe: true,
+                            count: 1,
+                            suffix: None,
+                        };
+                        out.push(tail);
+                    }
+                    None => lead += s.duration as u64,
+                }
+                continue;
+            }
+            if restart[i] {
+                if let Some(last) = out.last_mut() {
+                    last.suffix = eos;
+                }
+            }
+            let first = out.is_empty();
+            push_kept(
+                &mut out,
+                OutSample {
+                    src_offset: s.offset,
+                    size: s.size,
+                    duration: s.duration,
+                    cts_offset: s.cts_offset,
+                    keyframe: s.keyframe || first,
+                    count: 1,
+                    suffix: None,
+                },
+                constant_size.is_some() && video.is_none(),
+            );
+        }
+        if out.is_empty() {
+            continue;
+        }
+        let mut elst = t.elst.clone();
+        if lead > 0 {
+            let ts = t.timescale.max(1) as u128;
+            let empty = crate::boxes::Elst {
+                segment_duration: (lead as u128 * movie_ts / ts) as u64,
+                media_time: -1,
+                rate_integer: 1,
+                rate_fraction: 0,
+            };
+            let mut v = vec![empty];
+            v.extend(elst.unwrap_or_else(|| {
+                vec![crate::boxes::Elst {
+                    segment_duration: 0,
+                    media_time: 0,
+                    rate_integer: 1,
+                    rate_fraction: 0,
+                }]
+            }));
+            elst = Some(v);
+        }
+        tracks.push(TrackOut {
+            template: t.clone(),
+            track_id: t.tkhd.track_id,
+            samples: out,
+            elst,
+            fit_elst: true,
+            constant_size,
+        });
+    }
+    if tracks.is_empty() {
+        return Err(Error::corrupt("mdat", "no intact sample left in the file"));
+    }
+    let ftyp = match a.boxes.first() {
+        Some(b) if b.header.is(b"ftyp") && !b.truncated => read_box(&**src, &b.header)?,
+        _ => Vec::new(),
+    };
+    let movie = MovieOut {
+        ftyp,
+        mvhd: moov.mvhd.clone(),
+        tracks,
+        user_boxes: moov.user_boxes.clone(),
+        max_chunk_samples: 1024,
+    };
+    let out = assemble(&movie, src.clone())?;
+    Ok(Some(Step {
+        out,
+        note: format!(
+            "dropped {damaged_total} damaged sample(s) and {dependent_total} picture(s) that depend on them; every other sample keeps its timing"
+        ),
+        lossy: true,
+    }))
+}
+
+/// The first `keep` samples of a track as output samples. Constant-size
+/// tracks with one `stts` delta (uncompressed PCM, where every frame is a
+/// sample) are described chunk by chunk as runs, without listing every
+/// sample.
+fn first_samples(t: &crate::boxes::Trak, keep: u64) -> Result<Vec<OutSample>> {
+    if let (SampleSizes::Constant { size, .. }, [(_, delta)]) = (&t.stsz, t.stts.as_slice()) {
+        let mut out = Vec::new();
+        let mut left = keep;
+        for c in boxes::chunk_runs(t)? {
+            if left == 0 {
+                break;
+            }
+            let k = (c.samples as u64).min(left);
+            let mut done = 0u64;
+            while done < k {
+                let n = (k - done).min((u32::MAX / (*size).max(1)).min(1 << 20) as u64);
+                out.push(OutSample {
+                    src_offset: c.offset + done * *size as u64,
+                    size: (n * *size as u64) as u32,
+                    duration: *delta,
+                    cts_offset: 0,
+                    keyframe: true,
+                    count: n as u32,
+                    suffix: None,
+                });
+                done += n;
+            }
+            left -= k;
+        }
+        return Ok(out);
+    }
+    let samples = sample_table(t)?;
+    Ok(samples
+        .iter()
+        .take(keep.min(samples.len() as u64) as usize)
+        .map(|s| OutSample {
+            src_offset: s.offset,
+            size: s.size,
+            duration: s.duration,
+            cts_offset: s.cts_offset,
+            keyframe: s.keyframe,
+            count: 1,
+            suffix: None,
+        })
+        .collect())
+}
+
 fn clip_tables(src: &SharedSource, a: &Analysis) -> Result<Option<Step>> {
     let Some(moov) = &a.moov else {
         return Ok(None);
@@ -326,23 +649,12 @@ fn clip_tables(src: &SharedSource, a: &Analysis) -> Result<Option<Step>> {
     let mut tracks = Vec::new();
     let mut dropped_tracks = 0;
     for (t, check) in moov.tracks.iter().zip(&a.tracks) {
-        let samples = sample_table(t)?;
-        let keep = check.inside as usize;
+        let keep = check.inside;
         if keep == 0 {
             dropped_tracks += 1;
             continue;
         }
-        let out: Vec<OutSample> = samples[..keep.min(samples.len())]
-            .iter()
-            .map(|s| OutSample {
-                src_offset: s.offset,
-                size: s.size,
-                duration: s.duration,
-                cts_offset: s.cts_offset,
-                keyframe: s.keyframe,
-                count: 1,
-            })
-            .collect();
+        let out = first_samples(t, keep)?;
         let constant_size = match t.stsz {
             SampleSizes::Constant { size, .. } => Some(size),
             _ => None,
@@ -447,6 +759,7 @@ pub fn apply_to_source(
                 }
             }
             Strategy::ClipTablesToFile => clip_tables(&cur, &a),
+            Strategy::DropDamagedSamples => drop_damaged(&cur, &a),
             Strategy::FixMdatSize => fix_mdat_size(&cur, &a),
             Strategy::MoveMoovFirst => move_moov_first(&cur, &a),
             Strategy::StripTrailingGarbage => strip_trailing(&cur, &a),

@@ -145,6 +145,11 @@ pub struct Sps {
     pub long_term_ref_pics_present: Option<bool>,
     /// vui_parameters_present_flag, when the parse reached it.
     pub vui_present: Option<bool>,
+    /// The short-term reference picture sets of the SPS (empty when the
+    /// parse did not reach them).
+    pub st_rps: Vec<StRps>,
+    /// num_long_term_ref_pics_sps.
+    pub num_long_term_ref_pics_sps: u32,
 }
 
 /// Picture parameter set (prefix).
@@ -200,6 +205,11 @@ pub struct SliceSegmentHeader {
     pub layer_id: u8,
     /// TemporalId.
     pub temporal_id: u8,
+    /// POC deltas of every picture in the slice's reference picture set
+    /// (short-term sets; `Some(empty)` for IDR pictures). `None` when the
+    /// set could not be derived (long-term references, dependent slice
+    /// segments, or a parameter set the parse did not reach).
+    pub ref_deltas: Option<Vec<i32>>,
 }
 
 fn rbsp(nal: &[u8], max: usize) -> Vec<u8> {
@@ -277,33 +287,138 @@ fn skip_scaling_list_data(r: &mut BitReader<'_>) -> Option<()> {
     Some(())
 }
 
-/// Parse `st_ref_pic_set(idx)` in an SPS, returning NumDeltaPocs[idx].
-fn parse_st_rps(r: &mut BitReader<'_>, idx: usize, num_delta: &[u32]) -> Option<u32> {
+/// A short-term reference picture set (H.265 §7.4.8): POC deltas of the
+/// pictures before (`neg`, decreasing) and after (`pos`, increasing) the
+/// current one, each with its `used_by_curr_pic` flag.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct StRps {
+    /// DeltaPocS0 / UsedByCurrPicS0.
+    pub neg: Vec<(i32, bool)>,
+    /// DeltaPocS1 / UsedByCurrPicS1.
+    pub pos: Vec<(i32, bool)>,
+}
+
+impl StRps {
+    /// NumDeltaPocs.
+    pub fn len(&self) -> usize {
+        self.neg.len() + self.pos.len()
+    }
+
+    /// True when the set is empty.
+    pub fn is_empty(&self) -> bool {
+        self.neg.is_empty() && self.pos.is_empty()
+    }
+
+    /// Every POC delta of the set (used by the current picture or kept for
+    /// later pictures).
+    pub fn deltas(&self) -> Vec<i32> {
+        self.neg
+            .iter()
+            .chain(self.pos.iter())
+            .map(|x| x.0)
+            .collect()
+    }
+}
+
+/// Parse `st_ref_pic_set(idx)` (§7.3.7) and derive its delta POCs
+/// (§7.4.8). `sets` holds the sets already parsed from the SPS; `num_sets`
+/// is `num_short_term_ref_pic_sets` (a slice header passes `idx ==
+/// num_sets`, which carries `delta_idx_minus1`).
+fn parse_st_rps(
+    r: &mut BitReader<'_>,
+    idx: usize,
+    num_sets: usize,
+    sets: &[StRps],
+) -> Option<StRps> {
     let inter = if idx != 0 { r.read_flag()? } else { false };
     if inter {
-        r.read_flag()?; // delta_rps_sign
-        r.read_ue()?; // abs_delta_rps_minus1
-        let reference = *num_delta.get(idx - 1)?;
-        let mut count = 0;
-        for _ in 0..=reference {
-            let used = r.read_flag()?;
-            let use_delta = if used { true } else { r.read_flag()? };
-            if use_delta {
-                count += 1;
+        let delta_idx = if idx == num_sets {
+            r.read_ue()? as usize + 1
+        } else {
+            1
+        };
+        let reference = sets.get(idx.checked_sub(delta_idx)?)?;
+        let sign = r.read_flag()?;
+        let abs = r.read_ue()?;
+        if abs >= 1 << 15 {
+            return None;
+        }
+        let delta_rps = if sign {
+            -(abs as i32 + 1)
+        } else {
+            abs as i32 + 1
+        };
+        let n = reference.len();
+        let mut used = Vec::with_capacity(n + 1);
+        let mut use_delta = Vec::with_capacity(n + 1);
+        for _ in 0..=n {
+            let u = r.read_flag()?;
+            let d = if u { true } else { r.read_flag()? };
+            used.push(u);
+            use_delta.push(d);
+        }
+        let nn = reference.neg.len();
+        let mut out = StRps::default();
+        for j in (0..reference.pos.len()).rev() {
+            let d = reference.pos[j].0 + delta_rps;
+            if d < 0 && use_delta[nn + j] {
+                out.neg.push((d, used[nn + j]));
             }
         }
-        Some(count)
+        if delta_rps < 0 && use_delta[n] {
+            out.neg.push((delta_rps, used[n]));
+        }
+        for j in 0..nn {
+            let d = reference.neg[j].0 + delta_rps;
+            if d < 0 && use_delta[j] {
+                out.neg.push((d, used[j]));
+            }
+        }
+        for j in (0..nn).rev() {
+            let d = reference.neg[j].0 + delta_rps;
+            if d > 0 && use_delta[j] {
+                out.pos.push((d, used[j]));
+            }
+        }
+        if delta_rps > 0 && use_delta[n] {
+            out.pos.push((delta_rps, used[n]));
+        }
+        for j in 0..reference.pos.len() {
+            let d = reference.pos[j].0 + delta_rps;
+            if d > 0 && use_delta[nn + j] {
+                out.pos.push((d, used[nn + j]));
+            }
+        }
+        if out.neg.len() > 16 || out.pos.len() > 16 {
+            return None;
+        }
+        Some(out)
     } else {
         let neg = r.read_ue()?;
         let pos = r.read_ue()?;
         if neg > 16 || pos > 16 {
             return None;
         }
-        for _ in 0..neg + pos {
-            r.read_ue()?;
-            r.read_flag()?;
+        let mut out = StRps::default();
+        let mut d = 0i32;
+        for _ in 0..neg {
+            let m = r.read_ue()?;
+            if m >= 1 << 15 {
+                return None;
+            }
+            d -= m as i32 + 1;
+            out.neg.push((d, r.read_flag()?));
         }
-        Some(neg + pos)
+        d = 0;
+        for _ in 0..pos {
+            let m = r.read_ue()?;
+            if m >= 1 << 15 {
+                return None;
+            }
+            d += m as i32 + 1;
+            out.pos.push((d, r.read_flag()?));
+        }
+        Some(out)
     }
 }
 
@@ -406,12 +521,13 @@ pub fn parse_sps(nal: &[u8]) -> Option<Sps> {
         if n > 64 {
             return None;
         }
-        let mut deltas = Vec::with_capacity(n as usize);
+        let mut sets: Vec<StRps> = Vec::with_capacity(n as usize);
         for i in 0..n as usize {
-            let d = parse_st_rps(&mut r, i, &deltas)?;
-            deltas.push(d);
+            let d = parse_st_rps(&mut r, i, n as usize, &sets)?;
+            sets.push(d);
         }
         s.num_short_term_ref_pic_sets = Some(n);
+        s.st_rps = sets;
         let lt = r.read_flag()?;
         if lt {
             let k = r.read_ue()?;
@@ -421,6 +537,7 @@ pub fn parse_sps(nal: &[u8]) -> Option<Sps> {
             for _ in 0..k {
                 r.skip(s.log2_max_poc_lsb as usize + 1)?;
             }
+            s.num_long_term_ref_pics_sps = k;
         }
         s.long_term_ref_pics_present = Some(lt);
         r.read_flag()?; // temporal mvp
@@ -465,7 +582,7 @@ pub fn parse_slice_header(
     if !is_slice_type(h.nal_type) || nal.len() < 3 {
         return None;
     }
-    let data = rbsp(&nal[2..], 96);
+    let data = rbsp(&nal[2..], 160);
     let mut r = BitReader::new(&data);
     let mut s = SliceSegmentHeader {
         first_slice_segment_in_pic: r.read_flag()?,
@@ -512,13 +629,48 @@ pub fn parse_slice_header(
         if sps.separate_colour_plane {
             s.colour_plane_id = r.read_bits(2)?;
         }
-        s.poc_lsb = Some(if is_idr(h.nal_type) {
-            0
+        if is_idr(h.nal_type) {
+            s.poc_lsb = Some(0);
+            s.ref_deltas = Some(Vec::new());
         } else {
-            r.read_bits(sps.log2_max_poc_lsb)?
-        });
+            s.poc_lsb = Some(r.read_bits(sps.log2_max_poc_lsb)?);
+            s.ref_deltas = slice_rps(&mut r, sps);
+        }
     }
     Some(s)
+}
+
+/// The short-term reference picture set of a non-IDR slice (the syntax
+/// right after `slice_pic_order_cnt_lsb`). `None` when it cannot be
+/// derived or long-term references are in use.
+fn slice_rps(r: &mut BitReader<'_>, sps: &Sps) -> Option<Vec<i32>> {
+    let num = sps.num_short_term_ref_pic_sets? as usize;
+    if num != sps.st_rps.len() {
+        return None;
+    }
+    let rps = if !r.read_flag()? {
+        parse_st_rps(r, num, num, &sps.st_rps)?
+    } else {
+        let idx = if num > 1 {
+            let bits = 32 - ((num - 1) as u32).leading_zeros();
+            r.read_bits(bits)? as usize
+        } else {
+            0
+        };
+        sps.st_rps.get(idx)?.clone()
+    };
+    if sps.long_term_ref_pics_present? {
+        let lt_sps = if sps.num_long_term_ref_pics_sps > 0 {
+            r.read_ue()?
+        } else {
+            0
+        };
+        let lt_pics = r.read_ue()?;
+        if lt_sps + lt_pics > 0 {
+            return None;
+        }
+    }
+    Some(rps.deltas())
 }
 
 /// Does `cur` start a new picture after `prev`?
