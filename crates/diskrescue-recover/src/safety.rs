@@ -40,7 +40,8 @@ pub fn check(source: &Path, info: &DeviceInfo, output: &Path, allow_mounted: boo
     if info.kind == DeviceKind::ImageFile {
         if let (Ok(src), Some(out)) = (source.canonicalize(), out_abs.as_ref()) {
             if out == &src {
-                r.blockers.push("the output directory is the image file itself".into());
+                r.blockers
+                    .push("the output directory is the image file itself".into());
             }
         }
     } else {
@@ -57,7 +58,11 @@ pub fn check(source: &Path, info: &DeviceInfo, output: &Path, allow_mounted: boo
             )),
         }
         if info.is_mounted() {
-            let mps: Vec<String> = info.mountpoints.iter().map(|m| m.display().to_string()).collect();
+            let mps: Vec<String> = info
+                .mountpoints
+                .iter()
+                .map(|m| m.display().to_string())
+                .collect();
             let msg = format!(
                 "{} is mounted at {}. Unmount it first so nothing writes to it while recovering \
                  (or pass --allow-mounted to continue anyway).",
@@ -142,7 +147,9 @@ mod tests {
         let img = dir.path().join("card.img");
         std::fs::write(&img, [0u8; 1024]).unwrap();
         let info = image_info(&img);
-        assert!(check(&img, &info, &dir.path().join("out"), false).blockers.is_empty());
+        assert!(check(&img, &info, &dir.path().join("out"), false)
+            .blockers
+            .is_empty());
         assert!(!check(&img, &info, &img, false).blockers.is_empty());
     }
 

@@ -20,6 +20,7 @@ pub mod sink;
 
 pub use filters::Selection;
 pub use pipeline::{
-    recover, repair_files, survey, verify_files, CarvePolicy, Event, NoopObserver, Observer, RecoverOptions, Stage,
+    recover, repair_files, survey, verify_files, CarvePolicy, Event, NoopObserver, Observer,
+    RecoverOptions, Stage,
 };
 pub use report::{FileRecord, Outcome, Report};

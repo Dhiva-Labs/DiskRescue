@@ -18,6 +18,8 @@ pub fn open_filesystem(kind: FsKind, src: SharedSource) -> Result<Box<dyn FileSy
             let opts = diskrescue_ext4::ExtOptions::default();
             Ok(Box::new(diskrescue_ext4::open(src, &opts)?))
         }
-        FsKind::Other => Err(Error::unsupported("this filesystem type is recognised but not parsed")),
+        FsKind::Other => Err(Error::unsupported(
+            "this filesystem type is recognised but not parsed",
+        )),
     }
 }

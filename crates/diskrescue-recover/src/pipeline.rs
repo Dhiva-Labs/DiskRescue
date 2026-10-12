@@ -21,7 +21,8 @@ use std::sync::{Arc, Mutex};
 use rayon::prelude::*;
 
 use diskrescue_core::format::{
-    FileFormat, FormatRegistry, RepairContext, RepairOutcome, RepairResult, Validation, ValidationStatus,
+    FileFormat, FormatRegistry, RepairContext, RepairOutcome, RepairResult, Validation,
+    ValidationStatus,
 };
 use diskrescue_core::fs::{EntryConfidence, FileEntry, FileSystem, FsKind, WalkControl};
 use diskrescue_core::media::MediaCategory;
@@ -38,7 +39,8 @@ use crate::naming::extension_of;
 use crate::output::{set_file_times, OutputTree};
 use crate::registry;
 use crate::report::{
-    CarveRecord, FileRecord, Origin, Outcome, RepairRecord, Report, SourceRecord, ValidationRecord, VolumeRecord,
+    CarveRecord, FileRecord, Origin, Outcome, RepairRecord, Report, SourceRecord, ValidationRecord,
+    VolumeRecord,
 };
 use crate::sink::{HashingWriter, HeadSink};
 
@@ -218,9 +220,19 @@ pub struct Discovery {
 }
 
 /// Read partition tables, probe and open every volume.
-pub fn discover(src: &SharedSource, sector_size: u32, scan_lost: bool, cancel: &Arc<AtomicBool>, obs: &dyn Observer) -> Discovery {
+pub fn discover(
+    src: &SharedSource,
+    sector_size: u32,
+    scan_lost: bool,
+    cancel: &Arc<AtomicBool>,
+    obs: &dyn Observer,
+) -> Discovery {
     obs.event(Event::Stage(Stage::Partitions));
-    let sector = if sector_size > 0 { sector_size } else { src.sector_size().max(512) };
+    let sector = if sector_size > 0 {
+        sector_size
+    } else {
+        src.sector_size().max(512)
+    };
     let mut warnings = Vec::new();
     let (table, mut vols) = match diskrescue_partition::volumes(src, sector) {
         Ok(x) => x,
@@ -234,7 +246,8 @@ pub fn discover(src: &SharedSource, sector_size: u32, scan_lost: bool, cancel: &
     let nothing_usable = vols.iter().all(|v| v.probe.is_none());
     if nothing_usable && scan_lost && !cancel.load(Ordering::Relaxed) {
         obs.event(Event::Warning(
-            "no readable partition table or filesystem; scanning the whole source for lost volumes".into(),
+            "no readable partition table or filesystem; scanning the whole source for lost volumes"
+                .into(),
         ));
         let opts = diskrescue_partition::ScanOptions {
             step: 4096,
@@ -255,8 +268,13 @@ pub fn discover(src: &SharedSource, sector_size: u32, scan_lost: bool, cancel: &
             Ok(found) => {
                 for entry in found {
                     let probe = diskrescue_partition::probe_filesystem(src, entry.start);
-                    let source: SharedSource = Arc::new(SubSource::new(src.clone(), entry.start, entry.size));
-                    vols.push(diskrescue_partition::Volume { entry, source, probe });
+                    let source: SharedSource =
+                        Arc::new(SubSource::new(src.clone(), entry.start, entry.size));
+                    vols.push(diskrescue_partition::Volume {
+                        entry,
+                        source,
+                        probe,
+                    });
                 }
             }
             Err(e) => warnings.push(format!("lost-partition scan failed: {e}")),
@@ -277,12 +295,19 @@ pub fn discover(src: &SharedSource, sector_size: u32, scan_lost: bool, cancel: &
             origin: vol.entry.origin.clone(),
             files_listed: 0,
             deleted_listed: 0,
-            warnings: vol.probe.as_ref().map(|p| p.notes.clone()).unwrap_or_default(),
+            warnings: vol
+                .probe
+                .as_ref()
+                .map(|p| p.notes.clone())
+                .unwrap_or_default(),
             error: None,
         };
         match kind {
             Some(k) if k != FsKind::Other => {
-                obs.event(Event::Stage(Stage::Listing { volume: index, fs: k }));
+                obs.event(Event::Stage(Stage::Listing {
+                    volume: index,
+                    fs: k,
+                }));
                 match open_filesystem(k, vol.source.clone()) {
                     Ok(fs) => {
                         let info = fs.info();
@@ -291,7 +316,8 @@ pub fn discover(src: &SharedSource, sector_size: u32, scan_lost: bool, cancel: &
                         }
                         rec.fs = Some(info.kind);
                         rec.warnings.extend(info.warnings.iter().cloned());
-                        let dir = OutputTree::volume_dir(index, Some(info.kind), rec.label.as_deref());
+                        let dir =
+                            OutputTree::volume_dir(index, Some(info.kind), rec.label.as_deref());
                         parsed.push(ParsedVolume {
                             index,
                             start: vol.entry.start,
@@ -303,7 +329,10 @@ pub fn discover(src: &SharedSource, sector_size: u32, scan_lost: bool, cancel: &
                     Err(e) => rec.error = Some(e.to_string()),
                 }
             }
-            Some(_) => rec.error = Some("filesystem recognised but not supported; its space will be carved".into()),
+            Some(_) => {
+                rec.error =
+                    Some("filesystem recognised but not supported; its space will be carved".into())
+            }
             None => rec.error = Some("no filesystem recognised; its space will be carved".into()),
         }
         obs.event(Event::Volume(rec.clone()));
@@ -382,7 +411,8 @@ pub fn select_entries(
             rec.files_listed = listed;
             rec.deleted_listed = deleted;
             if let Err(e) = res {
-                rec.warnings.push(format!("directory walk stopped early: {e}"));
+                rec.warnings
+                    .push(format!("directory walk stopped early: {e}"));
             }
         }
     }
@@ -401,9 +431,16 @@ pub fn select_entries(
             let head = head.into_inner();
             let n = done.fetch_add(1, Ordering::Relaxed) + 1;
             if n % 256 == 0 {
-                obs.event(Event::Progress { done: n, total, bytes: 0 });
+                obs.event(Event::Progress {
+                    done: n,
+                    total,
+                    bytes: 0,
+                });
             }
-            let fmt = formats.matching(&head).into_iter().find(|f| f.probe(&head))?;
+            let fmt = formats
+                .matching(&head)
+                .into_iter()
+                .find(|f| f.probe(&head))?;
             if !sel.wants_category(fmt.category()) {
                 return None;
             }
@@ -430,9 +467,16 @@ struct Ctx<'a> {
 }
 
 /// Run the whole pipeline on `src`.
-pub fn recover(src: SharedSource, source: SourceRecord, opts: &RecoverOptions, obs: &dyn Observer) -> Result<Report> {
+pub fn recover(
+    src: SharedSource,
+    source: SourceRecord,
+    opts: &RecoverOptions,
+    obs: &dyn Observer,
+) -> Result<Report> {
     let workers = if opts.workers == 0 {
-        std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4)
+        std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4)
     } else {
         opts.workers
     };
@@ -479,12 +523,21 @@ pub fn recover(src: SharedSource, source: SourceRecord, opts: &RecoverOptions, o
                     user_supplied: true,
                 });
             }
-            None => report.warnings.push(format!("donor {} is not a recognised media file; ignored", d.display())),
+            None => report.warnings.push(format!(
+                "donor {} is not a recognised media file; ignored",
+                d.display()
+            )),
         }
     }
 
     let disc = if opts.use_filesystems {
-        discover(&src, opts.sector_size, opts.scan_lost_partitions, &opts.cancel, obs)
+        discover(
+            &src,
+            opts.sector_size,
+            opts.scan_lost_partitions,
+            &opts.cancel,
+            obs,
+        )
     } else {
         Discovery {
             table: PartitionTable::empty(PartitionScheme::Unknown),
@@ -499,7 +552,14 @@ pub fn recover(src: SharedSource, source: SourceRecord, opts: &RecoverOptions, o
     let parsed = disc.parsed;
 
     // Filesystem extraction.
-    let candidates = select_entries(&parsed, &mut volume_records, &opts.selection, &ctx.formats, &opts.cancel, obs);
+    let candidates = select_entries(
+        &parsed,
+        &mut volume_records,
+        &opts.selection,
+        &ctx.formats,
+        &opts.cancel,
+        obs,
+    );
     report.volumes = volume_records;
     obs.event(Event::Stage(Stage::Extracting));
     let total = candidates.len() as u64;
@@ -515,7 +575,11 @@ pub fn recover(src: SharedSource, source: SourceRecord, opts: &RecoverOptions, o
                 let rec = extract_fs_entry(&ctx, &parsed[c.volume], c);
                 let n = done.fetch_add(1, Ordering::Relaxed) + 1;
                 let b = bytes.fetch_add(rec.size, Ordering::Relaxed) + rec.size;
-                obs.event(Event::Progress { done: n, total, bytes: b });
+                obs.event(Event::Progress {
+                    done: n,
+                    total,
+                    bytes: b,
+                });
                 Some(rec)
             })
             .collect()
@@ -573,7 +637,8 @@ fn extract_fs_entry(ctx: &Ctx<'_>, pv: &ParsedVolume, c: &Candidate) -> FileReco
         Ok(x) => x,
         Err(err) => {
             rec.outcome = Outcome::Failed;
-            rec.notes.push(format!("could not create output file: {err}"));
+            rec.notes
+                .push(format!("could not create output file: {err}"));
             return rec;
         }
     };
@@ -637,7 +702,12 @@ fn extract_fs_entry(ctx: &Ctx<'_>, pv: &ParsedVolume, c: &Candidate) -> FileReco
 }
 
 /// Byte ranges of the source to carve, per the policy.
-fn carve_regions(policy: CarvePolicy, size: u64, parsed: &[ParsedVolume], warnings: &mut Vec<String>) -> Option<RangeSet> {
+fn carve_regions(
+    policy: CarvePolicy,
+    size: u64,
+    parsed: &[ParsedVolume],
+    warnings: &mut Vec<String>,
+) -> Option<RangeSet> {
     let whole = RangeSet::from_range(Range::new(0, size));
     match policy {
         CarvePolicy::Off => None,
@@ -663,7 +733,10 @@ fn carve_regions(policy: CarvePolicy, size: u64, parsed: &[ParsedVolume], warnin
                 }
             }
             if policy == CarvePolicy::Auto {
-                let covered: RangeSet = parsed.iter().map(|p| Range::with_len(p.start, p.size)).collect();
+                let covered: RangeSet = parsed
+                    .iter()
+                    .map(|p| Range::with_len(p.start, p.size))
+                    .collect();
                 set = set.union(&covered.complement_within(Range::new(0, size)));
             }
             Some(set)
@@ -671,7 +744,12 @@ fn carve_regions(policy: CarvePolicy, size: u64, parsed: &[ParsedVolume], warnin
     }
 }
 
-fn carve_stage(ctx: &Ctx<'_>, src: &SharedSource, parsed: &[ParsedVolume], report: &mut Report) -> Result<()> {
+fn carve_stage(
+    ctx: &Ctx<'_>,
+    src: &SharedSource,
+    parsed: &[ParsedVolume],
+    report: &mut Report,
+) -> Result<()> {
     let opts = ctx.opts;
     let mut warnings = Vec::new();
     let Some(regions) = carve_regions(opts.carve, src.size(), parsed, &mut warnings) else {
@@ -762,7 +840,11 @@ fn carve_stage(ctx: &Ctx<'_>, src: &SharedSource, parsed: &[ParsedVolume], repor
     Ok(())
 }
 
-fn extract_carved(ctx: &Ctx<'_>, src: &SharedSource, cf: &diskrescue_carve::CarvedFile) -> FileRecord {
+fn extract_carved(
+    ctx: &Ctx<'_>,
+    src: &SharedSource,
+    cf: &diskrescue_carve::CarvedFile,
+) -> FileRecord {
     let mut rec = FileRecord::new(
         Origin::Carved {
             offset: cf.start,
@@ -777,7 +859,15 @@ fn extract_carved(ctx: &Ctx<'_>, src: &SharedSource, cf: &diskrescue_carve::Carv
     rec.format = Some(cf.format.clone());
     rec.meta = cf.meta.clone();
     rec.notes.extend(cf.notes.iter().cloned());
-    let rel = OutputTree::carved_relative(cf.category, cf.meta.created, cf.start, &cf.extension);
+    // TIFF-family formats (RAW variants such as SRW, ERF, NRW) and RAF put
+    // the precise extension in their metadata.
+    let ext = cf
+        .meta
+        .extra
+        .get("extension")
+        .cloned()
+        .unwrap_or_else(|| cf.extension.clone());
+    let rel = OutputTree::carved_relative(cf.category, cf.meta.created, cf.start, &ext);
     let (file, rel) = match ctx.tree.create_new(&rel) {
         Ok(x) => x,
         Err(e) => {
@@ -828,7 +918,10 @@ fn extract_carved(ctx: &Ctx<'_>, src: &SharedSource, cf: &diskrescue_carve::Carv
 /// Determine the format of a file on disk: by content first, then by
 /// extension (a file whose header was destroyed has no signature left).
 pub fn identify_file(formats: &FormatRegistry, path: &Path) -> Option<Arc<dyn FileFormat>> {
-    let head = FileSource::open(path).ok().and_then(|s| s.read_vec(0, 64 * 1024).ok()).unwrap_or_default();
+    let head = FileSource::open(path)
+        .ok()
+        .and_then(|s| s.read_vec(0, 64 * 1024).ok())
+        .unwrap_or_default();
     if let Some(f) = formats.matching(&head).into_iter().find(|f| f.probe(&head)) {
         return Some(f);
     }
@@ -1016,7 +1109,11 @@ fn repair_stage(ctx: &Ctx<'_>, pool: &rayon::ThreadPool, report: &mut Report) {
                     )
                 });
                 let n = done.fetch_add(1, Ordering::Relaxed) + 1;
-                ctx.obs.event(Event::Progress { done: n, total, bytes: 0 });
+                ctx.obs.event(Event::Progress {
+                    done: n,
+                    total,
+                    bytes: 0,
+                });
                 (i, r)
             })
             .collect()
@@ -1031,7 +1128,11 @@ fn repair_stage(ctx: &Ctx<'_>, pool: &rayon::ThreadPool, report: &mut Report) {
                     _ => rec.outcome,
                 };
                 ctx.obs.event(Event::File {
-                    name: rr.output.as_ref().map(|p| p.display().to_string()).unwrap_or_default(),
+                    name: rr
+                        .output
+                        .as_ref()
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_default(),
                     outcome: rec.outcome,
                 });
                 rec.repair = Some(rr);
@@ -1093,7 +1194,13 @@ pub fn verify_files(paths: &[PathBuf]) -> Vec<VerifyResult> {
 /// validated; damaged ones are repaired into `output/repaired/`, trying the
 /// user's donors (and, for each input, the other healthy inputs of the same
 /// format) as references. Inputs are never modified.
-pub fn repair_files(inputs: &[PathBuf], output: &Path, donors: &[PathBuf], aggressive: bool, obs: &dyn Observer) -> Result<Report> {
+pub fn repair_files(
+    inputs: &[PathBuf],
+    output: &Path,
+    donors: &[PathBuf],
+    aggressive: bool,
+    obs: &dyn Observer,
+) -> Result<Report> {
     let tree = OutputTree::create(output)?;
     let formats = registry::all_formats();
     let pool = DonorPool::new();
@@ -1248,7 +1355,13 @@ pub struct SurveyCarved {
 }
 
 /// Survey `src` without writing anything.
-pub fn survey(src: SharedSource, sel: &Selection, carve: CarvePolicy, cancel: Arc<AtomicBool>, obs: &dyn Observer) -> Result<Survey> {
+pub fn survey(
+    src: SharedSource,
+    sel: &Selection,
+    carve: CarvePolicy,
+    cancel: Arc<AtomicBool>,
+    obs: &dyn Observer,
+) -> Result<Survey> {
     let formats = registry::all_formats();
     let disc = discover(&src, 0, true, &cancel, obs);
     let mut volumes = disc.volumes;
@@ -1302,14 +1415,17 @@ pub fn survey(src: SharedSource, sel: &Selection, carve: CarvePolicy, cancel: Ar
                 },
                 &mut |cf: diskrescue_carve::CarvedFile| {
                     if sel.wants_category(cf.category) && sel.wants_size(cf.len) {
-                        found.lock().unwrap_or_else(|p| p.into_inner()).push(SurveyCarved {
-                            offset: cf.start,
-                            len: cf.len,
-                            format: cf.format.clone(),
-                            category: cf.category,
-                            status: cf.status,
-                            created: cf.meta.created,
-                        });
+                        found
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner())
+                            .push(SurveyCarved {
+                                offset: cf.start,
+                                len: cf.len,
+                                format: cf.format.clone(),
+                                category: cf.category,
+                                status: cf.status,
+                                created: cf.meta.created,
+                            });
                     }
                     !cancel.load(Ordering::Relaxed)
                 },

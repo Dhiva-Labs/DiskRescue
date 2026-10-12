@@ -27,7 +27,11 @@ impl<W: Write> HashingWriter<W> {
     /// Finish: flush and return the inner writer, the hex hash and the count.
     pub fn finish(mut self) -> io::Result<(W, String, u64)> {
         self.inner.flush()?;
-        Ok((self.inner, self.hasher.finalize().to_hex().to_string(), self.written))
+        Ok((
+            self.inner,
+            self.hasher.finalize().to_hex().to_string(),
+            self.written,
+        ))
     }
 }
 

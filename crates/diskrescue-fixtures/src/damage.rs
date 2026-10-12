@@ -180,9 +180,11 @@ pub fn png_strip_chunk(png: &[u8], kind: &[u8; 4], nth: usize) -> Vec<u8> {
     }
 }
 
-/// Remove the `idx1` index chunk of an AVI, fix the RIFF size and clear the
-/// `AVIF_HASINDEX` flag, as a recorder that crashed before finalising would
-/// leave it (the `movi` list and headers are intact).
+/// Remove the `idx1` index chunk of an AVI and fix the RIFF size, keeping
+/// the `AVIF_HASINDEX` flag set: recorders write the header (with the flag)
+/// when recording starts and the index when it stops, so a recorder that
+/// crashed leaves a header that promises an index that is not there. The
+/// `movi` list and headers are intact.
 pub fn avi_strip_idx1(avi: &[u8]) -> Vec<u8> {
     if avi.len() < 12 || &avi[..4] != b"RIFF" || &avi[8..12] != b"AVI " {
         return avi.to_vec();
@@ -209,13 +211,6 @@ pub fn avi_strip_idx1(avi: &[u8]) -> Vec<u8> {
         out = remove_range(&out, start, len);
         let riff = (out.len() - 8) as u32;
         out[4..8].copy_from_slice(&riff.to_le_bytes());
-    }
-    // avih.dwFlags &= ~AVIF_HASINDEX
-    if let Some(i) = out.windows(4).position(|w| w == b"avih") {
-        let flags_at = i + 8 + 12;
-        if flags_at + 4 <= out.len() {
-            out[flags_at] &= !0x10;
-        }
     }
     out
 }
@@ -369,7 +364,7 @@ mod tests {
             out.len() - 8
         );
         let i = out.windows(4).position(|w| w == b"avih").unwrap();
-        assert_eq!(out[i + 8 + 12] & 0x10, 0);
+        assert_eq!(out[i + 8 + 12] & 0x10, 0x10, "AVIF_HASINDEX stays set");
         assert_eq!(avi_strip_idx1(b"garbage"), b"garbage".to_vec());
     }
 }
