@@ -8,10 +8,21 @@ repository.workspace = true
 authors.workspace = true
 rust-version.workspace = true
 
+[lib]
+name = "diskrescue_gui"
+path = "src/lib.rs"
+
+[[bin]]
+name = "diskrescue-gui"
+path = "src/main.rs"
+
 [dependencies]
 diskrescue-core.workspace = true
 diskrescue-app.workspace = true
-eframe.workspace = true
+# Types the app layer hands out (outcomes, stages, block maps) live here.
+diskrescue-imaging.workspace = true
+diskrescue-recover.workspace = true
+eframe = { workspace = true, features = ["persistence"] }
 egui.workspace = true
 egui_extras.workspace = true
 rfd.workspace = true
@@ -20,7 +31,14 @@ env_logger.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+
 [dev-dependencies]
 tempfile.workspace = true
+# Screenshots: palette PNGs keep the ones with photos small.
+png.workspace = true
+color_quant = "1"
 diskrescue-fixtures.workspace = true
-egui_kittest.workspace = true
+# `eframe`: drive the app through eframe::App exactly as the window does.
+egui_kittest = { workspace = true, features = ["eframe"] }

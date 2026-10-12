@@ -1,0 +1,26 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128">
+  <title>DiskRescue</title>
+  <defs>
+    <linearGradient id="card" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#3b82f6"/>
+      <stop offset="1" stop-color="#1d4ed8"/>
+    </linearGradient>
+  </defs>
+  <!-- SD card -->
+  <path d="M34 10 H78 L98 30 V110 a8 8 0 0 1 -8 8 H34 a8 8 0 0 1 -8 -8 V18 a8 8 0 0 1 8 -8 Z"
+        fill="url(#card)"/>
+  <g fill="#ffffff" fill-opacity="0.85">
+    <rect x="40" y="18" width="7" height="20" rx="2"/>
+    <rect x="52" y="18" width="7" height="20" rx="2"/>
+    <rect x="64" y="18" width="7" height="20" rx="2"/>
+    <rect x="76" y="22" width="7" height="16" rx="2"/>
+  </g>
+  <!-- A photo on the card -->
+  <rect x="38" y="52" width="48" height="36" rx="5" fill="#ffffff"/>
+  <path d="M42 84 L56 66 L66 78 L72 71 L82 84 Z" fill="#60a5fa"/>
+  <circle cx="74" cy="62" r="5" fill="#fbbf24"/>
+  <!-- Rescued: a green check -->
+  <circle cx="92" cy="96" r="22" fill="#16a34a" stroke="#ffffff" stroke-width="4"/>
+  <path d="M81 96 L89 104 L104 88" fill="none" stroke="#ffffff" stroke-width="7"
+        stroke-linecap="round" stroke-linejoin="round"/>
+</svg>
