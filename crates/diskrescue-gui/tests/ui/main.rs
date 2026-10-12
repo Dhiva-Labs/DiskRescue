@@ -5,6 +5,7 @@
 
 mod common;
 mod flow;
+mod gallery;
 mod pages;
 mod repair;
 mod small_window;

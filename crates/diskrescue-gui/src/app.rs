@@ -95,6 +95,7 @@ pub struct DiskRescueApp {
     closing: Closing,
     is_root: bool,
     styled: bool,
+    window_title: String,
 }
 
 impl DiskRescueApp {
@@ -120,6 +121,7 @@ impl DiskRescueApp {
             closing: Closing::default(),
             is_root: system::is_root(),
             styled: false,
+            window_title: String::new(),
         }
     }
 
@@ -151,9 +153,24 @@ impl DiskRescueApp {
         self.page = Page::Progress;
     }
 
-    /// Draw one frame. eframe calls this through [`eframe::App::ui`]; the
-    /// tests call it directly.
+    /// One frame for hosts other than eframe: [`Self::logic`], then
+    /// [`Self::draw`].
     pub fn ui(&mut self, ui: &mut Ui) {
+        let ctx = ui.ctx().clone();
+        self.logic(&ctx);
+        self.draw(ui);
+    }
+
+    /// Everything that is not drawing: background results, the chained
+    /// recovery after a privileged copy, the window title, closing. eframe
+    /// also calls it while the window is minimised, so a rescue moves on.
+    pub fn logic(&mut self, ctx: &egui::Context) {
+        self.update_background(ctx);
+        self.handle_close(ctx);
+    }
+
+    /// Draw the window.
+    pub fn draw(&mut self, ui: &mut Ui) {
         let ctx = ui.ctx().clone();
         if !self.styled {
             theme::apply(&ctx);
@@ -161,10 +178,7 @@ impl DiskRescueApp {
         }
         let thumbs = self.thumbs.get_or_insert_with(|| Thumbnails::new(&ctx));
         thumbs.poll(&ctx);
-
         self.handle_dropped_files(&ctx);
-        self.update_background(&ctx);
-        self.handle_close(&ctx);
 
         egui::Panel::left("nav")
             .resizable(false)
@@ -213,11 +227,23 @@ impl DiskRescueApp {
             self.saved.remember(p);
         }
         self.repair.update(ctx);
+        let mut title = "DiskRescue".to_string();
         if let Some(job) = &mut self.job {
             job.tick();
             if job.is_running() {
                 ctx.request_repaint_after(Duration::from_millis(100));
+                let (status, frac) = job.snapshot().short_status();
+                title = match frac {
+                    Some(f) if job.snapshot().imaging() => {
+                        format!("{:.0}% copied - DiskRescue", f * 100.0)
+                    }
+                    _ => format!("{status} - DiskRescue"),
+                };
             } else if !job.results_taken {
+                // Tell the user when they are looking at something else.
+                ctx.send_viewport_cmd(egui::ViewportCommand::RequestUserAttention(
+                    egui::UserAttentionType::Informational,
+                ));
                 job.results_taken = true;
                 let snap = job.snapshot();
                 if let Some(r) = snap.report() {
@@ -225,6 +251,10 @@ impl DiskRescueApp {
                     self.saved.remember(job.output.clone());
                 }
             }
+        }
+        if title != self.window_title {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Title(title.clone()));
+            self.window_title = title;
         }
     }
 
@@ -692,8 +722,12 @@ pub fn clear_color(v: &egui::Visuals) -> [f32; 4] {
 }
 
 impl eframe::App for DiskRescueApp {
+    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        DiskRescueApp::logic(self, ctx);
+    }
+
     fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
-        DiskRescueApp::ui(self, ui);
+        DiskRescueApp::draw(self, ui);
     }
 
     fn save(&mut self, storage: &mut dyn eframe::Storage) {

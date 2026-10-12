@@ -37,6 +37,10 @@ pub struct DeviceEntry {
 impl DeviceEntry {
     /// Describe `info`, asking `backend` whether it can be read.
     pub fn new(info: DeviceInfo, backend: &dyn Backend) -> Self {
+        Self::with_privilege(info, |i| backend.needs_privilege(&i.path))
+    }
+
+    fn with_privilege(info: DeviceInfo, needs: impl FnOnce(&DeviceInfo) -> bool) -> Self {
         let mut advice = devices::advice(&info);
         if let Some(h) = &info.health {
             for l in devices::health_lines(h) {
@@ -57,7 +61,7 @@ impl DeviceEntry {
                     || h.pending_sectors.unwrap_or(0) > 0
                     || h.uncorrectable_sectors.unwrap_or(0) > 0
             });
-        let needs_privilege = !system && backend.needs_privilege(&info.path);
+        let needs_privilege = !system && needs(&info);
         DeviceEntry {
             title: title(&info),
             advice,
@@ -162,11 +166,24 @@ impl Drives {
         }
         self.last = Some(Instant::now());
         let backend = backend.clone();
+        // A drive seen before keeps its answer: its node is not opened
+        // again every few seconds.
+        let known: Vec<(Identity, bool)> = self
+            .entries
+            .iter()
+            .map(|e| (identity(&e.info), e.needs_privilege))
+            .collect();
         self.task = Some(Task::spawn(ctx, "diskrescue-list", move || {
             let list = backend.list_devices()?;
             Ok(list
                 .into_iter()
-                .map(|i| DeviceEntry::new(i, backend.as_ref()))
+                .map(|i| {
+                    let id = identity(&i);
+                    match known.iter().find(|(k, _)| *k == id) {
+                        Some((_, p)) => DeviceEntry::with_privilege(i, |_| *p),
+                        None => DeviceEntry::new(i, backend.as_ref()),
+                    }
+                })
                 .collect())
         }));
     }
@@ -175,6 +192,12 @@ impl Drives {
     pub fn refreshing(&self) -> bool {
         self.task.is_some()
     }
+}
+
+type Identity = (std::path::PathBuf, u64, Option<String>);
+
+fn identity(i: &DeviceInfo) -> Identity {
+    (i.path.clone(), i.size, i.serial.clone())
 }
 
 /// What the user chose on the page.

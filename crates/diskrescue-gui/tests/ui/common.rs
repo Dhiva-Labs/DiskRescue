@@ -220,11 +220,16 @@ pub fn screenshot_dir() -> PathBuf {
 /// harnesses render (and release their renderer) one at a time.
 static RENDER: Mutex<()> = Mutex::new(());
 
+/// Hold while rendering (and while dropping a harness that rendered).
+pub fn render_lock() -> std::sync::MutexGuard<'static, ()> {
+    RENDER.lock().unwrap_or_else(|p| p.into_inner())
+}
+
 /// Render the last frame of a test; save it as
 /// `docs/screenshots/<name>.png` when `DISKRESCUE_SCREENSHOTS` is set (so
 /// that ordinary test runs leave the tree clean). Ends the test's harness.
 pub fn screenshot(mut h: Harness<'static, DiskRescueApp>, name: &str) {
-    let _g = RENDER.lock().unwrap_or_else(|p| p.into_inner());
+    let _g = render_lock();
     render_and_save(&mut h, name);
     drop(h);
 }

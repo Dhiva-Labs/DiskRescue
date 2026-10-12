@@ -103,14 +103,53 @@ pub fn show_in_folder(path: &Path) -> Result<(), String> {
         c.arg("-R").arg(path);
         return spawn_detached(c);
     }
-    let folder = if path.is_dir() {
-        path.to_path_buf()
-    } else {
-        path.parent()
-            .map(Path::to_path_buf)
-            .unwrap_or_else(|| path.to_path_buf())
-    };
-    open_path(&folder)
+    // The file manager's own "show this file" (selects it), falling back to
+    // opening the folder. Runs in the background: it waits for D-Bus.
+    let path = path.to_path_buf();
+    std::thread::spawn(move || {
+        let uri = file_uri(&path);
+        let shown = Command::new("dbus-send")
+            .args([
+                "--session",
+                "--print-reply",
+                "--dest=org.freedesktop.FileManager1",
+                "--type=method_call",
+                "/org/freedesktop/FileManager1",
+                "org.freedesktop.FileManager1.ShowItems",
+            ])
+            .arg(format!("array:string:{uri}"))
+            .arg("string:")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success());
+        if !shown {
+            let folder = if path.is_dir() {
+                path.clone()
+            } else {
+                path.parent()
+                    .map(Path::to_path_buf)
+                    .unwrap_or_else(|| path.clone())
+            };
+            if let Err(e) = open_path(&folder) {
+                log::warn!("{e}");
+            }
+        }
+    });
+    Ok(())
+}
+
+/// `file://` URI of an absolute path, percent-encoded.
+pub fn file_uri(path: &Path) -> String {
+    let mut out = String::from("file://");
+    for b in path.to_string_lossy().bytes() {
+        if b.is_ascii_alphanumeric() || b"/-_.~".contains(&b) {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
 }
 
 /// A file name for display (the whole path when it has none).
@@ -128,6 +167,14 @@ pub fn absolute(path: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn file_uris_are_encoded() {
+        assert_eq!(
+            file_uri(Path::new("/a b/ü,x.jpg")),
+            "file:///a%20b/%C3%BC%2Cx.jpg"
+        );
+    }
 
     #[test]
     fn names_are_safe() {
