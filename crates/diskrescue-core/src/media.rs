@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 use crate::time::Timestamp;
 
 /// Broad category of a recovered file.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MediaCategory {
     Photo,
