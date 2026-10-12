@@ -8,10 +8,16 @@ use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use diskrescue_core::util::human;
-use diskrescue_recover::report::{Outcome, VolumeRecord};
+use diskrescue_recover::report::Outcome;
+#[cfg(test)]
+use diskrescue_recover::report::VolumeRecord;
 use diskrescue_recover::{Event, Observer, Stage};
 use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
 use serde_json::json;
+
+pub use diskrescue_app::text::{
+    stage_id, stage_label, stage_progress_label as progress_label, volume_line,
+};
 
 use crate::term;
 use crate::util::percent;
@@ -46,63 +52,6 @@ impl Mode {
             Mode::Plain
         }
     }
-}
-
-/// Label shown for a pipeline stage.
-pub fn stage_label(s: &Stage) -> String {
-    match s {
-        Stage::Partitions => "Reading the partition table".into(),
-        Stage::Listing { volume, fs } => format!("Reading the file list of volume {volume} ({fs})"),
-        Stage::Extracting => "Copying the files found through the filesystem".into(),
-        Stage::Carving => "Searching the raw data for photos and videos".into(),
-        Stage::Validating => "Checking the files".into(),
-        Stage::Repairing => "Repairing damaged files".into(),
-        Stage::Report => "Writing the report".into(),
-    }
-}
-
-/// Label while a stage reports counters (some stages do two jobs).
-fn progress_label(s: &Stage) -> String {
-    match s {
-        Stage::Partitions => "Searching the whole source for lost volumes".into(),
-        Stage::Listing { .. } => "Looking at files that have no recognisable name".into(),
-        other => stage_label(other),
-    }
-}
-
-fn stage_id(s: &Stage) -> &'static str {
-    match s {
-        Stage::Partitions => "partitions",
-        Stage::Listing { .. } => "listing",
-        Stage::Extracting => "extracting",
-        Stage::Carving => "carving",
-        Stage::Validating => "validating",
-        Stage::Repairing => "repairing",
-        Stage::Report => "report",
-    }
-}
-
-/// Line describing a volume found by the pipeline.
-pub fn volume_line(v: &VolumeRecord) -> String {
-    let fs =
-        v.fs.map(|f| f.name().to_string())
-            .unwrap_or_else(|| "no filesystem recognised".into());
-    let label = v
-        .label
-        .as_deref()
-        .map(|l| format!(" \"{l}\""))
-        .unwrap_or_default();
-    let mut s = format!(
-        "Volume {}: {fs}{label}, {} at offset {} (found via {})",
-        v.index,
-        human::bytes(v.size),
-        human::bytes(v.start),
-        v.origin
-    );
-    if let Some(e) = &v.error {
-        s.push_str(&format!("\n  note: {e}"));
-    }
-    s
 }
 
 #[derive(Default)]

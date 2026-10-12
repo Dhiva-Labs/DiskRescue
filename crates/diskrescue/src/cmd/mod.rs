@@ -1,4 +1,8 @@
 //! The subcommands.
+//!
+//! Argument types are converted here into the plain plans of
+//! `diskrescue_app::plan`, which does the work shared with the other
+//! front-ends.
 
 pub mod carve;
 pub mod image;
@@ -10,61 +14,82 @@ pub mod repair;
 pub mod scan;
 pub mod verify;
 
+#[cfg(test)]
 use std::path::{Path, PathBuf};
 
+use diskrescue_app::plan;
+#[cfg(test)]
+use diskrescue_app::util::parent_dir;
+#[cfg(test)]
 use diskrescue_core::media::MediaCategory;
 use diskrescue_recover::{CarvePolicy, Selection};
 
-use crate::args::{CarveArg, CategoryArgs, StateArgs};
-use crate::error::CliError;
+use crate::args::{CarveArg, CategoryArgs, RepairOpts, StateArgs, Tuning};
 use crate::term;
+
+/// The categories as the app crate takes them.
+pub fn categories(c: &CategoryArgs) -> plan::Categories {
+    plan::Categories {
+        photos: c.photos,
+        videos: c.videos,
+        raw: c.raw,
+        audio: c.audio,
+        all_files: c.all_files,
+        min_size: c.min_size,
+    }
+}
+
+/// The existing/deleted filter as the app crate takes it.
+pub fn state_filter(s: &StateArgs) -> plan::StateFilter {
+    plan::StateFilter {
+        existing_only: s.existing_only,
+        deleted_only: s.deleted_only,
+    }
+}
+
+/// The carving mode as the app crate takes it.
+pub fn carve_mode(arg: CarveArg) -> plan::CarveMode {
+    match arg {
+        CarveArg::Auto => plan::CarveMode::Auto,
+        CarveArg::Free => plan::CarveMode::Free,
+        CarveArg::All => plan::CarveMode::All,
+        CarveArg::Off => plan::CarveMode::Off,
+    }
+}
+
+/// The repair options as the app crate takes them.
+pub fn repair_options(r: &RepairOpts) -> plan::RepairOptions {
+    plan::RepairOptions {
+        no_repair: r.no_repair,
+        donors: r.donor.clone(),
+        aggressive: r.aggressive,
+    }
+}
+
+/// The read-strategy overrides as the app crate takes them.
+pub fn tuning(t: &Tuning) -> plan::Tuning {
+    plan::Tuning {
+        profile: t.profile.clone(),
+        timeout: t.timeout,
+        block_size: t.block_size,
+        retries: t.retries,
+        no_trim: t.no_trim,
+        no_scrape: t.no_scrape,
+        reverse: t.reverse,
+    }
+}
 
 /// What the user asked to recover.
 ///
 /// No category flag means photos, RAW and videos; `--all-files` means every
 /// file; otherwise exactly the categories named.
-pub fn selection(categories: &CategoryArgs, state: &StateArgs) -> Selection {
-    let mut sel = if categories.all_files {
-        Selection::everything()
-    } else if categories.photos || categories.videos || categories.raw || categories.audio {
-        let mut s = Selection::photos_and_videos();
-        s.categories.clear();
-        if categories.photos {
-            s.categories.insert(MediaCategory::Photo);
-        }
-        if categories.raw {
-            s.categories.insert(MediaCategory::RawPhoto);
-        }
-        if categories.videos {
-            s.categories.insert(MediaCategory::Video);
-        }
-        if categories.audio {
-            s.categories.insert(MediaCategory::Audio);
-        }
-        s
-    } else {
-        Selection::photos_and_videos()
-    };
-    if state.existing_only {
-        sel.deleted = false;
-    }
-    if state.deleted_only {
-        sel.existing = false;
-    }
-    if let Some(min) = categories.min_size {
-        sel.min_size = min;
-    }
-    sel
+pub fn selection(categories_: &CategoryArgs, state: &StateArgs) -> Selection {
+    plan::selection(&categories(categories_), &state_filter(state))
 }
 
 /// The pipeline's carving policy for the `--carve` option.
 pub fn carve_policy(arg: CarveArg) -> CarvePolicy {
-    match arg {
-        CarveArg::Auto => CarvePolicy::Auto,
-        CarveArg::Free => CarvePolicy::FreeSpace,
-        CarveArg::All => CarvePolicy::Everything,
-        CarveArg::Off => CarvePolicy::Off,
-    }
+    carve_mode(arg).policy()
 }
 
 /// Print warnings to standard error.
@@ -72,50 +97,6 @@ pub fn print_warnings(warnings: &[String]) {
     let p = term::err();
     for w in warnings {
         eprintln!("{} {w}", p.yellow("warning:"));
-    }
-}
-
-/// Check that every donor is an existing file.
-pub fn check_donors(donors: &[PathBuf]) -> Result<(), CliError> {
-    for d in donors {
-        match std::fs::metadata(d) {
-            Ok(m) if m.is_file() => {}
-            Ok(_) => {
-                return Err(CliError::failed(format!(
-                    "the donor {} is not a file. A donor is a healthy photo or video from the same \
-                     camera or phone.",
-                    d.display()
-                )))
-            }
-            Err(_) => {
-                return Err(CliError::failed(format!(
-                "the donor {} does not exist. A donor is a healthy photo or video from the same \
-                     camera or phone.",
-                d.display()
-            )))
-            }
-        }
-    }
-    Ok(())
-}
-
-/// Refuse an output location that cannot hold results.
-pub fn check_output_dir(output: &Path) -> Result<(), CliError> {
-    if output.exists() && !output.is_dir() {
-        return Err(CliError::refused(format!(
-            "{} exists and is not a folder. Choose a folder for the recovered files, for example \
-             a new folder on another disk.",
-            output.display()
-        )));
-    }
-    Ok(())
-}
-
-/// The folder that will contain `file` (the current folder when none is given).
-pub fn parent_dir(file: &Path) -> PathBuf {
-    match file.parent() {
-        Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
-        _ => PathBuf::from("."),
     }
 }
 

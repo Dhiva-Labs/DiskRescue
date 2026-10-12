@@ -218,6 +218,10 @@ pub struct ImageArgs {
     /// Do not check that the output disk has enough free space
     #[arg(long, hide = true)]
     pub no_space_check: bool,
+    /// Stop cleanly (save progress, exit 130) when standard input is closed;
+    /// for programs that start this command with elevated rights
+    #[arg(long, hide = true)]
+    pub stop_on_stdin_close: bool,
 }
 
 /// Which kinds of files to recover.

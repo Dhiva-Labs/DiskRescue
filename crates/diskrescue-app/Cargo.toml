@@ -17,6 +17,7 @@ diskrescue-recover.workspace = true
 diskrescue-jpeg.workspace = true
 diskrescue-stills.workspace = true
 diskrescue-isobmff.workspace = true
+thiserror.workspace = true
 log.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -24,6 +25,9 @@ image = { workspace = true, features = ["gif", "bmp", "webp", "tiff"] }
 
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

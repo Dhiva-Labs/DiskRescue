@@ -1,8 +1,16 @@
 //! Errors of the command-line layer and how they are shown to the user.
+//!
+//! The plain-language explanations live in `diskrescue_app::error`; this
+//! module maps them onto exit codes.
 
+#[cfg(all(test, unix))]
 use std::path::Path;
 
+use diskrescue_app::AppError;
 use diskrescue_core::Error as CoreError;
+
+#[cfg(all(test, unix))]
+pub use diskrescue_app::error::explain_io;
 
 /// Exit codes documented in `docs/USAGE.md`.
 pub mod exit {
@@ -51,70 +59,37 @@ impl CliError {
     }
 
     /// Shorthand for [`CliError::Refused`].
+    #[cfg(test)]
     pub fn refused(msg: impl Into<String>) -> Self {
         CliError::Refused(msg.into())
     }
 
     /// Shorthand for [`CliError::Usage`].
+    #[cfg(test)]
     pub fn usage(msg: impl Into<String>) -> Self {
         CliError::Usage(msg.into())
     }
 }
 
+impl From<AppError> for CliError {
+    fn from(e: AppError) -> Self {
+        match e {
+            AppError::Refused(m) => CliError::Refused(m),
+            AppError::Invalid(m) => CliError::Usage(m),
+            AppError::Failed(m) => CliError::Failed(m),
+        }
+    }
+}
+
 impl From<CoreError> for CliError {
     fn from(e: CoreError) -> Self {
-        match e {
-            CoreError::Refused(m) => CliError::Refused(m),
-            CoreError::InvalidArgument(m) => CliError::Failed(m),
-            CoreError::NotFound(m) => CliError::Failed(m),
-            CoreError::Io(io) => CliError::Failed(explain_io(&io, None)),
-            other => CliError::Failed(other.to_string()),
-        }
+        AppError::from(e).into()
     }
 }
 
 impl From<std::io::Error> for CliError {
     fn from(e: std::io::Error) -> Self {
-        CliError::Failed(explain_io(&e, None))
-    }
-}
-
-/// Plain-language text for an I/O error, with a hint for the usual causes.
-pub fn explain_io(e: &std::io::Error, path: Option<&Path>) -> String {
-    use std::io::ErrorKind::*;
-    let text = e.to_string();
-    let mut msg = match path {
-        Some(p) if !text.contains(&p.display().to_string()) => format!("{}: {text}", p.display()),
-        _ => text,
-    };
-    if let Some(p) = path {
-        if let Some(h) = diskrescue_device::privilege_hint(e, p) {
-            if !msg.contains(&h) {
-                msg.push_str(". ");
-                msg.push_str(&h);
-            }
-        }
-    }
-    let efbig = e.kind() == FileTooLarge || (cfg!(unix) && e.raw_os_error() == Some(27));
-    let enospc = e.kind() == StorageFull || (cfg!(unix) && e.raw_os_error() == Some(28));
-    if enospc {
-        msg.push_str(
-            ". The disk is full: free some space or choose a different location with more room",
-        );
-    } else if efbig {
-        msg.push_str(
-            ". The filesystem of that disk cannot hold a file this large (FAT32 stops at 4 GiB): \
-             choose a disk formatted as NTFS, exFAT or ext4",
-        );
-    }
-    msg
-}
-
-/// Text printed for an error, without the program prefix.
-pub fn user_message(e: &CliError) -> String {
-    match e {
-        CliError::Refused(m) => m.clone(),
-        CliError::Usage(m) | CliError::Failed(m) => m.clone(),
+        AppError::from(e).into()
     }
 }
 

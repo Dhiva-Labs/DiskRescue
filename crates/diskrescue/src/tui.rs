@@ -34,6 +34,8 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Gauge, Paragraph, Widget};
 use ratatui::{Frame, Terminal};
 
+pub use diskrescue_app::text::problems_text;
+
 use crate::signal::{Interrupt, Step};
 use crate::util::{percent, plural};
 
@@ -537,17 +539,6 @@ impl Dashboard {
         }));
         f.render_widget(Paragraph::new(lines), area);
     }
-}
-
-/// "3 read errors, 1 timeout, 0 slow reads, 0 reconnects".
-pub fn problems_text(errors: u64, timeouts: u64, slow: u64, reconnects: u64) -> String {
-    format!(
-        "{}, {}, {}, {}",
-        plural(errors, "read error", "read errors"),
-        plural(timeouts, "timeout", "timeouts"),
-        plural(slow, "slow read", "slow reads"),
-        plural(reconnects, "reconnect", "reconnects")
-    )
 }
 
 fn cell_look(st: Option<BlockStatus>, current: bool, color: bool) -> (&'static str, Style) {

@@ -1,40 +1,17 @@
 //! `diskrescue list`: show disks, cards and USB drives.
 
-use diskrescue_core::device::{DeviceInfo, DeviceKind, Transport};
+use diskrescue_core::device::DeviceInfo;
+#[cfg(test)]
+use diskrescue_core::device::{DeviceKind, Transport};
 use diskrescue_core::util::human;
-use diskrescue_device::label_size;
+
+#[cfg(test)]
+pub use diskrescue_app::devices::visible_devices;
+pub use diskrescue_app::text::{size_label as size_text, transport_label as transport_name};
 
 use crate::args::ListArgs;
 use crate::error::{CliError, CmdResult};
 use crate::term::{self, Align, Table};
-
-/// Name of a transport for the table.
-pub fn transport_name(t: Transport) -> &'static str {
-    match t {
-        Transport::Ata => "SATA/ATA",
-        Transport::Sas => "SAS",
-        Transport::Nvme => "NVMe",
-        Transport::Usb => "USB",
-        Transport::Mmc => "MMC/SD",
-        Transport::Virtio => "virtio",
-        Transport::Scsi => "SCSI",
-        Transport::Firewire => "FireWire",
-        Transport::Thunderbolt => "Thunderbolt",
-        Transport::Virtual => "virtual",
-        Transport::Unknown => "-",
-    }
-}
-
-/// Size as `29.8 GiB (32.0 GB)`.
-pub fn size_text(bytes: u64) -> String {
-    if bytes == 0 {
-        return "0 B".to_string();
-    }
-    if bytes < 1000 {
-        return human::bytes(bytes);
-    }
-    format!("{} ({})", human::bytes(bytes), label_size(bytes))
-}
 
 fn mounted_text(d: &DeviceInfo) -> String {
     if d.mountpoints.is_empty() {
@@ -49,15 +26,6 @@ fn mounted_text(d: &DeviceInfo) -> String {
         v.dedup();
         v.join(", ")
     }
-}
-
-/// Devices to show, sorted by path.
-pub fn visible_devices(mut devices: Vec<DeviceInfo>, all: bool) -> Vec<DeviceInfo> {
-    if !all {
-        devices.retain(|d| d.kind != DeviceKind::Virtual);
-    }
-    devices.sort_by(|a, b| a.path.cmp(&b.path));
-    devices
 }
 
 /// Render the human-readable table.
@@ -132,8 +100,7 @@ pub fn render(devices: &[DeviceInfo], width: usize) -> String {
 
 /// Run the command.
 pub fn run(args: &ListArgs) -> CmdResult {
-    let devices = diskrescue_device::enumerate().map_err(CliError::from)?;
-    let devices = visible_devices(devices, args.all);
+    let devices = diskrescue_app::devices::list(args.all)?;
     if args.json {
         let text = serde_json::to_string_pretty(&devices)
             .map_err(|e| CliError::failed(format!("cannot format the device list: {e}")))?;

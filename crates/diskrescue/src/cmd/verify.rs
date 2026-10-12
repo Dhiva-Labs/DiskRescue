@@ -1,25 +1,15 @@
 //! `diskrescue verify`: check whether files are intact.
 
+#[cfg(test)]
 use diskrescue_core::format::ValidationStatus;
 use diskrescue_recover::pipeline::VerifyResult;
+
+pub use diskrescue_app::results::verify_verdict as verdict;
 
 use crate::args::VerifyArgs;
 use crate::error::{CliError, CmdResult};
 use crate::term::{self, Align, Paint, Table};
-use crate::util::{expand_file_args, plural};
-
-/// The verdict for one result: (label, is_problem).
-pub fn verdict(r: &VerifyResult) -> (&'static str, bool) {
-    match (&r.validation, &r.error) {
-        (Some(v), _) => match v.status {
-            ValidationStatus::Valid => ("ok", false),
-            ValidationStatus::Damaged => ("DAMAGED", true),
-            ValidationStatus::Invalid => ("INVALID", true),
-        },
-        (None, Some(_)) => ("UNRECOGNISED", true),
-        (None, None) => ("UNKNOWN", true),
-    }
-}
+use crate::util::plural;
 
 fn intact_text(r: &VerifyResult) -> String {
     match r.validation.as_ref().and_then(|v| v.intact_fraction) {
@@ -76,8 +66,7 @@ pub fn render(results: &[VerifyResult], width: usize, p: &Paint) -> String {
 
 /// Run the command.
 pub fn run(args: &VerifyArgs) -> CmdResult {
-    let files = expand_file_args(&args.files).map_err(CliError::failed)?;
-    let results = diskrescue_recover::verify_files(&files);
+    let results = diskrescue_app::recovery::run_verify(&args.files)?;
     let bad = results.iter().filter(|r| verdict(r).1).count();
     if args.json {
         let items: Vec<_> = results

@@ -1,29 +1,46 @@
 //! `diskrescue image`: a careful, resumable copy of a failing device.
 //!
 //! This is the only command that reads a device in earnest, and the code
-//! path shared with `recover --image-to`.
+//! path shared with `recover --image-to`. The checks before copying and the
+//! engine set-up are shared with the other front-ends
+//! (`diskrescue_app::imaging`); this module shows the progress (full-screen
+//! view, plain lines or JSON lines) and the summary.
 
-use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::io::{Read, Write};
+use std::path::Path;
+#[cfg(test)]
+use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use diskrescue_app::imaging::{self as app_imaging, Prepared, Setup};
+#[cfg(test)]
+use diskrescue_app::imaging::{read_identity, write_identity};
+use diskrescue_app::json::StartInfo;
 use diskrescue_core::device::{DeviceInfo, DeviceKind};
 use diskrescue_core::profile::ImagingProfile;
 use diskrescue_core::util::human;
+#[cfg(test)]
 use diskrescue_core::Range;
-use diskrescue_device::{Fingerprint, Match};
-use diskrescue_imaging::{
-    Control, Event, Imager, ImagingOptions, MapFile, Phase, Progress, Stats, Summary,
-};
-use serde_json::{json, Value};
+#[cfg(test)]
+use diskrescue_device::Fingerprint;
+use diskrescue_imaging::{Control, Event, Phase, Progress, Stats};
+#[cfg(test)]
+use diskrescue_imaging::{Imager, ImagingOptions, MapFile, Summary};
 
-use crate::args::{ImageArgs, Tuning};
-use crate::cmd::parent_dir;
+#[cfg(test)]
+pub use diskrescue_app::imaging::identity_path;
+pub use diskrescue_app::imaging::ImagingDone;
+pub use diskrescue_app::json::event_json;
+pub use diskrescue_app::text::{is_engine_chatter, phase_label as phase_short};
+
+use crate::args::ImageArgs;
+#[cfg(test)]
+use crate::args::Tuning;
 use crate::error::{CliError, CmdResult};
 use crate::signal::Interrupt;
-use crate::source::{self, default_map_path, SourceRequest};
+use crate::source::default_map_path;
 use crate::term;
 use crate::tui::{self, Dashboard, Header};
 use crate::util::{self, percent, plural, shell_quote};
@@ -63,7 +80,7 @@ pub struct ImagePlan<'a> {
     /// Mapfile (default `IMAGE.map`).
     pub map: Option<&'a Path>,
     /// Strategy overrides.
-    pub tuning: &'a Tuning,
+    pub tuning: &'a diskrescue_app::plan::Tuning,
     /// First byte to copy.
     pub start: Option<u64>,
     /// Number of bytes to copy.
@@ -80,155 +97,51 @@ pub struct ImagePlan<'a> {
     pub command_line: String,
 }
 
-/// What an imaging run produced.
-#[derive(Debug, Clone)]
-pub struct ImagingDone {
-    /// Totals at the end.
-    pub stats: Stats,
-    /// The engine's summary (None when the image was already complete).
-    pub summary: Option<Summary>,
-    /// The device that was copied.
-    pub info: DeviceInfo,
-    /// The image.
-    pub image: PathBuf,
-    /// The mapfile.
-    pub mapfile: PathBuf,
-    /// Nothing had to be done.
-    pub already_complete: bool,
-}
-
-impl ImagingDone {
-    /// All requested bytes were handled (copied or confirmed unreadable).
-    pub fn finished(&self) -> bool {
-        self.already_complete || self.summary.as_ref().is_some_and(|s| s.finished)
-    }
-
-    /// The run was stopped by the user.
-    pub fn cancelled(&self) -> bool {
-        self.summary.as_ref().is_some_and(|s| s.cancelled)
+impl ImagePlan<'_> {
+    /// The same plan for the app crate.
+    fn to_app(&self) -> diskrescue_app::plan::ImagePlan {
+        diskrescue_app::plan::ImagePlan {
+            source: self.source.to_path_buf(),
+            image: self.image.to_path_buf(),
+            map: self.map.map(Path::to_path_buf),
+            tuning: self.tuning.clone(),
+            start: self.start,
+            size: self.size,
+            force: self.force,
+            allow_mounted: self.allow_mounted,
+            no_space_check: !self.space_check,
+            command_line: Some(self.command_line.clone()),
+        }
     }
 }
 
 /// Apply `--profile`, `--block-size`, `--timeout`, `--retries`, `--no-trim`
-/// and `--no-scrape` to the profile recommended for `kind`.
+/// and `--no-scrape` to the profile recommended for `kind` (kept for the
+/// tests; runs use `diskrescue_app::imaging::build_profile`).
+#[cfg(test)]
 pub fn build_profile(kind: DeviceKind, t: &Tuning) -> Result<ImagingProfile, CliError> {
-    let mut p = match &t.profile {
-        Some(name) => ImagingProfile::by_name(name).ok_or_else(|| {
-            CliError::usage(format!(
-                "unknown profile '{name}'. Choose one of: {}",
-                ImagingProfile::names().join(", ")
-            ))
-        })?,
-        None => ImagingProfile::for_kind(kind),
-    };
-    if let Some(bs) = t.block_size {
-        if bs == 0 {
-            return Err(CliError::usage("--block-size must be larger than zero"));
-        }
-        p.block_size = bs;
-    }
-    if let Some(d) = t.timeout {
-        p.timeout_copy = d;
-        p.timeout_scrape = d;
-        p.timeout_retry = d;
-    }
-    if let Some(n) = t.retries {
-        p.retry_passes = n;
-    }
-    if t.no_trim {
-        p.trim = false;
-    }
-    if t.no_scrape {
-        p.scrape = false;
-    }
-    Ok(p)
+    app_imaging::build_profile(kind, &super::tuning(t)).map_err(CliError::from)
 }
 
-/// The rescue domain for `--start` / `--size`.
+/// The rescue domain for `--start` / `--size` (kept for the tests).
+#[cfg(test)]
 pub fn build_domain(
     start: Option<u64>,
     size: Option<u64>,
     source_size: u64,
 ) -> Result<Option<Range>, CliError> {
-    if start.is_none() && size.is_none() {
-        return Ok(None);
-    }
-    let s = start.unwrap_or(0);
-    if s >= source_size {
-        return Err(CliError::usage(format!(
-            "--start {} is beyond the end of the source, which is {} long",
-            human::bytes(s),
-            human::bytes(source_size)
-        )));
-    }
-    let e = match size {
-        Some(0) => return Err(CliError::usage("--size must be larger than zero")),
-        Some(n) => s.saturating_add(n).min(source_size),
-        None => source_size,
-    };
-    Ok(Some(Range::new(s, e)))
+    app_imaging::build_domain(start, size, source_size).map_err(CliError::from)
 }
 
-/// File next to the mapfile that remembers which device was being copied.
-pub fn identity_path(mapfile: &Path) -> PathBuf {
-    let mut s = mapfile.as_os_str().to_os_string();
-    s.push(".device.json");
-    PathBuf::from(s)
-}
-
-/// Refuse to continue a copy onto a device that is not the one it started on.
-///
-/// Two cards of the same model and size would otherwise be mixed into one
-/// image without any error. Only a definite difference (serial number,
-/// model, size) counts; weak identities are accepted.
+/// Refuse to continue a copy onto a device that is not the one it started
+/// on (kept for the tests).
+#[cfg(test)]
 pub fn check_same_device(
     before: &Fingerprint,
     now: &DeviceInfo,
     map: &Path,
 ) -> Result<(), CliError> {
-    match before.matches(now) {
-        Match::Mismatch(why) => Err(CliError::refused(format!(
-            "the progress map {} was made while copying a different device ({why}). Copying a second \
-             device into the same image would mix the two and ruin both. Use a new image name for this \
-             device, or add --force if it really is the same device (for example if its serial number \
-             changed after a reset).",
-            map.display()
-        ))),
-        _ => Ok(()),
-    }
-}
-
-fn read_identity(path: &Path) -> Option<Fingerprint> {
-    let text = std::fs::read_to_string(path).ok()?;
-    serde_json::from_str(&text).ok()
-}
-
-fn write_identity(path: &Path, fp: &Fingerprint) {
-    if let Ok(text) = serde_json::to_string_pretty(fp) {
-        if let Err(e) = std::fs::write(path, text) {
-            log::debug!("could not write {}: {e}", path.display());
-        }
-    }
-}
-
-fn same_file(a: &Path, b: &Path) -> bool {
-    match (a.canonicalize(), b.canonicalize()) {
-        (Ok(x), Ok(y)) => x == y,
-        _ => false,
-    }
-}
-
-/// Bytes already allocated on disk for `meta` (sparse files count less).
-fn allocated_bytes(meta: &std::fs::Metadata) -> u64 {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        meta.blocks().saturating_mul(512).min(meta.len())
-    }
-    #[cfg(not(unix))]
-    {
-        meta.len()
-    }
+    app_imaging::check_same_device(before, now, map).map_err(CliError::from)
 }
 
 /// Run an imaging job. Prints its own progress; the caller prints the
@@ -237,183 +150,25 @@ pub fn run_imaging(
     plan: &ImagePlan<'_>,
     interrupt: &Arc<Interrupt>,
 ) -> Result<ImagingDone, CliError> {
-    // Where the image goes must not be the source.
-    if same_file(plan.source, plan.image) {
-        return Err(CliError::refused(format!(
-            "{} is the source itself; the image must be a different file, on a different disk.",
-            plan.image.display()
-        )));
-    }
-    let image_meta = std::fs::metadata(plan.image).ok();
-    if let Some(m) = &image_meta {
-        if m.is_dir() {
-            return Err(CliError::usage(format!(
-                "{} is a folder. Give the image a file name inside it, for example {}.",
-                plan.image.display(),
-                plan.image.join("card.img").display()
-            )));
-        }
-        if !m.is_file() {
-            return Err(CliError::refused(format!(
-                "{} exists and is not a regular file (is it a device?). The image must be a file; \
-                 DiskRescue never copies one device directly onto another.",
-                plan.image.display()
-            )));
-        }
-    }
-    let map_path: PathBuf = plan
-        .map
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|| default_map_path(plan.image));
-    if same_file(&map_path, plan.image) || map_path == plan.image {
-        return Err(CliError::usage(
-            "the mapfile and the image must be different files",
-        ));
-    }
-
-    // Resume or start: make sure we never clobber something by accident.
-    let map_exists = std::fs::metadata(&map_path)
-        .map(|m| m.len() > 0)
-        .unwrap_or(false);
-    let prior: Option<Stats> = if map_exists {
-        MapFile::load(&map_path).ok().map(|m| m.map.stats())
-    } else {
-        None
+    // Every check before copying, and opening the source, are shared with
+    // the other front-ends. Warnings are printed as soon as the source is
+    // open, before anything else can fail.
+    let setup = Setup {
+        cancel: Some(interrupt.flag()),
+        map_snapshot_interval: (plan.ui == UiMode::Tui).then(|| Duration::from_millis(250)),
     };
-    if map_exists && prior.is_none() {
-        return Err(CliError::failed(format!(
-            "the progress map {} exists but cannot be read, so the copy cannot be resumed. If it is not \
-             needed, move it away to start a new copy; if it matters, keep it and use a different image name.",
-            map_path.display()
-        )));
-    }
-    if prior.is_none() && image_meta.as_ref().is_some_and(|m| m.len() > 0) && !plan.force {
-        return Err(CliError::refused(format!(
-            "{} already exists, but there is no progress map ({}) to resume from. DiskRescue will not \
-             overwrite it. Choose a new image name, or add --force if the file can be replaced.",
-            plan.image.display(),
-            map_path.display()
-        )));
-    }
-    if let Some(st) = &prior {
-        if image_meta.is_none() && st.rescued > 0 {
-            return Err(CliError::refused(format!(
-                "the progress map {} records {} already copied, but the image {} does not exist. \
-                 Put the image back where it was to resume, or move the map away to start over.",
-                map_path.display(),
-                human::bytes(st.rescued),
-                plan.image.display()
-            )));
-        }
-    }
-
-    // Nothing to do? Do not even touch the device.
-    let domain_requested = plan.start.is_some() || plan.size.is_some();
-    if let (Some(st), false) = (&prior, domain_requested) {
-        let image_len = image_meta.as_ref().map(|m| m.len()).unwrap_or(0);
-        if st.pending() == 0 && st.bad_sectors == 0 && image_len >= st.total() && st.total() > 0 {
-            let info = source::describe(plan.source)?;
-            return Ok(ImagingDone {
-                stats: *st,
-                summary: None,
-                info,
-                image: plan.image.to_path_buf(),
-                mapfile: map_path,
-                already_complete: true,
-            });
-        }
-    }
-
-    // Open the source (refuses output on the source and mounted sources).
-    let out_dir = parent_dir(plan.image);
-    let mut req = SourceRequest::reading(plan.source);
-    req.use_map = false;
-    req.direct = true;
-    req.allow_mounted = plan.allow_mounted;
-    req.output = Some(&out_dir);
-    req.interrupt = Some(interrupt);
-    req.timeout = Some(Duration::from_secs(30));
-    let opened = source::open(&req)?;
-    super::print_warnings(&opened.warnings);
-    let info = opened.info.clone();
-    let profile = build_profile(info.kind, plan.tuning)?;
-    let domain = build_domain(plan.start, plan.size, opened.shared.size())?;
-    let domain_len = domain
-        .map(|d| d.len())
-        .unwrap_or_else(|| opened.shared.size());
-    if let Some(dev) = &opened.device {
-        dev.set_reattach_deadline(profile.wait_for_reattach);
-    }
-
-    // Room for the image.
-    if plan.space_check {
-        let have_on_disk = image_meta.as_ref().map(allocated_bytes).unwrap_or(0);
-        let need = domain_len.saturating_sub(have_on_disk);
-        if let Some(free) = util::free_space(&out_dir) {
-            if free < need {
-                return Err(CliError::refused(format!(
-                    "there is not enough free space for the image. {} will hold {} but only {} is free \
-                     on that disk. Choose a location with more room, for example an external drive: \
-                     diskrescue image {} /path/on/another/disk/{}",
-                    plan.image.display(),
-                    human::bytes(need),
-                    human::bytes(free),
-                    shell_quote(&plan.source.display().to_string()),
-                    plan.image
-                        .file_name()
-                        .map(|n| n.to_string_lossy().into_owned())
-                        .unwrap_or_else(|| "image.img".into())
-                )));
-            }
-        }
-    }
-
-    // Resuming must continue on the same device.
-    let id_path = identity_path(&map_path);
-    let device_identity =
-        (info.kind != DeviceKind::ImageFile).then(|| Fingerprint::of(&info, None));
-    if prior.is_some() && !plan.force {
-        if let Some(before) = read_identity(&id_path) {
-            check_same_device(&before, &info, &map_path)?;
-        }
-    }
-
-    if !out_dir.exists() {
-        std::fs::create_dir_all(&out_dir)
-            .map_err(|e| CliError::failed(crate::error::explain_io(&e, Some(&out_dir))))?;
-    }
-    if prior.is_none() && plan.force && image_meta.as_ref().is_some_and(|m| m.len() > 0) {
-        // Replacing a file: unreadable areas must read back as zeros, not as old data.
-        std::fs::OpenOptions::new()
-            .write(true)
-            .truncate(true)
-            .open(plan.image)
-            .map_err(|e| CliError::failed(crate::error::explain_io(&e, Some(plan.image))))?;
-    }
-
-    let mut opts = ImagingOptions::with_profile(profile.clone());
-    opts.domain = domain;
-    opts.start_reverse = plan.tuning.reverse;
-    opts.command_line = Some(plan.command_line.clone());
-    opts.allow_existing_output = plan.force;
-    opts.preallocate = domain.is_none() && opened.shared.size() >= (1 << 20);
-    if plan.ui == UiMode::Tui {
-        opts.map_snapshot_interval = Some(Duration::from_millis(250));
-    }
-    let mut imager = Imager::new(opened.shared.clone(), plan.image, &map_path, opts).map_err(|e| match e {
-        diskrescue_core::Error::InvalidArgument(m) if m.contains("mapfile") => CliError::failed(format!(
-            "{m}. The progress map seems to belong to a different device or image: use another image \
-             name to start a new copy."
-        )),
-        other => CliError::from(other),
-    })?;
-    let resumed = imager.is_resumed();
-    let before = imager.stats();
-    if let Some(fp) = &device_identity {
-        if !resumed || plan.force {
-            write_identity(&id_path, fp);
-        }
-    }
+    let prepared = app_imaging::prepare(&plan.to_app(), &setup, &mut |w| super::print_warnings(w))?;
+    let ready = match prepared {
+        Prepared::AlreadyComplete(done) => return Ok(*done),
+        Prepared::Ready(r) => *r,
+    };
+    let imager = ready.imager;
+    let info = ready.info;
+    let profile = ready.profile;
+    let map_path = ready.mapfile;
+    let resumed = ready.resumed;
+    let before = ready.before;
+    let domain_len = ready.copy_size;
     let header = Header {
         source: format!(
             "{}{}",
@@ -436,15 +191,14 @@ pub fn run_imaging(
     } else {
         println!(
             "{}",
-            json!({
-                "event": "start",
-                "source": info.path,
-                "image": plan.image,
-                "mapfile": map_path,
-                "profile": profile.name,
-                "size": domain_len,
-                "resumed": resumed,
-                "command_line": plan.command_line,
+            diskrescue_app::json::start_json(&StartInfo {
+                source: info.path.clone(),
+                image: plan.image.to_path_buf(),
+                mapfile: map_path.clone(),
+                profile: profile.name.clone(),
+                size: domain_len,
+                resumed,
+                command_line: plan.command_line.clone(),
             })
         );
     }
@@ -453,6 +207,7 @@ pub fn run_imaging(
     interrupt.attach(control.clone());
     let (tx, rx) = mpsc::channel::<Event>();
     let engine_control = control.clone();
+    let mut imager = imager;
     let handle = std::thread::Builder::new()
         .name("imaging".into())
         .spawn(move || {
@@ -496,29 +251,15 @@ pub fn run_imaging(
     interrupt.detach_all();
     let summary = match joined {
         Ok(Ok(s)) => s,
-        Ok(Err(e)) => {
-            return Err(CliError::failed(format!(
-                "{}. Progress up to this point is saved in {}; run the same command again to continue.",
-                crate::error::user_message(&CliError::from(e)),
-                map_path.display()
-            )))
-        }
-        Err(_) => {
-            return Err(CliError::failed(format!(
-                "the imaging engine stopped unexpectedly (this is a bug). Progress up to the last save is in {}; \
-                 run the same command again to continue.",
-                map_path.display()
-            )))
-        }
+        Ok(Err(e)) => return Err(app_imaging::engine_error(&map_path, e).into()),
+        Err(_) => return Err(app_imaging::engine_panicked(&map_path).into()),
     };
-    Ok(ImagingDone {
-        stats: summary.stats,
-        summary: Some(summary),
+    Ok(ImagingDone::from_summary(
+        summary,
         info,
-        image: plan.image.to_path_buf(),
-        mapfile: map_path,
-        already_complete: false,
-    })
+        plan.image.to_path_buf(),
+        map_path,
+    ))
 }
 
 fn print_preface(
@@ -560,28 +301,6 @@ fn print_preface(
 
 // ---------------------------------------------------------------- plain
 
-fn dir_text(reverse: bool) -> &'static str {
-    if reverse {
-        "backwards"
-    } else {
-        "forwards"
-    }
-}
-
-/// Short phase name for progress lines.
-pub fn phase_short(p: &Phase) -> String {
-    match p {
-        Phase::Copying { pass, reverse } => format!("copying pass {pass} ({})", dir_text(*reverse)),
-        Phase::Trimming => "trimming failed areas".into(),
-        Phase::Dividing => "dividing failed areas".into(),
-        Phase::Scraping => "scraping failed areas".into(),
-        Phase::Retrying { pass, reverse } => {
-            format!("retrying pass {pass} ({})", dir_text(*reverse))
-        }
-        Phase::Finished => "finished".into(),
-    }
-}
-
 /// One progress line for plain output.
 pub fn plain_line(p: &Progress) -> String {
     let s = &p.stats;
@@ -601,11 +320,6 @@ pub fn plain_line(p: &Progress) -> String {
         eta,
         plural(p.errors, "read error", "read errors")
     )
-}
-
-/// Engine messages that only matter in a log file.
-pub fn is_engine_chatter(msg: &str) -> bool {
-    msg.starts_with("resuming: status")
 }
 
 /// Turns engine events into text lines, printing progress at most every `every`.
@@ -685,89 +399,6 @@ fn plain_loop(rx: &Receiver<Event>, every: Duration) {
 }
 
 // ---------------------------------------------------------------- json
-
-/// JSON for a phase.
-pub fn phase_json(p: &Phase) -> Value {
-    match p {
-        Phase::Copying { pass, reverse } => {
-            json!({"name": "copying", "pass": pass, "reverse": reverse, "text": p.to_string()})
-        }
-        Phase::Retrying { pass, reverse } => {
-            json!({"name": "retrying", "pass": pass, "reverse": reverse, "text": p.to_string()})
-        }
-        Phase::Trimming => json!({"name": "trimming", "text": p.to_string()}),
-        Phase::Dividing => json!({"name": "dividing", "text": p.to_string()}),
-        Phase::Scraping => json!({"name": "scraping", "text": p.to_string()}),
-        Phase::Finished => json!({"name": "finished", "text": p.to_string()}),
-    }
-}
-
-fn stats_json(s: &Stats) -> Value {
-    json!({
-        "rescued": s.rescued,
-        "non_tried": s.non_tried,
-        "non_trimmed": s.non_trimmed,
-        "non_scraped": s.non_scraped,
-        "bad": s.bad_sectors,
-        "bad_areas": s.bad_areas,
-        "total": s.total(),
-        "percent_rescued": s.rescued_fraction() * 100.0,
-    })
-}
-
-/// JSON for a summary.
-pub fn summary_json(s: &Summary) -> Value {
-    json!({
-        "event": "finished",
-        "finished": s.finished,
-        "cancelled": s.cancelled,
-        "elapsed_secs": s.elapsed.as_secs_f64(),
-        "errors": s.errors,
-        "timeouts": s.timeouts,
-        "slow_reads": s.slow_reads,
-        "reattaches": s.reattaches,
-        "image": s.output,
-        "mapfile": s.mapfile,
-        "stats": stats_json(&s.stats),
-        "warnings": s.warnings,
-    })
-}
-
-/// JSON for an engine event (map snapshots are not reported).
-pub fn event_json(ev: &Event) -> Option<Value> {
-    Some(match ev {
-        Event::Progress(p) => json!({
-            "event": "progress",
-            "phase": phase_json(&p.phase),
-            "position": p.current_pos,
-            "size": p.size,
-            "stats": stats_json(&p.stats),
-            "rate": p.current_rate,
-            "average_rate": p.average_rate,
-            "elapsed_secs": p.elapsed.as_secs_f64(),
-            "eta_secs": p.eta.map(|d| d.as_secs_f64()),
-            "errors": p.errors,
-            "timeouts": p.timeouts,
-            "slow_reads": p.slow_reads,
-            "reattaches": p.reattaches,
-            "last_error": p.last_error,
-        }),
-        Event::Phase(p) => json!({"event": "phase", "phase": phase_json(p)}),
-        Event::Log(level, msg) => json!({
-            "event": "log",
-            "level": level.to_string().to_lowercase(),
-            "message": msg,
-        }),
-        Event::DeviceLost { at } => json!({"event": "device_lost", "position": at}),
-        Event::DeviceBack { after } => {
-            json!({"event": "device_back", "after_secs": after.as_secs_f64()})
-        }
-        Event::Paused(d) => json!({"event": "paused", "secs": d.as_secs_f64()}),
-        Event::Saved => json!({"event": "saved"}),
-        Event::Finished(s) => summary_json(s),
-        Event::Map(_) => return None,
-    })
-}
 
 fn json_loop(rx: &Receiver<Event>) {
     let mut last_progress: Option<Instant> = None;
@@ -944,20 +575,54 @@ pub fn print_summary(done: &ImagingDone, resume_command: &str, json: bool, show_
     }
 }
 
+/// Stop cleanly (save the progress map, exit 130) when standard input is
+/// closed: for programs that start the command with elevated rights and
+/// may not be allowed to signal it (`--stop-on-stdin-close`).
+fn stop_when_stdin_closes(interrupt: Arc<Interrupt>) {
+    let spawned = std::thread::Builder::new()
+        .name("stdin-watch".into())
+        .spawn(move || {
+            let mut stdin = std::io::stdin();
+            let mut buf = [0u8; 512];
+            loop {
+                match stdin.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(_) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                    Err(_) => break,
+                }
+            }
+            if !interrupt.is_set() {
+                eprintln!(
+                    "Stopping: standard input was closed. Finishing the current step and saving what \
+                     has been done so far."
+                );
+            }
+            interrupt.trigger();
+        });
+    if let Err(e) = spawned {
+        log::warn!("cannot watch standard input: {e}");
+    }
+}
+
 /// Run the command.
 pub fn run(args: &ImageArgs, interrupt: &Arc<Interrupt>) -> CmdResult {
+    if args.stop_on_stdin_close {
+        stop_when_stdin_closes(interrupt.clone());
+    }
     let command_line = util::command_line();
+    let tuning = super::tuning(&args.tuning);
     let plan = ImagePlan {
         source: &args.source,
         image: &args.image,
         map: args.map.as_deref(),
-        tuning: &args.tuning,
+        tuning: &tuning,
         start: args.start,
         size: args.size,
         force: args.force,
         allow_mounted: args.allow_mounted,
         space_check: !args.no_space_check,
-        ui: UiMode::choose(args.no_tui, args.json_progress),
+        ui: UiMode::choose(args.no_tui || args.stop_on_stdin_close, args.json_progress),
         command_line: command_line.clone(),
     };
     let done = run_imaging(&plan, interrupt)?;

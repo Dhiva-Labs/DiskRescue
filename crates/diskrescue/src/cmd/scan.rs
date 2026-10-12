@@ -3,9 +3,17 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+use diskrescue_app::text::{
+    date_text, entry_state_label as state_text, extent_label as extent_text,
+    scheme_label as scheme_text,
+};
+#[cfg(test)]
 use diskrescue_core::format::ExtentStatus;
+#[cfg(test)]
 use diskrescue_core::fs::EntryConfidence;
+#[cfg(test)]
 use diskrescue_core::partition::PartitionScheme;
+#[cfg(test)]
 use diskrescue_core::time::Timestamp;
 use diskrescue_core::util::human;
 use diskrescue_recover::pipeline::Survey;
@@ -13,54 +21,12 @@ use diskrescue_recover::CarvePolicy;
 
 use crate::args::ScanArgs;
 use crate::cmd::{carve_policy, print_warnings, selection};
-use crate::error::{CliError, CmdResult};
+use crate::error::CmdResult;
 use crate::progress::{self, Mode, ProgressUi};
 use crate::signal::Interrupt;
 use crate::source::{self, SourceRequest};
 use crate::term::{self, Align, Table};
 use crate::util::plural;
-
-fn scheme_text(s: PartitionScheme) -> &'static str {
-    match s {
-        PartitionScheme::Mbr => "MBR",
-        PartitionScheme::Gpt => "GPT",
-        PartitionScheme::None => {
-            "none (the filesystem starts at the beginning, like a camera card)"
-        }
-        PartitionScheme::Unknown => "none found",
-    }
-}
-
-fn state_text(c: EntryConfidence, deleted: bool) -> &'static str {
-    if !deleted {
-        return "existing";
-    }
-    match c {
-        EntryConfidence::Allocated => "existing",
-        EntryConfidence::DeletedIntact => "deleted",
-        EntryConfidence::DeletedGuessed => "deleted, guessed",
-        EntryConfidence::DeletedNoData => "deleted, data gone",
-    }
-}
-
-fn extent_text(s: ExtentStatus) -> &'static str {
-    match s {
-        ExtentStatus::Complete => "complete",
-        ExtentStatus::Truncated => "cut short",
-        ExtentStatus::Capped => "very large",
-        ExtentStatus::UnknownLength => "length guessed",
-    }
-}
-
-fn date_text(t: Option<Timestamp>) -> String {
-    match t {
-        Some(ts) => {
-            let (y, mo, d, h, mi, _) = ts.civil();
-            format!("{y:04}-{mo:02}-{d:02} {h:02}:{mi:02}")
-        }
-        None => "-".into(),
-    }
-}
 
 /// Render a survey as text. `limit == 0` shows every file.
 pub fn render(survey: &Survey, limit: usize, carve_requested: bool, width: usize) -> String {
@@ -210,7 +176,7 @@ pub fn render(survey: &Survey, limit: usize, carve_requested: bool, width: usize
 pub fn run(args: &ScanArgs, interrupt: &Arc<Interrupt>) -> CmdResult {
     let mut req = SourceRequest::reading(&args.source);
     req.map = args.map.as_deref();
-    req.interrupt = Some(interrupt);
+    req.cancel = Some(interrupt.flag());
     let opened = source::open(&req)?;
     print_warnings(&opened.warnings);
     let sel = selection(&args.categories, &args.state);
@@ -223,14 +189,20 @@ pub fn run(args: &ScanArgs, interrupt: &Arc<Interrupt>) -> CmdResult {
             human::bytes(opened.info.size)
         );
     }
-    let result =
-        diskrescue_recover::survey(opened.shared.clone(), &sel, policy, interrupt.flag(), &ui);
+    let result = diskrescue_app::recovery::run_survey(
+        opened.shared.clone(),
+        &sel,
+        policy,
+        interrupt.flag(),
+        &ui,
+    );
     ui.finish();
     let _ = progress::multi().clear();
-    let survey = result.map_err(CliError::from)?;
+    let survey = result?;
     if args.json {
-        let text = serde_json::to_string_pretty(&survey)
-            .map_err(|e| CliError::failed(format!("cannot format the result: {e}")))?;
+        let text = serde_json::to_string_pretty(&survey).map_err(|e| {
+            crate::error::CliError::failed(format!("cannot format the result: {e}"))
+        })?;
         println!("{text}");
     } else {
         print!(

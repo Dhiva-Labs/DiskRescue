@@ -1,29 +1,19 @@
 //! `diskrescue info`: device details, partitions and filesystems.
 
-use std::time::Duration;
-
 use diskrescue_core::device::{DeviceInfo, DeviceKind, HealthInfo};
 use diskrescue_core::partition::{PartitionScheme, PartitionTable};
-use diskrescue_core::profile::ImagingProfile;
 use diskrescue_core::util::human;
-use diskrescue_core::SharedSource;
-use diskrescue_partition::Volume;
 use serde_json::json;
+
+#[cfg(test)]
+pub use diskrescue_app::devices::wants_smart;
+use diskrescue_app::devices::{health_lines, VolumeInfo};
 
 use crate::args::InfoArgs;
 use crate::cmd::list::{size_text, transport_name};
 use crate::error::{CliError, CmdResult};
-use crate::source::{self, SourceRequest};
 use crate::term::{self, Align, Paint, Table};
 use crate::{profile_text, util};
-
-/// SMART data is only asked of real disks.
-fn wants_smart(info: &DeviceInfo) -> bool {
-    !matches!(
-        info.kind,
-        DeviceKind::ImageFile | DeviceKind::Virtual | DeviceKind::Optical
-    ) && info.health.is_none()
-}
 
 fn scheme_text(s: PartitionScheme) -> &'static str {
     match s {
@@ -32,43 +22,6 @@ fn scheme_text(s: PartitionScheme) -> &'static str {
         PartitionScheme::None => "none (a filesystem starts at the beginning, like a camera card)",
         PartitionScheme::Unknown => "none found",
     }
-}
-
-fn health_lines(h: &HealthInfo) -> Vec<String> {
-    let mut v = Vec::new();
-    match h.passed {
-        Some(true) => v.push("the drive's own health check passed".to_string()),
-        Some(false) => v.push("the drive's own health check FAILED: it is failing".to_string()),
-        None => {}
-    }
-    let mut counters = Vec::new();
-    if let Some(n) = h.reallocated_sectors {
-        counters.push(format!("{n} reallocated sectors"));
-    }
-    if let Some(n) = h.pending_sectors {
-        counters.push(format!("{n} pending sectors"));
-    }
-    if let Some(n) = h.uncorrectable_sectors {
-        counters.push(format!("{n} uncorrectable sectors"));
-    }
-    if !counters.is_empty() {
-        v.push(counters.join(", "));
-    }
-    let mut misc = Vec::new();
-    if let Some(t) = h.temperature_c {
-        misc.push(format!("{t} C"));
-    }
-    if let Some(n) = h.power_on_hours {
-        misc.push(format!("{} hours powered on", human::count(n)));
-    }
-    if let Some(n) = h.percentage_used {
-        misc.push(format!("{n}% of rated life used"));
-    }
-    if !misc.is_empty() {
-        v.push(misc.join(", "));
-    }
-    v.extend(h.notes.iter().cloned());
-    v
 }
 
 fn field(out: &mut String, p: &Paint, name: &str, value: &str) {
@@ -189,7 +142,7 @@ pub fn render_device(info: &DeviceInfo, health: Option<&HealthInfo>) -> String {
 }
 
 /// Text for the partition table and its volumes.
-pub fn render_partitions(table: &PartitionTable, vols: &[Volume], width: usize) -> String {
+pub fn render_partitions(table: &PartitionTable, vols: &[VolumeInfo], width: usize) -> String {
     let p = term::out();
     let mut out = String::new();
     out.push_str(&format!(
@@ -255,43 +208,17 @@ pub fn render_partitions(table: &PartitionTable, vols: &[Volume], width: usize) 
 
 /// Run the command.
 pub fn run(args: &InfoArgs) -> CmdResult {
-    let mut info = source::describe(&args.source)?;
+    let d = diskrescue_app::devices::details(&args.source, args.map.as_deref())?;
     let p = term::out();
-
-    let mut health = info.health.clone();
-    if health.is_none() && wants_smart(&info) {
-        health = diskrescue_device::smart::query_with_timeout(&info.path, Duration::from_secs(8));
-    }
-
-    // Opening can fail (permissions); the description above is still useful.
-    let mut req = SourceRequest::reading(&args.source);
-    req.map = args.map.as_deref();
-    let mut open_error: Option<String> = None;
-    let mut table: Option<PartitionTable> = None;
-    let mut vols: Vec<Volume> = Vec::new();
-    let mut notes: Vec<String> = Vec::new();
-    let mut mapfile = None;
-    let mut map_stats = None;
-    match source::open(&req) {
-        Ok(opened) => {
-            info = opened.info.clone();
-            notes.extend(opened.warnings.iter().cloned());
-            mapfile = opened.mapfile.clone();
-            map_stats = opened.map_stats;
-            let shared: SharedSource = opened.shared.clone();
-            match diskrescue_partition::volumes(&shared, opened.info.logical_sector) {
-                Ok((t, v)) => {
-                    table = Some(t);
-                    vols = v;
-                }
-                Err(e) => open_error = Some(format!("the partition table could not be read: {e}")),
-            }
-        }
-        Err(CliError::Failed(m)) | Err(CliError::Refused(m)) => open_error = Some(m),
-        Err(e) => return Err(e),
-    }
-
-    let profile = ImagingProfile::for_kind(info.kind);
+    let info = d.info;
+    let health = d.health;
+    let mapfile = d.mapfile;
+    let map_stats = d.map_stats;
+    let table = d.table;
+    let vols = d.volumes;
+    let notes = d.notes;
+    let open_error = d.open_error;
+    let profile = d.profile;
 
     if args.json {
         let volumes: Vec<_> = vols

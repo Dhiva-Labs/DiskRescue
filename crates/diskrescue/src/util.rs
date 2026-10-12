@@ -1,8 +1,12 @@
-//! Small helpers: size parsing, wildcard expansion, command-line quoting,
-//! free-space lookup.
+//! Small helpers: size parsing and the command line as typed. Number
+//! formatting, wildcard expansion and free-space lookup live in
+//! `diskrescue_app` and are re-exported here.
 
-use std::path::{Path, PathBuf};
 use std::time::Duration;
+
+pub use diskrescue_app::text::{fraction, percent, plural, shell_quote};
+#[cfg(test)]
+pub use diskrescue_app::util::{expand_file_args, free_space, wildcard_match};
 
 /// Parse a size such as `4096`, `64k`, `1M`, `2.5G`, `0x10000`, `512KiB` or `1MB`.
 ///
@@ -70,22 +74,6 @@ pub fn parse_secs(s: &str) -> Result<Duration, String> {
     Ok(Duration::from_secs_f64(v))
 }
 
-/// Quote one command-line argument for display in a copy-and-paste command.
-pub fn shell_quote(arg: &str) -> String {
-    let safe = !arg.is_empty()
-        && arg
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || "-_./:=@%+,\\".contains(c));
-    if safe {
-        arg.to_string()
-    } else if cfg!(windows) {
-        // cmd.exe and PowerShell both understand double quotes.
-        format!("\"{}\"", arg.replace('"', "\\\""))
-    } else {
-        format!("'{}'", arg.replace('\'', "'\\''"))
-    }
-}
-
 /// The command line as typed (`diskrescue ...`), for mapfile headers and reports.
 pub fn command_line() -> String {
     let mut parts = vec!["diskrescue".to_string()];
@@ -95,174 +83,6 @@ pub fn command_line() -> String {
             .map(|a| shell_quote(&a.to_string_lossy())),
     );
     parts.join(" ")
-}
-
-/// Percentage with one decimal, never rounding up to 100.0 unless complete.
-pub fn percent(part: u64, total: u64) -> String {
-    if total == 0 {
-        return "100%".into();
-    }
-    if part >= total {
-        return "100%".into();
-    }
-    let p = part as f64 * 100.0 / total as f64;
-    let p = (p * 10.0).floor() / 10.0;
-    format!("{p:.1}%")
-}
-
-/// Fraction 0..=1 for a gauge.
-pub fn fraction(part: u64, total: u64) -> f64 {
-    if total == 0 {
-        1.0
-    } else {
-        (part as f64 / total as f64).clamp(0.0, 1.0)
-    }
-}
-
-/// Plural helper: `1 file`, `2 files`.
-pub fn plural(n: u64, one: &str, many: &str) -> String {
-    format!(
-        "{} {}",
-        diskrescue_core::util::human::count(n),
-        if n == 1 { one } else { many }
-    )
-}
-
-/// Case-insensitive `*` / `?` wildcard match on a file name.
-pub fn wildcard_match(pattern: &str, name: &str) -> bool {
-    let p: Vec<char> = pattern.to_lowercase().chars().collect();
-    let n: Vec<char> = name.to_lowercase().chars().collect();
-    let (mut pi, mut ni) = (0usize, 0usize);
-    let (mut star, mut mark) = (None::<usize>, 0usize);
-    while ni < n.len() {
-        if pi < p.len() && (p[pi] == '?' || p[pi] == n[ni]) {
-            pi += 1;
-            ni += 1;
-        } else if pi < p.len() && p[pi] == '*' {
-            star = Some(pi);
-            mark = ni;
-            pi += 1;
-        } else if let Some(s) = star {
-            pi = s + 1;
-            mark += 1;
-            ni = mark;
-        } else {
-            return false;
-        }
-    }
-    while pi < p.len() && p[pi] == '*' {
-        pi += 1;
-    }
-    pi == p.len()
-}
-
-/// Expand `*` and `?` in file names that the shell left alone (Windows `cmd`
-/// does not expand them) and check that every input exists and is a file.
-pub fn expand_file_args(args: &[PathBuf]) -> Result<Vec<PathBuf>, String> {
-    let mut out: Vec<PathBuf> = Vec::new();
-    for a in args {
-        let name = a
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_default();
-        if !a.exists() && (name.contains('*') || name.contains('?')) {
-            let dir = match a.parent() {
-                Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
-                _ => PathBuf::from("."),
-            };
-            let mut found: Vec<PathBuf> = std::fs::read_dir(&dir)
-                .map_err(|e| format!("cannot read the folder {}: {e}", dir.display()))?
-                .filter_map(|e| e.ok())
-                .filter(|e| {
-                    e.file_type().map(|t| t.is_file()).unwrap_or(false)
-                        && wildcard_match(&name, &e.file_name().to_string_lossy())
-                })
-                .map(|e| e.path())
-                .collect();
-            found.sort();
-            if found.is_empty() {
-                return Err(format!("no files match {}", a.display()));
-            }
-            out.extend(found);
-            continue;
-        }
-        match std::fs::metadata(a) {
-            Ok(m) if m.is_file() => out.push(a.clone()),
-            Ok(m) if m.is_dir() => {
-                return Err(format!(
-                    "{} is a folder; give the files inside it (for example {}/*.jpg)",
-                    a.display(),
-                    a.display()
-                ))
-            }
-            Ok(_) => {
-                return Err(format!(
-                    "{} is a device, not a file. This command works on files; \
-                     to get files back from a device use 'diskrescue recover'",
-                    a.display()
-                ))
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                return Err(format!("{} does not exist", a.display()))
-            }
-            Err(e) => return Err(format!("cannot read {}: {e}", a.display())),
-        }
-    }
-    let mut seen = std::collections::HashSet::new();
-    out.retain(|p| seen.insert(p.clone()));
-    Ok(out)
-}
-
-/// Free space, in bytes, on the filesystem that holds `path` (or its nearest
-/// existing ancestor). `None` when it cannot be determined.
-pub fn free_space(path: &Path) -> Option<u64> {
-    let mut cur = if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        std::env::current_dir().ok()?.join(path)
-    };
-    while !cur.exists() {
-        if !cur.pop() {
-            return None;
-        }
-    }
-    free_space_of_existing(&cur)
-}
-
-#[cfg(unix)]
-fn free_space_of_existing(path: &Path) -> Option<u64> {
-    use std::ffi::CString;
-    use std::os::unix::ffi::OsStrExt;
-    let c = CString::new(path.as_os_str().as_bytes()).ok()?;
-    // SAFETY: `c` is a valid NUL-terminated string and `st` is a properly
-    // sized, writable statvfs buffer that statvfs fully initialises on success.
-    unsafe {
-        let mut st: libc::statvfs = std::mem::zeroed();
-        if libc::statvfs(c.as_ptr(), &mut st) != 0 {
-            return None;
-        }
-        #[allow(clippy::unnecessary_cast)]
-        Some((st.f_bavail as u64).saturating_mul(st.f_frsize as u64))
-    }
-}
-
-#[cfg(windows)]
-fn free_space_of_existing(path: &Path) -> Option<u64> {
-    use std::os::windows::ffi::OsStrExt;
-    use windows_sys::Win32::Storage::FileSystem::GetDiskFreeSpaceExW;
-    let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
-    let mut avail: u64 = 0;
-    let mut total: u64 = 0;
-    let mut free: u64 = 0;
-    // SAFETY: `wide` is NUL terminated and the three out-pointers refer to
-    // live u64 variables for the duration of the call.
-    let ok = unsafe { GetDiskFreeSpaceExW(wide.as_ptr(), &mut avail, &mut total, &mut free) };
-    (ok != 0).then_some(avail)
-}
-
-#[cfg(not(any(unix, windows)))]
-fn free_space_of_existing(_path: &Path) -> Option<u64> {
-    None
 }
 
 #[cfg(test)]

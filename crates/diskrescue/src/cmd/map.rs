@@ -1,6 +1,6 @@
 //! `diskrescue map`: show the progress map of an image.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use diskrescue_core::util::human;
 use diskrescue_imaging::{render_map, BlockStatus, MapFile, StatusMap};
@@ -8,7 +8,6 @@ use serde_json::json;
 
 use crate::args::MapArgs;
 use crate::error::{CliError, CmdResult};
-use crate::source::default_map_path;
 use crate::term::{self, Paint};
 use crate::util::{percent, plural};
 
@@ -17,18 +16,7 @@ const MAX_WIDTH: usize = 240;
 
 /// The mapfile to read for the argument: the argument itself, or
 /// `<argument>.map` when the argument is an image that has one.
-pub fn resolve(arg: &Path) -> PathBuf {
-    let looks_like_map = arg
-        .extension()
-        .is_some_and(|e| e.to_string_lossy().eq_ignore_ascii_case("map"));
-    if !looks_like_map {
-        let candidate = default_map_path(arg);
-        if candidate.is_file() {
-            return candidate;
-        }
-    }
-    arg.to_path_buf()
-}
+pub use diskrescue_app::source::resolve_mapfile as resolve;
 
 fn row(p: &Paint, label: &str, status: BlockStatus, bytes: u64, total: u64) -> String {
     let glyph = status.as_char().to_string();

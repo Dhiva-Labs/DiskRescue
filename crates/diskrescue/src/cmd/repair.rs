@@ -3,48 +3,30 @@
 use std::path::Path;
 use std::sync::Arc;
 
+#[cfg(test)]
 use diskrescue_core::format::ValidationStatus;
 use diskrescue_recover::report::{FileRecord, Origin, Outcome};
 use diskrescue_recover::Report;
 
 use crate::args::RepairArgs;
-use crate::cmd::{check_donors, check_output_dir};
 use crate::error::{CliError, CmdResult};
 use crate::progress::{Mode, ProgressUi};
 use crate::signal::Interrupt;
 use crate::term::{self, Paint, Table};
-use crate::util::{expand_file_args, plural};
+use crate::util::plural;
 
 fn before_text(f: &FileRecord) -> String {
-    match f.validation.as_ref().map(|v| v.status) {
-        Some(ValidationStatus::Valid) => "intact".into(),
-        Some(ValidationStatus::Damaged) => "damaged".into(),
-        Some(ValidationStatus::Invalid) => "not valid".into(),
-        None => "unrecognised".into(),
-    }
+    diskrescue_app::text::validation_label(f.validation.as_ref().map(|v| v.status)).to_string()
 }
 
 /// One-line result for a file.
 pub fn result_text(f: &FileRecord) -> &'static str {
-    match f.outcome {
-        Outcome::Recovered | Outcome::RecoveredUnverified => "no repair needed",
-        Outcome::Repaired => "repaired",
-        Outcome::PartiallyRepaired => "partly repaired",
-        Outcome::Damaged => "could not be repaired",
-        Outcome::Failed => "could not be checked",
-        Outcome::Duplicate => "duplicate",
-    }
+    diskrescue_app::text::repair_result_label(f.outcome)
 }
 
 /// True when the file ended up usable (intact or repaired at least partly).
 pub fn is_ok(f: &FileRecord) -> bool {
-    matches!(
-        f.outcome,
-        Outcome::Recovered
-            | Outcome::RecoveredUnverified
-            | Outcome::Repaired
-            | Outcome::PartiallyRepaired
-    )
+    diskrescue_app::results::is_usable(f.outcome)
 }
 
 fn display_name(f: &FileRecord) -> String {
@@ -115,20 +97,18 @@ pub fn render(report: &Report, output: &Path, width: usize, p: &Paint) -> String
 
 /// Run the command.
 pub fn run(args: &RepairArgs, interrupt: &Arc<Interrupt>) -> CmdResult {
-    let inputs = expand_file_args(&args.files).map_err(CliError::failed)?;
-    check_donors(&args.donor)?;
-    check_output_dir(&args.output)?;
+    let inputs = diskrescue_app::recovery::check_repair(&args.files, &args.output, &args.donor)?;
     let _ = interrupt;
     let ui = ProgressUi::new(Mode::choose(false));
-    let result =
-        diskrescue_recover::repair_files(&inputs, &args.output, &args.donor, args.aggressive, &ui);
+    let result = diskrescue_app::recovery::run_repair(
+        &inputs,
+        &args.output,
+        &args.donor,
+        args.aggressive,
+        &ui,
+    );
     ui.finish();
-    let report = result.map_err(|e| match e {
-        diskrescue_core::Error::Io(io) => {
-            CliError::failed(crate::error::explain_io(&io, Some(&args.output)))
-        }
-        other => CliError::from(other),
-    })?;
+    let report = result?;
     let failed = report.files.iter().filter(|f| !is_ok(f)).count();
     if args.json {
         let text = serde_json::to_string_pretty(&report)

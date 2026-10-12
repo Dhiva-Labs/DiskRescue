@@ -1,60 +1,38 @@
 //! `diskrescue recover`: the whole pipeline, optionally preceded by imaging.
 //!
-//! [`run_recovery`] is shared with `diskrescue carve`.
+//! [`run_recovery`] is shared with `diskrescue carve`. The checks, opening
+//! the source and the pipeline options are shared with the other front-ends
+//! (`diskrescue_app::recovery`); this module prints.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use diskrescue_app::recovery::RecoveryJob as AppJob;
+use diskrescue_app::results::has_files;
 use diskrescue_core::device::DeviceKind;
 use diskrescue_core::util::human;
 use diskrescue_recover::report::Report;
-use diskrescue_recover::{CarvePolicy, RecoverOptions, Selection};
 use serde_json::json;
 
-use crate::args::{RecoverArgs, RepairOpts, Tuning};
+pub use diskrescue_app::recovery::keep_previous_report;
+
+use crate::args::RecoverArgs;
 use crate::cmd::image::{self, ImagePlan, UiMode};
-use crate::cmd::{carve_policy, check_donors, check_output_dir, print_warnings, selection};
-use crate::error::{exit, CliError, CmdResult};
+use crate::cmd::print_warnings;
+use crate::error::{exit, CmdResult};
 use crate::progress::{Mode, ProgressUi};
 use crate::signal::Interrupt;
-use crate::source::{self, SourceRequest};
 use crate::term;
 use crate::util::{self, plural};
 
-/// The imaging step of `recover --image-to`.
-pub struct ImageStep<'a> {
-    /// Image file to create or resume.
-    pub image: &'a Path,
-    /// Strategy overrides.
-    pub tuning: &'a Tuning,
-    /// Plain progress lines instead of the dashboard.
+/// A recovery job (`recover` and `carve`) and how to show it.
+pub struct RecoveryJob {
+    /// What to do (shared with the other front-ends).
+    pub job: AppJob,
+    /// Plain progress lines while imaging instead of the dashboard.
     pub no_tui: bool,
-}
-
-/// A recovery job (`recover` and `carve`).
-pub struct RecoveryJob<'a> {
-    /// Device, partition or image file.
-    pub source: &'a Path,
-    /// Output folder.
-    pub output: &'a Path,
-    /// Mapfile of the image.
-    pub map: Option<&'a Path>,
-    /// What to recover.
-    pub selection: Selection,
-    /// Carving policy.
-    pub carve: CarvePolicy,
-    /// Read filesystems (false for `carve`).
-    pub use_filesystems: bool,
-    /// Repair options.
-    pub repair: &'a RepairOpts,
-    /// Worker threads.
-    pub jobs: Option<usize>,
-    /// Allow a mounted source.
-    pub allow_mounted: bool,
     /// JSON lines instead of human text.
     pub json: bool,
-    /// Image the device first.
-    pub image_to: Option<ImageStep<'a>>,
     /// What the user typed.
     pub command_line: String,
 }
@@ -63,47 +41,37 @@ pub struct RecoveryJob<'a> {
 const SUMMARY_LINES: usize = 40;
 
 /// Run a recovery job end to end.
-pub fn run_recovery(job: &RecoveryJob<'_>, interrupt: &Arc<Interrupt>) -> CmdResult {
-    check_output_dir(job.output)?;
-    check_donors(&job.repair.donor)?;
-    if same_path(job.source, job.output) {
-        return Err(CliError::refused(format!(
-            "the output location {} is the source itself. Choose a new folder for the recovered files, \
-             preferably on another disk.",
-            job.output.display()
-        )));
-    }
+pub fn run_recovery(rj: &RecoveryJob, interrupt: &Arc<Interrupt>) -> CmdResult {
+    let job = &rj.job;
+    job.check()?;
     let paint = term::out();
 
     // Step 1 (optional): copy the device into an image.
-    let mut source_path: PathBuf = job.source.to_path_buf();
-    let mut map_path: Option<PathBuf> = job.map.map(Path::to_path_buf);
+    let mut source_path: PathBuf = job.source.clone();
+    let mut map_path: Option<PathBuf> = job.map.clone();
     let mut origin = None;
     if let Some(step) = &job.image_to {
-        let info = source::describe(job.source)?;
         // The folder for the results must be safe too (the image folder is checked while imaging).
-        let check =
-            diskrescue_recover::safety::check(job.source, &info, job.output, job.allow_mounted);
-        check.into_result().map_err(CliError::from)?;
+        job.check_output_against_device()?;
         let plan = ImagePlan {
-            source: job.source,
-            image: step.image,
-            map: job.map,
-            tuning: step.tuning,
+            source: &job.source,
+            image: &step.image,
+            map: job.map.as_deref(),
+            tuning: &step.tuning,
             start: None,
             size: None,
             force: false,
             allow_mounted: job.allow_mounted,
             space_check: true,
-            ui: UiMode::choose(step.no_tui, job.json),
-            command_line: job.command_line.clone(),
+            ui: UiMode::choose(rj.no_tui, rj.json),
+            command_line: rj.command_line.clone(),
         };
         let done = image::run_imaging(&plan, interrupt)?;
-        let code = image::print_summary(&done, &job.command_line, job.json, false);
+        let code = image::print_summary(&done, &rj.command_line, rj.json, false);
         if !done.finished() {
             return Ok(code);
         }
-        if !job.json {
+        if !rj.json {
             println!();
             println!("{}", paint.bold("Now recovering files from the image."));
         }
@@ -113,24 +81,10 @@ pub fn run_recovery(job: &RecoveryJob<'_>, interrupt: &Arc<Interrupt>) -> CmdRes
     }
 
     // Step 2: open and recover.
-    let mut req = SourceRequest::reading(&source_path);
-    req.map = map_path.as_deref();
-    req.use_map = true;
-    req.allow_mounted = job.allow_mounted;
-    req.output = Some(job.output);
-    req.interrupt = Some(interrupt);
-    let opened = source::open(&req)?;
+    let opened = job.open(&source_path, map_path.as_deref(), Some(interrupt.flag()))?;
     let reading_device = opened.info.kind != DeviceKind::ImageFile;
-    let mut warnings = opened.warnings.clone();
-    if reading_device && job.image_to.is_none() {
-        warnings.push(
-            "Reading directly from the device. That is fine when the device is healthy (for example \
-             after accidental deletion). If it shows read errors, slows down or disconnects, stop and \
-             copy it to an image first with: diskrescue image <device> <image file>"
-                .to_string(),
-        );
-    }
-    if job.json {
+    let warnings = job.warnings(&opened);
+    if rj.json {
         for w in &warnings {
             println!("{}", json!({"event": "warning", "message": w}));
         }
@@ -158,38 +112,23 @@ pub fn run_recovery(job: &RecoveryJob<'_>, interrupt: &Arc<Interrupt>) -> CmdRes
     }
 
     // A report from an earlier run in the same folder would be replaced: keep it.
-    if let Some(note) = keep_previous_report(job.output) {
-        if job.json {
+    if let Some(note) = keep_previous_report(&job.output) {
+        if rj.json {
             println!("{}", json!({"event": "warning", "message": note}));
         } else {
             print_warnings(&[note]);
         }
     }
 
-    let mut opts = RecoverOptions::new(job.output);
-    opts.selection = job.selection.clone();
-    opts.carve = job.carve;
-    opts.use_filesystems = job.use_filesystems;
-    opts.repair = !job.repair.no_repair;
-    opts.donors = job.repair.donor.clone();
-    opts.aggressive_repair = job.repair.aggressive;
-    opts.workers = job.jobs.unwrap_or(0);
-    opts.cancel = interrupt.flag();
-    opts.command_line = Some(job.command_line.clone());
-
+    let opts = job.options(interrupt.flag());
     let record = opened.record(origin.as_ref());
-    let ui = ProgressUi::new(Mode::choose(job.json));
-    let result = diskrescue_recover::recover(opened.shared.clone(), record, &opts, &ui);
+    let ui = ProgressUi::new(Mode::choose(rj.json));
+    let result = diskrescue_app::recovery::run_pipeline(opened.shared.clone(), record, &opts, &ui);
     ui.finish();
-    let report = result.map_err(|e| match e {
-        diskrescue_core::Error::Io(io) => {
-            CliError::failed(crate::error::explain_io(&io, Some(job.output)))
-        }
-        other => CliError::from(other),
-    })?;
+    let report = result?;
 
     let interrupted = report.interrupted || interrupt.is_set();
-    if job.json {
+    if rj.json {
         println!(
             "{}",
             json!({
@@ -206,7 +145,7 @@ pub fn run_recovery(job: &RecoveryJob<'_>, interrupt: &Arc<Interrupt>) -> CmdRes
         println!();
         print!(
             "{}",
-            finish_text(&report, job.output, interrupted, &job.command_line)
+            finish_text(&report, &job.output, interrupted, &rj.command_line)
         );
     }
     Ok(if interrupted {
@@ -214,43 +153,6 @@ pub fn run_recovery(job: &RecoveryJob<'_>, interrupt: &Arc<Interrupt>) -> CmdRes
     } else {
         exit::OK
     })
-}
-
-/// If `output` already holds a report, rename it to `report.previous.*` so
-/// the new run does not replace it. Returns the note to show the user.
-pub fn keep_previous_report(output: &Path) -> Option<String> {
-    let json = output.join("report.json");
-    let txt = output.join("report.txt");
-    if !json.is_file() && !txt.is_file() {
-        return None;
-    }
-    let mut kept = false;
-    for (from, to) in [
-        (json, output.join("report.previous.json")),
-        (txt, output.join("report.previous.txt")),
-    ] {
-        if from.is_file() && std::fs::rename(&from, &to).is_ok() {
-            kept = true;
-        }
-    }
-    Some(if kept {
-        format!(
-            "{} already contains the report of an earlier run; it was kept as report.previous.txt and \
-             report.previous.json. Files recovered before are never overwritten: new copies get numbered \
-             names. Use a new folder to keep the runs apart.",
-            output.display()
-        )
-    } else {
-        format!(
-            "{} already contains the report of an earlier run, which will be replaced. Use a new folder \
-             to keep both.",
-            output.display()
-        )
-    })
-}
-
-fn same_path(a: &Path, b: &Path) -> bool {
-    matches!((a.canonicalize(), b.canonicalize()), (Ok(x), Ok(y)) if x == y)
 }
 
 /// What to print after a recovery: the start of the report and what to look at.
@@ -349,45 +251,30 @@ pub fn finish_text(
     out
 }
 
-/// True when `dir` holds at least one file (looking a few levels down).
-fn has_files(dir: &Path) -> bool {
-    fn walk(dir: &Path, depth: u32) -> bool {
-        let Ok(rd) = std::fs::read_dir(dir) else {
-            return false;
-        };
-        for e in rd.flatten().take(10_000) {
-            match e.file_type() {
-                Ok(t) if t.is_file() => return true,
-                Ok(t) if t.is_dir() && depth < 8 && walk(&e.path(), depth + 1) => return true,
-                _ => {}
-            }
-        }
-        false
-    }
-    walk(dir, 0)
-}
-
 /// Run the command.
 pub fn run(args: &RecoverArgs, interrupt: &Arc<Interrupt>) -> CmdResult {
-    let job = RecoveryJob {
-        source: &args.source,
-        output: &args.output,
-        map: args.map.as_deref(),
-        selection: selection(&args.categories, &args.state),
-        carve: carve_policy(args.carve),
-        use_filesystems: true,
-        repair: &args.repair,
-        jobs: args.jobs.filter(|j| *j > 0),
+    let command_line = util::command_line();
+    let plan = diskrescue_app::plan::RecoverPlan {
+        source: args.source.clone(),
+        output: args.output.clone(),
+        categories: super::categories(&args.categories),
+        state: super::state_filter(&args.state),
+        carve: super::carve_mode(args.carve),
+        repair: super::repair_options(&args.repair),
+        jobs: args.jobs,
+        image_to: args.image_to.clone(),
+        map: args.map.clone(),
         allow_mounted: args.allow_mounted,
-        json: args.json,
-        image_to: args.image_to.as_deref().map(|image| ImageStep {
-            image,
-            tuning: &args.tuning,
-            no_tui: args.no_tui,
-        }),
-        command_line: util::command_line(),
+        tuning: super::tuning(&args.tuning),
+        command_line: Some(command_line.clone()),
     };
-    run_recovery(&job, interrupt)
+    let rj = RecoveryJob {
+        job: plan.job(),
+        no_tui: args.no_tui,
+        json: args.json,
+        command_line,
+    };
+    run_recovery(&rj, interrupt)
 }
 
 #[cfg(test)]

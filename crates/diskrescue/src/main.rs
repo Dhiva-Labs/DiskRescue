@@ -52,8 +52,9 @@ fn real_main() -> i32 {
         signal::global()
     };
     let started = std::time::SystemTime::now() - std::time::Duration::from_secs(2);
+    let result = dispatch(&cli.command, &interrupt);
+    // Listed after the run, so that sidecars it created are included.
     let written = written_paths(&cli.command);
-    let result = dispatch(cli.command, &interrupt);
     ownership::hand_back(&written, started);
     match result {
         Ok(code) => code,
@@ -90,17 +91,17 @@ fn written_paths(command: &Command) -> Vec<std::path::PathBuf> {
     }
 }
 
-fn dispatch(command: Command, interrupt: &Arc<Interrupt>) -> CmdResult {
+fn dispatch(command: &Command, interrupt: &Arc<Interrupt>) -> CmdResult {
     match command {
-        Command::List(a) => cmd::list::run(&a),
-        Command::Info(a) => cmd::info::run(&a),
-        Command::Image(a) => cmd::image::run(&a, interrupt),
-        Command::Scan(a) => cmd::scan::run(&a, interrupt),
-        Command::Recover(a) => cmd::recover::run(&a, interrupt),
-        Command::Carve(a) => cmd::carve::run(&a, interrupt),
-        Command::Repair(a) => cmd::repair::run(&a, interrupt),
-        Command::Verify(a) => cmd::verify::run(&a),
-        Command::Map(a) => cmd::map::run(&a),
+        Command::List(a) => cmd::list::run(a),
+        Command::Info(a) => cmd::info::run(a),
+        Command::Image(a) => cmd::image::run(a, interrupt),
+        Command::Scan(a) => cmd::scan::run(a, interrupt),
+        Command::Recover(a) => cmd::recover::run(a, interrupt),
+        Command::Carve(a) => cmd::carve::run(a, interrupt),
+        Command::Repair(a) => cmd::repair::run(a, interrupt),
+        Command::Verify(a) => cmd::verify::run(a),
+        Command::Map(a) => cmd::map::run(a),
     }
 }
 

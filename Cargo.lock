@@ -1049,6 +1049,7 @@ dependencies = [
  "clap",
  "crossterm",
  "ctrlc",
+ "diskrescue-app",
  "diskrescue-core",
  "diskrescue-device",
  "diskrescue-fixtures",
@@ -1087,6 +1088,8 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
+ "thiserror 2.0.21",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
