@@ -6,14 +6,16 @@ use std::collections::HashSet;
 use diskrescue_core::fs::{EntryConfidence, FileEntry, WalkControl};
 use diskrescue_core::{Range, RangeSet, Result};
 
+use crate::table::ClusterSet;
+
 use super::dir::{
     parse_dir, sniff_dir, DirData, ParsedDir, RawItem, ATTR_HIDDEN, ATTR_READ_ONLY, ATTR_SYSTEM,
 };
 use super::FatFs;
 use crate::common::{
     allocated_clusters, contiguous_runs, for_each_state, orphan_dir_entry, orphan_dir_id,
-    orphans_root_entry, runs_to_extents, scan_heads, ClusterMap, ClusterState, Emitter, MAX_DEPTH,
-    MAX_DIR_BYTES, MAX_ORPHAN_DIRS, ORPHANS_ID,
+    orphans_root_entry, runs_to_extents, scan_heads, ClaimIndex, ClusterMap, ClusterState, Emitter,
+    MAX_DEPTH, MAX_DIR_BYTES, MAX_ORPHAN_DIRS, ORPHANS_ID, SHARED_NOTE,
 };
 use crate::util::{div_ceil, is_media_name, join_path, looks_like_media, sanitize_name};
 
@@ -55,26 +57,43 @@ struct Walker<'a, 'b> {
     fs: &'a FatFs,
     em: Emitter<'b>,
     /// Every directory cluster already listed.
-    dir_clusters: RangeSet,
+    dir_clusters: ClusterSet,
     /// Clusters claimed by live files.
-    claimed: RangeSet,
+    claimed: ClusterSet,
+    /// Deleted-entry claims from the first pass (second pass only).
+    index: Option<&'a ClaimIndex>,
+    /// Deleted-entry claims being collected (first pass only).
+    recorder: Option<ClaimIndex>,
 }
 
-fn add_runs(set: &mut RangeSet, runs: &[(u32, u32)]) {
+fn add_runs(set: &mut ClusterSet, runs: &[(u32, u32)]) {
     for &(s, n) in runs {
         set.insert(Range::new(s as u64, s as u64 + n as u64));
+    }
+}
+
+fn runs_intersect(set: &ClusterSet, runs: &[(u32, u32)]) -> bool {
+    runs.iter()
+        .any(|&(s, n)| set.intersects(Range::new(s as u64, s as u64 + n as u64)))
+}
+
+impl<'a, 'b> Walker<'a, 'b> {
+    fn new(fs: &'a FatFs, em: Emitter<'b>) -> Self {
+        Walker {
+            fs,
+            em,
+            dir_clusters: ClusterSet::new(),
+            claimed: ClusterSet::new(),
+            index: None,
+            recorder: None,
+        }
     }
 }
 
 /// Load the root directory and return its label entry, if any.
 pub(super) fn root_label(fs: &FatFs) -> Option<String> {
     let mut ignore = |_: &FileEntry| WalkControl::Continue;
-    let mut w = Walker {
-        fs,
-        em: Emitter::new(&mut ignore, 0),
-        dir_clusters: RangeSet::new(),
-        claimed: RangeSet::new(),
-    };
+    let mut w = Walker::new(fs, Emitter::new(&mut ignore, 0));
     let (data, _) = w.load(root_src(fs))?;
     let p = parse_dir(&data, fs.is_fat32(), fs.max_cluster());
     p.label
@@ -87,14 +106,30 @@ fn root_src(fs: &FatFs) -> DirSrc {
     }
 }
 
+/// First pass: walk the tree silently and collect the clusters every
+/// deleted entry claims (orphans are not included).
+pub(super) fn collect_claims(fs: &FatFs) -> ClaimIndex {
+    let mut ignore = |_: &FileEntry| WalkControl::Continue;
+    let mut w = Walker::new(fs, Emitter::new(&mut ignore, fs.opts().max_entries));
+    w.recorder = Some(ClaimIndex::default());
+    w.walk_dir(root_src(fs), None, "", Ctx::Live, 0);
+    let mut ix = w.recorder.take().unwrap_or_default();
+    ix.finish();
+    if ix.truncated {
+        log::warn!("too many deleted entries to cross-check all their clusters");
+    }
+    ix
+}
+
 /// Walk the whole volume.
 pub(super) fn run(fs: &FatFs, visit: &mut dyn FnMut(&FileEntry) -> WalkControl) -> Result<()> {
-    let mut w = Walker {
-        fs,
-        em: Emitter::new(visit, fs.opts().max_entries),
-        dir_clusters: RangeSet::new(),
-        claimed: RangeSet::new(),
+    let index = if fs.opts().include_deleted {
+        Some(fs.claims())
+    } else {
+        None
     };
+    let mut w = Walker::new(fs, Emitter::new(visit, fs.opts().max_entries));
+    w.index = index;
     w.walk_dir(root_src(fs), None, "", Ctx::Live, 0);
     if !w.em.stopped && fs.opts().scan_orphans && fs.opts().include_deleted {
         w.scan_orphans();
@@ -239,8 +274,11 @@ impl<'a, 'b> Walker<'a, 'b> {
         if !self.em.reserve(held) {
             return;
         }
-        for n in notes.iter().chain(parsed.notes.iter()) {
-            log::warn!("{}: {n}", if path.is_empty() { "/" } else { path });
+        // The silent first pass (claims) does not repeat the warnings.
+        if self.recorder.is_none() {
+            for n in notes.iter().chain(parsed.notes.iter()) {
+                log::warn!("{}: {n}", if path.is_empty() { "/" } else { path });
+            }
         }
         for item in parsed.items {
             if self.em.stopped {
@@ -318,8 +356,30 @@ impl<'a, 'b> Walker<'a, 'b> {
     }
 
     /// Choose the first cluster of a deleted entry whose high word may have
-    /// been zeroed (FAT32 volumes with more than 65535 clusters).
+    /// been zeroed (FAT32 volumes with more than 65535 clusters). Results
+    /// are cached in the claim index so the second pass does not repeat
+    /// the candidate reads.
     fn resolve_first(
+        &mut self,
+        item: &RawItem,
+        size: u64,
+        is_dir: bool,
+        flags: &mut Vec<String>,
+    ) -> u32 {
+        if let Some((c, f)) = self.index.and_then(|ix| ix.resolved(item.id)) {
+            flags.extend(f.iter().cloned());
+            return *c;
+        }
+        let mut notes = Vec::new();
+        let c = self.resolve_first_uncached(item, size, is_dir, &mut notes);
+        if let Some(rec) = self.recorder.as_mut() {
+            rec.remember(item.id, c, &notes);
+        }
+        flags.extend(notes);
+        c
+    }
+
+    fn resolve_first_uncached(
         &self,
         item: &RawItem,
         size: u64,
@@ -331,7 +391,10 @@ impl<'a, 'b> Walker<'a, 'b> {
         if !self.fs.is_fat32() || item.hi != 0 || max <= 0xFFFF {
             return item.first_cluster(self.fs.is_fat32());
         }
-        if !is_dir && size == 0 {
+        if (!is_dir && size == 0) || lo == 0 {
+            // A zero cluster field is "data location lost", not a file at
+            // cluster h << 16: guessing there would hand every such entry
+            // the same unrelated content.
             return lo;
         }
         let check = |c: u32| -> bool {
@@ -343,15 +406,32 @@ impl<'a, 'b> Walker<'a, 'b> {
         };
         let free = |c: u32| self.fs.valid(c) && self.fs.state(c) == ClusterState::Free;
         let lo_ok = free(lo);
-        if lo_ok && check(lo) {
-            return lo;
-        }
         // A content signature only tells something about media files;
         // directories are checked through their self-pointing "." entry.
         let guess = is_dir || is_media_name(&item.name);
-        for h in (1..=(max >> 16)).filter(|_| guess) {
+        if !guess {
+            if !lo_ok {
+                flags.push(
+                    "first cluster may be incomplete (high word zeroed on delete)".to_string(),
+                );
+            }
+            return lo;
+        }
+        if lo_ok && check(lo) {
+            return lo;
+        }
+        let mut found: Vec<u32> = Vec::new();
+        for h in 1..=(max >> 16) {
             let c = (h << 16) | lo;
             if c != lo && free(c) && check(c) {
+                found.push(c);
+                if found.len() > 8 {
+                    break;
+                }
+            }
+        }
+        match found.first() {
+            Some(&c) => {
                 flags.push(format!(
                     "first cluster high word was zeroed on delete; cluster {c} chosen because {}",
                     if is_dir {
@@ -360,13 +440,27 @@ impl<'a, 'b> Walker<'a, 'b> {
                         "it starts with a media signature"
                     }
                 ));
-                return c;
+                if found.len() > 1 {
+                    flags.push(format!(
+                        "first cluster is ambiguous: {} other free clusters with the same low word also match ({})",
+                        found.len() - 1,
+                        found[1..]
+                            .iter()
+                            .map(|c| c.to_string())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ));
+                }
+                c
+            }
+            None => {
+                flags.push(
+                    "first cluster may be incomplete (high word zeroed on delete); no candidate cluster holds the expected content"
+                        .to_string(),
+                );
+                lo
             }
         }
-        if !lo_ok && lo != 0 {
-            flags.push("first cluster may be incomplete (high word zeroed on delete)".to_string());
-        }
-        lo
     }
 
     fn plan_file(
@@ -408,6 +502,11 @@ impl<'a, 'b> Walker<'a, 'b> {
                     }
                 }
             }
+            if runs_intersect(&self.claimed, &runs) {
+                flags.push(
+                    "cross-linked: some of its clusters also belong to another file".to_string(),
+                );
+            }
             add_runs(&mut self.claimed, &runs);
             return (
                 runs_to_extents(fs, &runs, Some(size)),
@@ -445,10 +544,34 @@ impl<'a, 'b> Walker<'a, 'b> {
                 runs.iter().map(|r| r.1 as u64).sum::<u64>()
             ));
         }
+        self.note_shared(item.id, &runs, ctx, flags);
         (
             runs_to_extents(fs, &runs, Some(size)),
             EntryConfidence::DeletedGuessed,
         )
+    }
+
+    /// Record (first pass) or check (second pass) the clusters a deleted
+    /// entry claims; returns true when they overlap another deleted entry.
+    fn note_shared(
+        &mut self,
+        id: u64,
+        runs: &[(u32, u32)],
+        ctx: Ctx,
+        flags: &mut Vec<String>,
+    ) -> bool {
+        if let Some(rec) = self.recorder.as_mut() {
+            rec.record(id, runs);
+            return false;
+        }
+        let Some(ix) = self.index else {
+            return false;
+        };
+        let shared = ix.is_shared(id) || (ctx.is_orphan() && ix.overlaps(id, runs));
+        if shared {
+            flags.push(SHARED_NOTE.to_string());
+        }
+        shared
     }
 
     fn plan_dir(
@@ -486,6 +609,7 @@ impl<'a, 'b> Walker<'a, 'b> {
             return (Vec::new(), EntryConfidence::DeletedNoData, None);
         }
         let one = vec![Range::with_len(fs.offset_of(first), self.cs())];
+        self.note_shared(item.id, &[(first, 1)], ctx, flags);
         if self.dir_clusters.contains(first as u64) {
             flags.push("directory cluster already listed elsewhere".to_string());
             return (one, EntryConfidence::DeletedGuessed, None);

@@ -10,9 +10,10 @@
 //! contiguous chains cost almost nothing) and a hard step limit, so a
 //! looping or absurdly long chain can neither hang nor exhaust memory.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use diskrescue_core::{Range, RangeSet};
+use diskrescue_core::Range;
 
 use crate::io::MetaReader;
 
@@ -77,6 +78,65 @@ pub(crate) fn push_run(runs: &mut Vec<(u32, u32)>, c: u32) {
         }
     }
     runs.push((c, 1));
+}
+
+/// A set of cluster numbers kept as disjoint runs in a B-tree, so inserts
+/// and lookups cost O(log runs) whatever the insertion order. (A sorted
+/// vector of ranges degrades to quadratic time when a damaged FAT chain
+/// walks backwards through every other cluster.)
+#[derive(Debug, Clone, Default)]
+pub(crate) struct ClusterSet {
+    /// Run start -> run end (exclusive).
+    runs: BTreeMap<u64, u64>,
+}
+
+impl ClusterSet {
+    /// Empty set.
+    pub(crate) fn new() -> Self {
+        ClusterSet::default()
+    }
+
+    /// True when cluster `c` is in the set.
+    pub(crate) fn contains(&self, c: u64) -> bool {
+        self.runs
+            .range(..=c)
+            .next_back()
+            .is_some_and(|(_, &end)| c < end)
+    }
+
+    /// True when any cluster of `r` is in the set.
+    pub(crate) fn intersects(&self, r: Range) -> bool {
+        if r.is_empty() {
+            return false;
+        }
+        if self.contains(r.start) {
+            return true;
+        }
+        self.runs.range(r.start..r.end).next().is_some()
+    }
+
+    /// Add the clusters of `r`, merging with touching runs.
+    pub(crate) fn insert(&mut self, r: Range) {
+        if r.is_empty() {
+            return;
+        }
+        let (mut start, mut end) = (r.start, r.end);
+        if let Some((&ps, &pe)) = self.runs.range(..=start).next_back() {
+            if pe >= start {
+                start = ps;
+                end = end.max(pe);
+                self.runs.remove(&ps);
+            }
+        }
+        while let Some((&ns, &ne)) = self.runs.range(start..).next() {
+            if ns > end {
+                break;
+            }
+            end = end.max(ne);
+            self.runs.remove(&ns);
+        }
+        self.runs.insert(start, end);
+    }
 }
 
 /// Lazily read FAT.
@@ -157,19 +217,54 @@ impl FatTable {
 
     /// Raw value of the entry for cluster `c`, falling back to the other
     /// FAT copies when unreadable.
+    ///
+    /// A copy whose sector holding the entry is entirely 0xFF (an
+    /// unprogrammed flash page exposed by a failing controller, or a
+    /// reader's error fill) is not trusted while another copy still has
+    /// real data there; when every copy is 0xFF there, the value stands.
     pub(crate) fn raw(&self, c: u32) -> Option<u32> {
         let (off, len) = self.span(c)?;
         let mut buf = [0u8; 4];
+        let mut ff_value = None;
         for (i, &base) in self.copies.iter().enumerate() {
             let bad = self.meta.read(base + off, &mut buf[..len]);
             if bad.is_empty() {
+                let v = self.decode(c, &buf);
+                let last = i + 1 == self.copies.len();
+                if !last && v == self.all_ones() && self.ff_sectors(base, off, len) {
+                    ff_value.get_or_insert(v);
+                    continue;
+                }
                 if i > 0 {
                     log::debug!("FAT entry {c} read from FAT copy {}", i + 1);
                 }
-                return Some(self.decode(c, &buf));
+                return Some(v);
             }
         }
-        None
+        ff_value
+    }
+
+    /// The value every entry of a 0xFF-filled sector decodes to.
+    fn all_ones(&self) -> u32 {
+        match self.width {
+            FatWidth::Fat12 => 0xFFF,
+            FatWidth::Fat16 => 0xFFFF,
+            FatWidth::Fat32 => 0x0FFF_FFFF,
+            FatWidth::ExFat => 0xFFFF_FFFF,
+        }
+    }
+
+    /// True when every 512-byte sector of FAT copy `base` touched by the
+    /// entry at `off..off+len` is readable and entirely 0xFF.
+    fn ff_sectors(&self, base: u64, off: u64, len: usize) -> bool {
+        let first = off / 512;
+        let last = (off + len as u64 - 1) / 512;
+        (first..=last).all(|sec| {
+            let s = sec * 512;
+            let n = 512.min(self.fat_bytes.saturating_sub(s)) as usize;
+            let (b, bad) = self.meta.read_vec(base + s, n);
+            n > 0 && bad.is_empty() && b.iter().all(|&x| x == 0xFF)
+        })
     }
 
     /// Classify a raw value.
@@ -218,12 +313,18 @@ impl FatTable {
         };
         let len = (end_off + end_len as u64 - start) as usize;
         let mut pending: Vec<u32> = (first..=last as u32).collect();
-        for &base in &self.copies {
+        // Values from 0xFF-filled sectors, used only when no other copy
+        // has real data for the entry (see `raw`).
+        let mut ff_vals: Vec<Option<u32>> = Vec::new();
+        let ones = self.all_ones();
+        for (ci, &base) in self.copies.iter().enumerate() {
             if pending.is_empty() {
                 break;
             }
+            let last_copy = ci + 1 == self.copies.len();
             let (buf, bad) = self.meta.read_vec(base + start, len);
             let mut still = Vec::new();
+            let mut memo: Option<(u64, u64, bool)> = None;
             for c in pending {
                 let (off, l) = match self.span(c) {
                     Some(s) => s,
@@ -234,9 +335,37 @@ impl FatTable {
                     still.push(c);
                     continue;
                 }
-                out[(c - first) as usize] = Some(self.decode(c, &buf[rel..rel + l]));
+                let v = self.decode(c, &buf[rel..rel + l]);
+                if !last_copy && v == ones {
+                    let key = (off / 512, (off + l as u64 - 1) / 512);
+                    let ff = match memo {
+                        Some((a, b, f)) if (a, b) == key => f,
+                        _ => {
+                            let f = self.ff_sectors(base, off, l);
+                            memo = Some((key.0, key.1, f));
+                            f
+                        }
+                    };
+                    if ff {
+                        if ff_vals.is_empty() {
+                            ff_vals = vec![None; count as usize];
+                        }
+                        ff_vals[(c - first) as usize].get_or_insert(v);
+                        still.push(c);
+                        continue;
+                    }
+                }
+                out[(c - first) as usize] = Some(v);
             }
             pending = still;
+        }
+        if !ff_vals.is_empty() {
+            for c in pending {
+                let i = (c - first) as usize;
+                if out[i].is_none() {
+                    out[i] = ff_vals[i];
+                }
+            }
         }
         out
     }
@@ -249,7 +378,7 @@ impl FatTable {
         if limit == 0 {
             return chain;
         }
-        let mut visited = RangeSet::new();
+        let mut visited = ClusterSet::new();
         let mut c = first;
         loop {
             if c < 2 || c > self.max_cluster {
@@ -328,7 +457,7 @@ impl FatTable {
 mod tests {
     use super::*;
     use diskrescue_core::source::MemSource;
-    use diskrescue_core::SharedSource;
+    use diskrescue_core::{RangeSet, SharedSource};
 
     fn table(width: FatWidth, fat: Vec<u8>, copies: usize, max: u32) -> FatTable {
         let fat_len = fat.len() as u64;
@@ -388,6 +517,59 @@ mod tests {
         let ch = t.follow(2, 2, true);
         assert_eq!(ch.clusters, 2);
         assert!(ch.notes[0].contains("longer"));
+    }
+
+    #[test]
+    fn cluster_set_merges_in_any_order() {
+        let mut s = ClusterSet::new();
+        for c in (10..40u64).rev().step_by(2) {
+            s.insert(Range::new(c, c + 1));
+        }
+        assert!(s.contains(39) && s.contains(11) && !s.contains(38) && !s.contains(10));
+        for c in (10..40u64).step_by(2) {
+            s.insert(Range::new(c, c + 1));
+        }
+        assert_eq!(s.runs.len(), 1);
+        assert!(s.contains(10) && s.contains(39) && !s.contains(40) && !s.contains(9));
+        s.insert(Range::new(50, 60));
+        s.insert(Range::new(45, 52));
+        s.insert(Range::new(40, 45));
+        assert_eq!(s.runs.len(), 1);
+        assert!(s.intersects(Range::new(0, 11)));
+        assert!(s.intersects(Range::new(59, 70)));
+        assert!(!s.intersects(Range::new(60, 70)));
+        assert!(!s.intersects(Range::new(0, 10)));
+    }
+
+    #[test]
+    fn ff_sector_falls_back_to_other_copy() {
+        // FAT16, 2 copies; copy 1's first sector is 0xFF, copy 2 is real.
+        let mut fat = vec![0u8; 1024];
+        fat[0..4].copy_from_slice(&[0xF8, 0xFF, 0xFF, 0xFF]);
+        fat[4..6].copy_from_slice(&3u16.to_le_bytes());
+        fat[6..8].copy_from_slice(&0xFFFFu16.to_le_bytes());
+        let mut data = vec![0xFFu8; 512];
+        data.extend_from_slice(&fat[512..]);
+        data.extend_from_slice(&fat);
+        let src: SharedSource = Arc::new(MemSource::new(data.clone()));
+        let meta = Arc::new(MetaReader::new(src));
+        let t = FatTable::new(meta, FatWidth::Fat16, vec![0, 1024], 1024, 400);
+        assert_eq!(t.entry(2), Some(FatEntry::Next(3)));
+        assert_eq!(t.entry(3), Some(FatEntry::Eoc));
+        assert_eq!(t.entry(4), Some(FatEntry::Free));
+        let b = t.raw_batch(2, 4);
+        assert_eq!(b, vec![Some(3), Some(0xFFFF), Some(0), Some(0)]);
+        // Both copies 0xFF there: the value stands (a legitimate run of
+        // end-of-chain markers looks the same).
+        let mut both = vec![0xFFu8; 512];
+        both.extend_from_slice(&fat[512..]);
+        let mut d2 = both.clone();
+        d2.extend_from_slice(&both);
+        let src: SharedSource = Arc::new(MemSource::new(d2));
+        let meta = Arc::new(MetaReader::new(src));
+        let t = FatTable::new(meta, FatWidth::Fat16, vec![0, 1024], 1024, 400);
+        assert_eq!(t.entry(2), Some(FatEntry::Eoc));
+        assert_eq!(t.raw_batch(2, 2), vec![Some(0xFFFF), Some(0xFFFF)]);
     }
 
     #[test]

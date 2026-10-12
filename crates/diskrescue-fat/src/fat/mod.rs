@@ -24,22 +24,27 @@
 //! with the directory heuristic. Hits whose parent is not another hit are
 //! listed under `$orphans/cluster_<n>/`.
 //!
-//! Limits: FAT12/16 boot sectors without a backup are not reconstructed
-//! heuristically; short names are decoded as CP437 only.
+//! When no valid boot sector is left (FAT12/16 have no backup; FAT32 may
+//! have lost sector 6 too), the geometry is reconstructed from the two FAT
+//! copies and the directory structure (see the `rebuild` module, filesystems
+//! spec 2.2.10) and the volume warnings say so.
+//!
+//! Limits: short names are decoded as CP437 only.
 
 mod boot;
 mod dir;
+mod rebuild;
 mod walk;
 
 pub use boot::{BootSector, FsInfo};
 
 use std::io::Write;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use diskrescue_core::fs::{FileEntry, FileReadReport, FileSystem, FsKind, VolumeInfo, WalkControl};
 use diskrescue_core::{Error, Range, RangeSet, Result, SharedSource};
 
-use crate::common::{self, ClusterMap, ClusterState};
+use crate::common::{self, ClaimIndex, ClusterMap, ClusterState};
 use crate::io::MetaReader;
 use crate::table::{FatTable, FatWidth};
 use crate::FatOptions;
@@ -56,6 +61,8 @@ pub struct FatFs {
     table: FatTable,
     info: VolumeInfo,
     opts: FatOptions,
+    /// Clusters claimed by deleted entries (first walk pass, computed once).
+    claims: OnceLock<ClaimIndex>,
 }
 
 impl std::fmt::Debug for FatFs {
@@ -69,6 +76,13 @@ impl std::fmt::Debug for FatFs {
 
 /// Open a FAT12/16/32 volume. See the module docs.
 pub fn open_fat(src: SharedSource, opts: &FatOptions) -> Result<FatFs> {
+    open_fat_impl(src, opts, true)
+}
+
+/// [`open_fat`], optionally without the heuristic boot sector
+/// reconstruction (so [`crate::open`] can try exFAT's backup boot region
+/// first).
+pub(crate) fn open_fat_impl(src: SharedSource, opts: &FatOptions, rebuild: bool) -> Result<FatFs> {
     let meta = Arc::new(MetaReader::new(src.clone()));
     let size = src.size();
     if size < 512 {
@@ -131,7 +145,26 @@ pub fn open_fat(src: SharedSource, opts: &FatOptions) -> Result<FatFs> {
                 ));
                 x
             }
-            None => return Err(Error::corrupt("FAT boot sector", reason)),
+            None => {
+                let rebuilt = if rebuild {
+                    rebuild::reconstruct(&meta, size)
+                } else {
+                    None
+                };
+                match rebuilt {
+                    Some((b, g, notes)) => {
+                        log::warn!(
+                            "FAT boot sector invalid ({reason}) and no backup; geometry reconstructed"
+                        );
+                        warnings.push(format!(
+                            "boot sector invalid ({reason}) and no usable backup boot sector"
+                        ));
+                        warnings.extend(notes);
+                        (b, g)
+                    }
+                    None => return Err(Error::corrupt("FAT boot sector", reason)),
+                }
+            }
         }
     };
     warnings.extend(geo.warnings.iter().cloned());
@@ -222,6 +255,7 @@ pub fn open_fat(src: SharedSource, opts: &FatOptions) -> Result<FatFs> {
         table,
         info,
         opts: opts.clone(),
+        claims: OnceLock::new(),
     };
     // The label entry in the root directory wins over the boot sector copy.
     if let Some(l) = walk::root_label(&fs) {
@@ -310,6 +344,11 @@ impl FatFs {
     pub(crate) fn geometry(&self) -> &boot::Geometry {
         &self.geo
     }
+
+    /// Deleted-entry cluster claims, collected by a silent first walk.
+    pub(crate) fn claims(&self) -> &ClaimIndex {
+        self.claims.get_or_init(|| walk::collect_claims(self))
+    }
 }
 
 impl ClusterMap for FatFs {
@@ -372,7 +411,7 @@ impl FileSystem for FatFs {
     }
 
     fn read_file(&self, entry: &FileEntry, sink: &mut dyn Write) -> Result<FileReadReport> {
-        common::read_entry(&self.src, self, entry, sink)
+        common::read_entry(&self.src, self, entry, sink, false)
     }
 
     fn unallocated(&self) -> Result<RangeSet> {

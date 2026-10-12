@@ -4,16 +4,16 @@
 use std::collections::HashSet;
 
 use diskrescue_core::fs::{EntryConfidence, FileEntry, WalkControl};
-use diskrescue_core::{Range, RangeSet, Result};
+use diskrescue_core::{Range, Result};
 
 use super::dir::{parse_dir, sniff_dir, SetItem};
 use super::ExFatFs;
 use crate::common::{
     allocated_clusters, contiguous_runs, for_each_state, orphan_dir_entry, orphan_dir_id,
-    orphans_root_entry, runs_to_extents, scan_heads, ClusterMap, ClusterState, Emitter, MAX_DEPTH,
-    MAX_DIR_BYTES, MAX_ORPHAN_DIRS, VDL_FLAG,
+    orphans_root_entry, runs_to_extents, scan_heads, ClaimIndex, ClusterMap, ClusterState, Emitter,
+    MAX_DEPTH, MAX_DIR_BYTES, MAX_ORPHAN_DIRS, SHARED_NOTE, VDL_FLAG,
 };
-use crate::table::FatEntry;
+use crate::table::{ClusterSet, FatEntry};
 use crate::util::{div_ceil, join_path, sanitize_name};
 
 /// Where a directory's entries come from, and how far its metadata is
@@ -54,34 +54,77 @@ const HEAD: usize = 4096;
 struct Walker<'a, 'b> {
     fs: &'a ExFatFs,
     em: Emitter<'b>,
-    dir_clusters: RangeSet,
-    claimed: RangeSet,
+    dir_clusters: ClusterSet,
+    claimed: ClusterSet,
     /// First clusters of directories named by entries of orphan candidates:
     /// an orphan scan never extends a directory into one of them.
     dir_starts: HashSet<u32>,
+    /// Deleted-entry claims from the first pass (second pass only).
+    index: Option<&'a ClaimIndex>,
+    /// Deleted-entry claims being collected (first pass only).
+    recorder: Option<ClaimIndex>,
 }
 
-fn add_runs(set: &mut RangeSet, runs: &[(u32, u32)]) {
+fn add_runs(set: &mut ClusterSet, runs: &[(u32, u32)]) {
     for &(s, n) in runs {
         set.insert(Range::new(s as u64, s as u64 + n as u64));
     }
 }
 
+fn runs_intersect(set: &ClusterSet, runs: &[(u32, u32)]) -> bool {
+    runs.iter()
+        .any(|&(s, n)| set.intersects(Range::new(s as u64, s as u64 + n as u64)))
+}
+
+impl<'a, 'b> Walker<'a, 'b> {
+    fn new(fs: &'a ExFatFs, em: Emitter<'b>) -> Self {
+        let mut w = Walker {
+            fs,
+            em,
+            dir_clusters: ClusterSet::new(),
+            claimed: ClusterSet::new(),
+            dir_starts: HashSet::new(),
+            index: None,
+            recorder: None,
+        };
+        add_runs(&mut w.claimed, fs.system_runs());
+        w
+    }
+
+    fn walk_root(&mut self) {
+        let root = self.fs.root_cluster();
+        if self.fs.valid(root) {
+            let limit = self.max_dir_clusters();
+            self.walk_dir(DirSrc::Chain(root, limit), None, "", Ctx::Live, 0);
+        }
+    }
+}
+
+/// First pass: walk the tree silently and collect the clusters every
+/// deleted entry set claims (orphans are not included).
+pub(super) fn collect_claims(fs: &ExFatFs) -> ClaimIndex {
+    let mut ignore = |_: &FileEntry| WalkControl::Continue;
+    let mut w = Walker::new(fs, Emitter::new(&mut ignore, fs.opts().max_entries));
+    w.recorder = Some(ClaimIndex::default());
+    w.walk_root();
+    let mut ix = w.recorder.take().unwrap_or_default();
+    ix.finish();
+    if ix.truncated {
+        log::warn!("too many deleted entries to cross-check all their clusters");
+    }
+    ix
+}
+
 /// Walk the whole volume.
 pub(super) fn run(fs: &ExFatFs, visit: &mut dyn FnMut(&FileEntry) -> WalkControl) -> Result<()> {
-    let mut w = Walker {
-        fs,
-        em: Emitter::new(visit, fs.opts().max_entries),
-        dir_clusters: RangeSet::new(),
-        claimed: RangeSet::new(),
-        dir_starts: HashSet::new(),
+    let index = if fs.opts().include_deleted {
+        Some(fs.claims())
+    } else {
+        None
     };
-    add_runs(&mut w.claimed, fs.system_runs());
-    let root = fs.root_cluster();
-    if fs.valid(root) {
-        let limit = w.max_dir_clusters();
-        w.walk_dir(DirSrc::Chain(root, limit), None, "", Ctx::Live, 0);
-    }
+    let mut w = Walker::new(fs, Emitter::new(visit, fs.opts().max_entries));
+    w.index = index;
+    w.walk_root();
     if !w.em.stopped && fs.opts().scan_orphans && fs.opts().include_deleted {
         w.scan_orphans();
     }
@@ -190,8 +233,11 @@ impl<'a, 'b> Walker<'a, 'b> {
         if !self.em.reserve(held) {
             return;
         }
-        for n in notes.iter().chain(parsed.notes.iter()) {
-            log::warn!("{}: {n}", if path.is_empty() { "/" } else { path });
+        // The silent first pass (claims) does not repeat the warnings.
+        if self.recorder.is_none() {
+            for n in notes.iter().chain(parsed.notes.iter()) {
+                log::warn!("{}: {n}", if path.is_empty() { "/" } else { path });
+            }
         }
         let heap_bytes = self.fs.cluster_count() as u64 * self.cs();
         for mut item in parsed.items {
@@ -372,6 +418,11 @@ impl<'a, 'b> Walker<'a, 'b> {
         let n = div_ceil(dl, self.cs());
         if trusted {
             let runs = self.stream_runs(item, n, flags, false);
+            if runs_intersect(&self.claimed, &runs) {
+                flags.push(
+                    "cross-linked: some of its clusters also belong to another file".to_string(),
+                );
+            }
             add_runs(&mut self.claimed, &runs);
             return (
                 runs_to_extents(fs, &runs, Some(dl)),
@@ -400,13 +451,37 @@ impl<'a, 'b> Walker<'a, 'b> {
                 "{reused} of {total} clusters are now allocated to another file"
             ));
         }
+        let shared = self.note_shared(item.id, &runs, ctx, flags);
         let exact = item.no_fat_chain() && total == n;
-        let conf = if exact && reused == 0 {
+        let conf = if exact && reused == 0 && !shared {
             EntryConfidence::DeletedIntact
         } else {
             EntryConfidence::DeletedGuessed
         };
         (runs_to_extents(fs, &runs, Some(dl)), conf)
+    }
+
+    /// Record (first pass) or check (second pass) the clusters a deleted
+    /// entry claims; returns true when they overlap another deleted entry.
+    fn note_shared(
+        &mut self,
+        id: u64,
+        runs: &[(u32, u32)],
+        ctx: Ctx,
+        flags: &mut Vec<String>,
+    ) -> bool {
+        if let Some(rec) = self.recorder.as_mut() {
+            rec.record(id, runs);
+            return false;
+        }
+        let Some(ix) = self.index else {
+            return false;
+        };
+        let shared = ix.is_shared(id) || (ctx.is_orphan() && ix.overlaps(id, runs));
+        if shared {
+            flags.push(SHARED_NOTE.to_string());
+        }
+        shared
     }
 
     fn plan_dir(
@@ -484,7 +559,8 @@ impl<'a, 'b> Walker<'a, 'b> {
             contiguous_runs(fs, first, n).0
         };
         let reused = allocated_clusters(fs, &runs);
-        let conf = if item.no_fat_chain() && reused == 0 {
+        let shared = self.note_shared(item.id, &runs, ctx, flags);
+        let conf = if item.no_fat_chain() && reused == 0 && !shared {
             EntryConfidence::DeletedIntact
         } else {
             EntryConfidence::DeletedGuessed
