@@ -320,7 +320,14 @@ fn truncated_idat_keeps_recovered_rows_and_fills_the_rest() {
                 RepairResult::PartiallyRepaired,
                 "{ct}/{depth} {pct}%"
             );
-            assert_eq!(validate(&r.bytes), ValidationStatus::Valid);
+            // The output decodes, but it carries the repair marker that says
+            // the filled rows are not real, so it never validates as intact.
+            assert_eq!(validate(&r.bytes), ValidationStatus::Damaged);
+            assert!(
+                chunks_of(&r.bytes).iter().any(|c| &c.kind == b"tEXt"
+                    && r.bytes[c.data()].starts_with(b"DiskRescue\0partly recovered: intact=")),
+                "{ct}/{depth} {pct}%: repair marker present"
+            );
             let d = png_decode(&r.bytes).unwrap_or_else(|e| panic!("{ct}/{depth} {pct}%: {e}"));
             assert_eq!((d.width, d.height), (spec.width, spec.height));
             assert_eq!(d.color as u8, ct);

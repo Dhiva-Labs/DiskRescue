@@ -606,6 +606,26 @@ fn apply_inner(
                 }
             }
         }
+        if let Some(e) = &enc_info {
+            // Record in the file how much of it is real, so a later check
+            // does not take the filled picture for an intact one.
+            let frac = if ihdr.is_interlaced() {
+                e.fraction
+            } else if e.total > 0 {
+                e.kept as f32 / e.total as f32
+            } else {
+                1.0
+            };
+            if frac < 1.0 {
+                let text = format!(
+                    "{}\0{}{:.4}",
+                    crate::format::REPAIR_MARKER_KEYWORD,
+                    crate::format::REPAIR_MARKER_PREFIX,
+                    frac
+                );
+                write_chunk(w, b"tEXt", text.as_bytes())?;
+            }
+        }
         if write_iend {
             write_chunk(w, b"IEND", &[])?;
         }
@@ -656,7 +676,7 @@ fn apply_inner(
         }
     }
 
-    let result = match check.validation.status {
+    let result = match check.unmarked_status {
         ValidationStatus::Valid if partial_content => RepairResult::PartiallyRepaired,
         ValidationStatus::Valid => RepairResult::Repaired,
         ValidationStatus::Damaged if new_fraction > orig_fraction => {

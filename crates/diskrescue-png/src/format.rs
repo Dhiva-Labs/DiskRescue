@@ -78,6 +78,45 @@ pub(crate) struct Analysis {
     /// Statistics-only decode; `None` when the IHDR is unusable.
     pub image: Option<LenientImage>,
     pub validation: Validation,
+    /// The verdict before applying a repair marker (see
+    /// [`REPAIR_MARKER_KEYWORD`]); repair compares outputs on this.
+    pub unmarked_status: ValidationStatus,
+}
+
+/// `tEXt` keyword of the marker a repair writes into a PNG whose missing
+/// rows it filled; the text is `partly recovered: intact=<fraction>`.
+pub const REPAIR_MARKER_KEYWORD: &str = "DiskRescue";
+/// Prefix of the marker text, followed by the intact fraction.
+pub(crate) const REPAIR_MARKER_PREFIX: &str = "partly recovered: intact=";
+
+/// The intact fraction recorded by an earlier repair, if the file has one.
+fn repair_marker(src: &dyn Source, walk: &ChunkWalk) -> Option<f32> {
+    for c in walk
+        .chunks
+        .iter()
+        .filter(|c| &c.kind == b"tEXt" && c.len <= 256)
+    {
+        let Ok(data) = src.read_vec(walk.start + c.data_offset, c.len as usize) else {
+            continue;
+        };
+        let Some((key, text)) = data.split_at_checked(REPAIR_MARKER_KEYWORD.len()) else {
+            continue;
+        };
+        if key != REPAIR_MARKER_KEYWORD.as_bytes() || text.first() != Some(&0) {
+            continue;
+        }
+        let Ok(text) = std::str::from_utf8(&text[1..]) else {
+            continue;
+        };
+        if let Some(v) = text.strip_prefix(REPAIR_MARKER_PREFIX) {
+            if let Ok(f) = v.trim().parse::<f32>() {
+                if (0.0..=1.0).contains(&f) {
+                    return Some(f);
+                }
+            }
+        }
+    }
+    None
 }
 
 /// Walk and decode (statistics only) the PNG occupying all of `src`.
@@ -140,11 +179,23 @@ pub(crate) fn analyze_with_walk(src: &dyn Source, mut walk: ChunkWalk) -> Result
         },
         _ => None,
     };
-    let validation = build_validation(src, &walk, image.as_ref(), decode_problem, &malformed);
+    let mut validation = build_validation(src, &walk, image.as_ref(), decode_problem, &malformed);
+    let unmarked_status = validation.status;
+    // A file repaired earlier says how much of it is real: it decodes, but
+    // the filled rows are not image data.
+    if let Some(f) = repair_marker(src, &walk) {
+        validation.status = ValidationStatus::Damaged;
+        validation.intact_fraction = Some(validation.intact_fraction.unwrap_or(1.0).min(f));
+        validation.problems.push(format!(
+            "partly recovered: only {:.0}% of the picture is real image data; an earlier repair filled the rest",
+            f * 100.0
+        ));
+    }
     Ok(Analysis {
         walk,
         image,
         validation,
+        unmarked_status,
     })
 }
 

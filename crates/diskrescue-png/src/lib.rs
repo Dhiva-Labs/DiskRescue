@@ -38,5 +38,5 @@ mod meta;
 pub mod repair;
 mod sanity;
 
-pub use format::{PngFormat, MAX_PROBE_DIM, MAX_SIZE, MIN_SIZE};
+pub use format::{PngFormat, MAX_PROBE_DIM, MAX_SIZE, MIN_SIZE, REPAIR_MARKER_KEYWORD};
 pub use ihdr::{Ihdr, Pass, ADAM7};
