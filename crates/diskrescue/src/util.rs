@@ -4,7 +4,7 @@
 
 use std::time::Duration;
 
-pub use diskrescue_app::text::{fraction, percent, plural, shell_quote};
+pub use diskrescue_app::text::{percent, plural, shell_quote};
 #[cfg(test)]
 pub use diskrescue_app::util::{expand_file_args, free_space, wildcard_match};
 
