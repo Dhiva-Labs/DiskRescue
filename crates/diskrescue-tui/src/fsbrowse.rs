@@ -411,7 +411,8 @@ impl Picker {
                     let p = absolute_from(&typed, &self.home, &self.cwd);
                     if p.is_dir() {
                         self.go(p);
-                    } else if p.is_file() && self.mode != PickMode::Folder {
+                    } else if p.exists() && self.mode != PickMode::Folder {
+                        // A file, or a device such as /dev/sdb1.
                         return PickEvent::Chosen(vec![p]);
                     } else {
                         self.error = Some(format!("{} is not a folder.", p.display()));
