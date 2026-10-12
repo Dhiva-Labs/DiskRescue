@@ -360,6 +360,21 @@ impl RepairPage {
             if f.browse {
                 self.pick(&ctx, Target::Output);
             }
+            let out = expand(&self.output);
+            let beside = self
+                .files
+                .iter()
+                .any(|f| f.parent().is_some_and(|d| out.starts_with(d)));
+            if !self.output.trim().is_empty() && beside {
+                widgets::callout_text(
+                    ui,
+                    Kind::Warn,
+                    "This saves the copies next to the damaged files",
+                    "If those files are on the card or drive you want to rescue, choose a folder on \
+                     your computer instead: writing to that card or drive can overwrite deleted \
+                     photos.",
+                );
+            }
         });
 
         ui.add_space(10.0);
@@ -379,7 +394,7 @@ impl RepairPage {
                 self.scroll_top = true;
             }
             if running {
-                ui.spinner();
+                widgets::busy(ui, 18.0);
                 let s = self.job.as_ref().map(|j| j.snapshot()).unwrap_or_default();
                 let stage = if s.pipeline.stage_label.is_empty() {
                     "Starting...".to_string()
@@ -402,7 +417,7 @@ impl RepairPage {
             if !job.is_finished() {
                 let s = job.snapshot();
                 ui.horizontal(|ui| {
-                    ui.spinner();
+                    widgets::busy(ui, 18.0);
                     let stage = if s.pipeline.stage_label.is_empty() {
                         "Starting...".to_string()
                     } else {

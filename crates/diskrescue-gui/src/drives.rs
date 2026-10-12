@@ -255,7 +255,7 @@ pub fn show(ui: &mut Ui, drives: &Drives, job_running: bool) -> Option<Action> {
 
     if !drives.loaded && drives.entries.is_empty() {
         ui.horizontal(|ui| {
-            ui.spinner();
+            widgets::busy(ui, 18.0);
             ui.label("Looking for drives...");
         });
         return action;

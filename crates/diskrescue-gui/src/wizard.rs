@@ -951,7 +951,7 @@ impl Wizard {
         let plan = self.plan();
         let Some(check) = self.check.get(&plan).cloned() else {
             ui.horizontal(|ui| {
-                ui.spinner();
+                widgets::busy(ui, 18.0);
                 ui.label("Checking that everything is safe...");
             });
             return None;

@@ -420,7 +420,7 @@ pub fn show(
                 recovery_panel(ui, r, &job.output, thumbs);
             } else if snap.outcome.is_none() && !snap.imaging() {
                 ui.horizontal(|ui| {
-                    ui.spinner();
+                    widgets::busy(ui, 18.0);
                     ui.label("Getting ready...");
                 });
             } else if snap.imaging() {
@@ -500,7 +500,7 @@ fn step_header(ui: &mut Ui, title: &str, state: StepState) {
             StepState::Stopped => icons::cross(ui.painter(), r.center(), 11.0, warn),
             StepState::Waiting => icons::pending(ui.painter(), r.center(), 11.0, weak),
             StepState::Running => {
-                egui::Spinner::new().size(20.0).paint_at(ui, r);
+                widgets::busy_at(ui, r);
             }
         }
         ui.label(RichText::new(title).strong().size(17.0));
@@ -549,7 +549,7 @@ fn imaging_panel(ui: &mut Ui, img: &ImageState, snap: &Snapshot, cache: &mut Map
         }
         None => {
             ui.horizontal(|ui| {
-                ui.spinner();
+                widgets::busy(ui, 18.0);
                 ui.label(match img.status {
                     ImageStatus::Checking => "Checking that everything is safe...",
                     _ if snap.privileged => "Waiting for administrator rights...",
@@ -586,7 +586,7 @@ fn imaging_panel(ui: &mut Ui, img: &ImageState, snap: &Snapshot, cache: &mut Map
                     None,
                 ),
                 widgets::Stat::new(
-                    "could not be read (so far)",
+                    "unreadable so far",
                     text::bytes(bad),
                     Some(if bad > 0 { Kind::Bad } else { Kind::Good }),
                 ),
@@ -764,7 +764,7 @@ fn recovery_panel(ui: &mut Ui, r: &RecoverState, output: &Path, thumbs: &mut Thu
             let (rect, _) = ui.allocate_exact_size(vec2(22.0, 22.0), Sense::hover());
             let good = theme::palette(ui.visuals(), Kind::Good).fg;
             if running {
-                egui::Spinner::new().size(18.0).paint_at(ui, rect);
+                widgets::busy_at(ui, rect);
             } else if last && r.interrupted {
                 icons::cross(
                     ui.painter(),
@@ -786,7 +786,7 @@ fn recovery_panel(ui: &mut Ui, r: &RecoverState, output: &Path, thumbs: &mut Thu
                 RichText::new(label)
             });
             if let Some(t) = s.took {
-                if !running {
+                if !running && t.as_secs() >= 1 {
                     widgets::weak(ui, format!("({})", text::duration(t)));
                 }
             }
@@ -834,7 +834,7 @@ fn recovery_panel(ui: &mut Ui, r: &RecoverState, output: &Path, thumbs: &mut Thu
     }
     if n == 0 && !done {
         ui.horizontal(|ui| {
-            ui.spinner();
+            widgets::busy(ui, 18.0);
             ui.label("Opening...");
         });
     }
@@ -878,13 +878,20 @@ fn recovery_panel(ui: &mut Ui, r: &RecoverState, output: &Path, thumbs: &mut Thu
         widgets::stats(ui, &items);
     }
 
-    let recent: Vec<_> = p
-        .recent_files
-        .iter()
-        .rev()
-        .filter(|f| f.outcome != Outcome::Duplicate)
-        .take(14)
-        .collect();
+    // While it runs: the newest files (each once). Outcomes can still
+    // change (a damaged file may be repaired), so no verdict is shown;
+    // the Results page has the final word.
+    let mut recent: Vec<&diskrescue_app::jobs::FinishedFile> = Vec::new();
+    if !done {
+        for f in p.recent_files.iter().rev() {
+            if f.outcome != Outcome::Duplicate && !recent.iter().any(|x| x.name == f.name) {
+                recent.push(f);
+            }
+            if recent.len() >= 14 {
+                break;
+            }
+        }
+    }
     if !recent.is_empty() {
         ui.add_space(6.0);
         ui.label(RichText::new("Found most recently").strong());
@@ -892,10 +899,8 @@ fn recovery_panel(ui: &mut Ui, r: &RecoverState, output: &Path, thumbs: &mut Thu
             for f in recent {
                 let path = output.join(&f.name);
                 let name = system::file_name(Path::new(&f.name));
-                let kind = Kind::from(text::outcome_tone(f.outcome));
-                let kind = (kind != Kind::Good).then_some(kind);
-                tile(ui, thumbs, &path, category_of(&path), 84.0, &name, kind)
-                    .on_hover_text(format!("{} ({})", f.name, text::outcome_label(f.outcome)));
+                tile(ui, thumbs, &path, category_of(&path), 84.0, &name, None)
+                    .on_hover_text(f.name.as_str());
             }
         });
     }

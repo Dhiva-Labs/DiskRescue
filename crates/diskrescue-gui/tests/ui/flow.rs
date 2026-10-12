@@ -87,6 +87,7 @@ fn recovering_an_image_file_through_the_ui() {
         "Finished: 11 files were recovered"
     ));
     assert!(!h.state().busy());
+    crate::gallery::shoot(&mut h, "flow-finished");
     click(&mut h, "See your recovered files");
     assert_eq!(h.state().page, Page::Results);
 

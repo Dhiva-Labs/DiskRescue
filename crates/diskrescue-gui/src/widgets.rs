@@ -284,6 +284,37 @@ pub fn stat(ui: &mut Ui, caption: &str, value: &str, kind: Option<Kind>) {
     });
 }
 
+/// A calm "working" indicator: a three-quarter ring turning slowly
+/// (always the same length, unlike egui's spinner, so that it reads the
+/// same in every frame). Animates at about 30 frames per second.
+pub fn busy_at(ui: &Ui, rect: egui::Rect) {
+    let t = ui.input(|i| i.time);
+    ui.ctx()
+        .request_repaint_after(std::time::Duration::from_millis(33));
+    let c = rect.center();
+    let r = rect.width().min(rect.height()) / 2.0 - 2.0;
+    let start = (t * 4.0 % std::f64::consts::TAU) as f32;
+    let n = 28;
+    let pts: Vec<egui::Pos2> = (0..=n)
+        .map(|i| {
+            let a = start + i as f32 / n as f32 * std::f32::consts::TAU * 0.75;
+            c + vec2(a.cos(), a.sin()) * r
+        })
+        .collect();
+    let color = theme::accent(ui.visuals());
+    ui.painter().add(egui::Shape::line(
+        pts,
+        Stroke::new((r / 4.0).max(1.5), color),
+    ));
+}
+
+/// [`busy_at`] in a square of `size` points.
+pub fn busy(ui: &mut Ui, size: f32) -> Response {
+    let (rect, resp) = ui.allocate_exact_size(vec2(size, size), Sense::hover());
+    busy_at(ui, rect);
+    resp
+}
+
 /// One figure of a [`stats`] row.
 pub struct Stat {
     /// What it is ("speed").
@@ -308,17 +339,18 @@ impl Stat {
 /// Figures in columns of equal width, wrapping onto more rows when the
 /// window is narrow.
 pub fn stats(ui: &mut Ui, items: &[Stat]) {
-    let min_col = 135.0;
+    let min_col = 140.0;
     let avail = ui.available_width();
-    let per_row = ((avail / min_col).floor() as usize).clamp(1, items.len().max(1));
-    let w = avail / per_row as f32;
+    let cols = ((avail / min_col).floor() as usize).max(1);
+    let w = avail / cols as f32;
+    let per_row = cols.min(items.len().max(1));
     for chunk in items.chunks(per_row) {
         ui.horizontal_top(|ui| {
             ui.spacing_mut().item_spacing.x = 0.0;
             for s in chunk {
                 ui.allocate_ui_with_layout(vec2(w, 0.0), Layout::top_down(Align::Min), |ui| {
-                    ui.set_min_width(w);
-                    ui.set_max_width(w - 8.0);
+                    ui.set_min_width(w - 10.0);
+                    ui.set_max_width(w - 10.0);
                     stat(ui, &s.caption, &s.value, s.kind);
                 });
             }

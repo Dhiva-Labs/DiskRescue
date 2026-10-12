@@ -10,7 +10,8 @@ use crate::common::*;
 use diskrescue_gui::{DiskRescueApp, Page};
 use egui_kittest::Harness;
 
-fn shoot(h: &mut Harness<'static, DiskRescueApp>, name: &str) {
+/// Save the current frame to `$DISKRESCUE_GALLERY_DIR` (when set).
+pub fn shoot(h: &mut Harness<'static, DiskRescueApp>, name: &str) {
     for _ in 0..3 {
         h.step();
     }

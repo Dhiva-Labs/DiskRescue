@@ -482,7 +482,7 @@ impl Results {
                     self.load(ui.ctx(), p);
                 }
                 if self.loading.is_some() {
-                    ui.spinner();
+                    widgets::busy(ui, 18.0);
                     ui.label("Opening...");
                 }
             });
@@ -559,7 +559,7 @@ impl Results {
                 );
             }
             Thumb::Loading => {
-                egui::Spinner::new().paint_at(
+                widgets::busy_at(
                     ui,
                     egui::Rect::from_center_size(rect.center(), vec2(24.0, 24.0)),
                 );

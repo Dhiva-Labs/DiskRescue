@@ -246,6 +246,10 @@ impl DiskRescueApp {
                 ));
                 job.results_taken = true;
                 let snap = job.snapshot();
+                if snap.outcome == Some(diskrescue_app::JobOutcome::Finished) {
+                    // Done: the settings are not needed again.
+                    self.wizard = None;
+                }
                 if let Some(r) = snap.report() {
                     self.results.set_report(&job.output, r.clone());
                     self.saved.remember(job.output.clone());
@@ -375,7 +379,7 @@ impl DiskRescueApp {
                         .show(ui, |ui| {
                             ui.horizontal(|ui| {
                                 if running {
-                                    ui.spinner();
+                                    widgets::busy(ui, 18.0);
                                 } else {
                                     let (r, _) =
                                         ui.allocate_exact_size(vec2(18.0, 18.0), Sense::hover());
@@ -409,7 +413,7 @@ impl DiskRescueApp {
             }
             if self.repair.running() {
                 ui.add_space(8.0);
-                ui.spinner();
+                widgets::busy(ui, 18.0);
                 ui.label("Repairing files...");
                 if self.page != Page::Repair && ui.button("View").clicked() {
                     self.page = Page::Repair;
@@ -553,13 +557,14 @@ impl DiskRescueApp {
                         donor,
                         output,
                     }) => {
+                        // One repair at a time: a running one is shown instead.
                         if !self.repair.running() {
                             self.repair.files = vec![file.clone()];
                             self.repair.donors = vec![donor.clone()];
                             self.repair.output = output.display().to_string();
                             self.repair.start(vec![file], vec![donor], output);
-                            self.page = Page::Repair;
                         }
+                        self.page = Page::Repair;
                     }
                     Some(results::Action::Opened(p)) => self.saved.remember(p),
                     Some(results::Action::Forget(p)) => {
@@ -706,7 +711,7 @@ impl DiskRescueApp {
             egui::Modal::new(egui::Id::new("closing")).show(ctx, |ui| {
                 ui.set_width(360.0);
                 ui.horizontal(|ui| {
-                    ui.spinner();
+                    widgets::busy(ui, 18.0);
                     ui.label(RichText::new("Saving and stopping...").strong());
                 });
                 ui.label("DiskRescue closes as soon as everything is saved.");

@@ -126,7 +126,7 @@ impl ImagePage {
             match self.info.get(&p) {
                 None => {
                     ui.horizontal(|ui| {
-                        ui.spinner();
+                        widgets::busy(ui, 18.0);
                         ui.label("Looking at the file...");
                     });
                 }
