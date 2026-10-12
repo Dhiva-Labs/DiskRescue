@@ -186,6 +186,7 @@ fn hand_written_numbers_and_merging() {
     let text = m.to_text("DiskRescue", "0.1.0", None, Timestamp::from_unix(0));
     let want = "\
 # Mapfile. Created by DiskRescue version 0.1.0
+# Command line:\x20
 # Start time:   1970-01-01 00:00:00
 # Current time: 1970-01-01 00:00:00
 # current_pos  current_status  current_pass
