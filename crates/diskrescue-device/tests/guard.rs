@@ -1,5 +1,7 @@
 //! Output guard (path_is_on_device) and re-identification by fingerprint.
 
+#![cfg(target_os = "linux")]
+
 mod common;
 
 use std::os::unix::fs::MetadataExt;
@@ -229,10 +231,14 @@ fn weak_identities_need_an_unambiguous_candidate() {
     let fp = Fingerprint::of(&info, None);
     assert!(!fp.has_strong_serial());
 
+    // Without a first-sector hash a weak identity is never guessed, not
+    // even when only one device of that model and size is present: it may
+    // be another stick of the same kind.
     let one = FakeSys::new();
     usb_stick(&one, "sdd", "1-3", (8, 48), None, 15_000_000);
-    let got = sysfs::find_by_fingerprint_with(&one.roots, &fp).unwrap();
-    assert_eq!(got.map(|d| d.name), Some("sdd".to_string()));
+    assert!(sysfs::find_by_fingerprint_with(&one.roots, &fp)
+        .unwrap()
+        .is_none());
 
     let two = FakeSys::new();
     usb_stick(&two, "sdd", "1-3", (8, 48), None, 15_000_000);
@@ -243,6 +249,87 @@ fn weak_identities_need_an_unambiguous_candidate() {
     assert!(sysfs::find_by_fingerprint_with(&FakeSys::new().roots, &fp)
         .unwrap()
         .is_none());
+
+    // With the hash of LBA 0 the right one of the two is found (the fake
+    // device nodes are regular files holding the first sectors).
+    let ours = vec![0x5Au8; 512];
+    let theirs = vec![0xA5u8; 512];
+    two.write("dev/sdd", &theirs);
+    two.write("dev/sde", &ours);
+    let fp = Fingerprint::of(&info, Some(&ours));
+    let got = sysfs::find_by_fingerprint_with(&two.roots, &fp).unwrap();
+    assert_eq!(got.map(|d| d.name), Some("sde".to_string()));
+    // Nobody has our first sector: nothing is found.
+    two.write("dev/sde", &theirs);
+    assert!(sysfs::find_by_fingerprint_with(&two.roots, &fp)
+        .unwrap()
+        .is_none());
+}
+
+#[test]
+fn cloned_serials_and_swapped_cards_are_not_taken_for_the_lost_device() {
+    // Two sticks that ship the same "unique" serial number and size: the
+    // first-sector hash decides, and without it nothing is chosen.
+    let before = FakeSys::new();
+    usb_stick(
+        &before,
+        "sdc",
+        "1-3",
+        (8, 32),
+        Some("AA11BB22CC33DD44"),
+        15_000_000,
+    );
+    let info = sysfs::describe_name_with(&before.roots, "sdc").unwrap();
+    let ours = vec![0x11u8; 512];
+    let other = vec![0x22u8; 512];
+    let fp_nohash = Fingerprint::of(&info, None);
+    let fp = Fingerprint::of(&info, Some(&ours));
+    assert!(fp.has_strong_serial());
+
+    let after = FakeSys::new();
+    for (name, port, devt) in [("sdd", "1-3", (8, 48)), ("sde", "1-4", (8, 64))] {
+        usb_stick(
+            &after,
+            name,
+            port,
+            devt,
+            Some("AA11BB22CC33DD44"),
+            15_000_000,
+        );
+    }
+    after.write("dev/sdd", &other);
+    after.write("dev/sde", &ours);
+    assert!(sysfs::find_by_fingerprint_with(&after.roots, &fp_nohash)
+        .unwrap()
+        .is_none());
+    let got = sysfs::find_by_fingerprint_with(&after.roots, &fp).unwrap();
+    assert_eq!(got.map(|d| d.name), Some("sde".to_string()));
+
+    // A single device with our serial (a card reader) but another card in
+    // it: its first sector differs, so it is not ours.
+    let swapped = FakeSys::new();
+    usb_stick(
+        &swapped,
+        "sdd",
+        "1-3",
+        (8, 48),
+        Some("AA11BB22CC33DD44"),
+        15_000_000,
+    );
+    swapped.write("dev/sdd", &other);
+    assert!(sysfs::find_by_fingerprint_with(&swapped.roots, &fp)
+        .unwrap()
+        .is_none());
+    // The original card is back: found. An unreadable first sector does not
+    // block a unique serial number.
+    swapped.write("dev/sdd", &ours);
+    assert!(sysfs::find_by_fingerprint_with(&swapped.roots, &fp)
+        .unwrap()
+        .is_some());
+    std::fs::remove_file(swapped.base().join("dev/sdd")).unwrap();
+    assert!(sysfs::find_by_fingerprint_with(&swapped.roots, &fp)
+        .unwrap()
+        .is_some());
 }
 
 #[test]

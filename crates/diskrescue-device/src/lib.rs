@@ -118,9 +118,12 @@ pub fn describe(path: &Path) -> Result<DeviceInfo> {
     }
 }
 
-/// Re-find a device after re-enumeration (USB reset, re-plug): exact
-/// serial matches first, then weak identities confirmed by the first-sector
-/// hash (or accepted when unambiguous). Partitions are candidates too.
+/// Re-find a device after re-enumeration (USB reset, re-plug): a unique
+/// serial match (refused when the first sector reads back differently from
+/// the fingerprint's hash), or, for several devices with the same serial
+/// number and for weak identities, the device whose first sector has the
+/// fingerprint's hash. Weak identities without a hash are never guessed
+/// (`Ok(None)`). Partitions are candidates too.
 pub fn find_by_fingerprint(fp: &Fingerprint) -> Result<Option<DeviceInfo>> {
     #[cfg(target_os = "linux")]
     {
@@ -129,7 +132,13 @@ pub fn find_by_fingerprint(fp: &Fingerprint) -> Result<Option<DeviceInfo>> {
     #[cfg(windows)]
     {
         let disks = windows::enumerate()?;
-        let sel = device_source::select_candidate(fp, "", &disks, true);
+        let sel = device_source::select_candidate(
+            fp,
+            &device_source::Lost::default(),
+            &disks,
+            true,
+            &|_| false,
+        );
         Ok(device_source::resolve_selection(sel, fp))
     }
     #[cfg(not(any(target_os = "linux", windows)))]
@@ -210,10 +219,13 @@ pub fn mountpoints_of(path: &Path) -> Result<Vec<PathBuf>> {
     }
 }
 
-/// Whether `path` (or its nearest existing ancestor) is stored on the
-/// device `info`: the output guard. On Linux see
+/// Whether `path` (or its nearest existing ancestor, after following every
+/// symbolic link, including a dangling one) is stored on the device
+/// `info`: the output guard. For an image file: whether `path` is the
+/// image itself or inside a filesystem mounted from it. On Linux see
 /// `sysfs::path_is_on_device_with` for the rules; on Windows the volume's
-/// disk extents are compared with the drive number.
+/// disk extents are compared with the drive number. An error means the
+/// question could not be answered; callers should treat it as "refuse".
 pub fn path_is_on_device(path: &Path, info: &DeviceInfo) -> Result<bool> {
     #[cfg(target_os = "linux")]
     {

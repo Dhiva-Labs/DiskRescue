@@ -1,6 +1,8 @@
 //! DeviceSource over regular files: the same code path as a block device
 //! (workers, timeouts, alignment, re-attach), without touching hardware.
 
+#![cfg(target_os = "linux")]
+
 mod common;
 
 use std::path::{Path, PathBuf};

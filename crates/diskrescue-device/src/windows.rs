@@ -247,7 +247,15 @@ fn volume_root(path: &Path) -> io::Result<PathBuf> {
 /// disk extents).
 pub(crate) fn path_is_on_device(path: &Path, info: &DeviceInfo) -> Result<bool> {
     if info.kind == DeviceKind::ImageFile {
-        return Ok(false);
+        // Writing next to an image is fine; writing onto it is not.
+        let same = match (
+            std::fs::canonicalize(path),
+            std::fs::canonicalize(&info.path),
+        ) {
+            (Ok(a), Ok(b)) => a == b,
+            _ => false,
+        };
+        return Ok(same);
     }
     let Some(n) = drive_number(info) else {
         return Err(Error::InvalidArgument(format!(

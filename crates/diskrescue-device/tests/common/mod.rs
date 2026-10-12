@@ -7,17 +7,22 @@
 
 #![allow(dead_code)]
 
+#[cfg(target_os = "linux")]
 use std::fs;
+#[cfg(target_os = "linux")]
 use std::path::{Path, PathBuf};
 
+#[cfg(target_os = "linux")]
 use diskrescue_device::sysfs::Roots;
 
+#[cfg(target_os = "linux")]
 pub struct FakeSys {
     pub dir: tempfile::TempDir,
     pub roots: Roots,
 }
 
 /// A whole disk to add.
+#[cfg(target_os = "linux")]
 pub struct Disk<'a> {
     pub name: &'a str,
     /// Disk directory relative to `sys/` (e.g.
@@ -34,6 +39,7 @@ pub struct Disk<'a> {
     pub pbs: u32,
 }
 
+#[cfg(target_os = "linux")]
 impl<'a> Disk<'a> {
     /// A SCSI-style disk below `parent` (the scsi_device directory relative
     /// to `sys/`).
@@ -69,6 +75,7 @@ impl<'a> Disk<'a> {
     }
 }
 
+#[cfg(target_os = "linux")]
 impl FakeSys {
     pub fn new() -> Self {
         let dir = tempfile::tempdir().unwrap();
