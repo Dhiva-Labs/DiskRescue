@@ -27,15 +27,15 @@ use std::time::{Duration, Instant};
 
 use diskrescue_core::format::{Confidence, ExtentStatus, FileFormat, Measured, Nested, NestedRole};
 use diskrescue_core::media::MediaCategory;
-use diskrescue_core::source::SubSource;
 use diskrescue_core::{Error, Range, RangeSet, ReadError, Result, SharedSource, Source, SourceExt};
 
 use crate::patterns::{Hit, PatternSet, SearchArea};
 use crate::plan::{Planner, Window};
 use crate::resolve::{Candidate, Child, Open, PendingState, Resolver, ResolverCfg};
 use crate::types::{
-    CarveMode, CarveOptions, CarvedFile, ExtractReport, ScanProgress, ScanSummary, MIN_CHUNK_SIZE,
-    PENALTY_ALLOCATED, PENALTY_CONFLICT, PENALTY_OFF_CLUSTER, PENALTY_UNREADABLE,
+    CarveMode, CarveOptions, CarvedFile, ExtractReport, ScanProgress, ScanSummary, MAX_CHUNK_SIZE,
+    MAX_PROBE_WINDOW, MIN_CHUNK_SIZE, PENALTY_ALLOCATED, PENALTY_CONFLICT, PENALTY_OFF_CLUSTER,
+    PENALTY_UNREADABLE,
 };
 use crate::zerofill::ZeroFill;
 
@@ -298,6 +298,8 @@ pub struct Carver {
     pool: Arc<rayon::ThreadPool>,
     workers: usize,
     window_len: usize,
+    /// `chunk_size` clamped to [`MAX_CHUNK_SIZE`].
+    chunk: usize,
 }
 
 impl std::fmt::Debug for Carver {
@@ -305,6 +307,7 @@ impl std::fmt::Debug for Carver {
         f.debug_struct("Carver")
             .field("opts", &self.opts)
             .field("workers", &self.workers)
+            .field("chunk", &self.chunk)
             .field("probe_window", &self.window_len)
             .finish()
     }
@@ -358,14 +361,17 @@ impl Carver {
             .panic_handler(|_| log::error!("a carving measurement job panicked"))
             .build()
             .map_err(|e| Error::other(format!("cannot start measurement threads: {e}")))?;
+        // Both sizes become allocations (two chunk buffers, each with the
+        // window as overlap): clamp absurd values instead of trying them.
         let window_len = opts
             .probe_window
-            .max(usize::try_from(patterns.max_probe_len()).unwrap_or(usize::MAX))
+            .min(MAX_PROBE_WINDOW)
+            .max(usize::try_from(patterns.max_probe_len()).unwrap_or(MAX_PROBE_WINDOW))
             .max(1);
+        let chunk = opts.chunk_size.min(MAX_CHUNK_SIZE);
         log::debug!(
-            "carver ready: {} formats, {workers} workers, chunk {} bytes, probe window {window_len} bytes",
+            "carver ready: {} formats, {workers} workers, chunk {chunk} bytes, probe window {window_len} bytes",
             fmts.len(),
-            opts.chunk_size
         );
         Ok(Carver {
             opts,
@@ -375,6 +381,7 @@ impl Carver {
             pool: Arc::new(pool),
             workers,
             window_len,
+            chunk,
         })
     }
 
@@ -435,7 +442,7 @@ impl Carver {
         let mut planner = Planner::new(
             &scan_set,
             size,
-            self.opts.chunk_size as u64,
+            self.chunk as u64,
             self.window_len as u64,
             sector,
         );
@@ -536,10 +543,12 @@ impl Carver {
     /// BLAKE3 (lowercase hex) of exactly the bytes [`Carver::extract`] would
     /// write for `file` (unreadable ranges hashed as zeros).
     pub fn hash(src: &SharedSource, file: &CarvedFile) -> Result<String> {
-        let view: SharedSource = Arc::new(SubSource::new(src.clone(), file.start, file.len));
-        let known = view.unreadable().unwrap_or_default();
-        let fill = ZeroFill::new(view, known, Arc::new(AtomicBool::new(false)));
-        Ok(diskrescue_core::util::hash::blake3_source(&fill)?)
+        // Through `extract` rather than a window onto the source: a window
+        // clamps the sector-expanded reads of a direct-I/O device to the
+        // file's (unaligned) end, which such a device refuses.
+        let mut hasher = blake3::Hasher::new();
+        Carver::extract(src, file, &mut hasher)?;
+        Ok(hasher.finalize().to_hex().to_string())
     }
 }
 

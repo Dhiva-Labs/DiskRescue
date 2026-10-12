@@ -22,6 +22,14 @@ pub const DEFAULT_ALIGNMENT: u64 = 512;
 /// Smallest accepted `chunk_size`.
 pub const MIN_CHUNK_SIZE: usize = 4096;
 
+/// Largest `chunk_size` used; larger values are clamped to it (two chunk
+/// buffers are resident during a scan).
+pub const MAX_CHUNK_SIZE: usize = 1 << 30;
+
+/// Largest `probe_window` used; larger values are clamped to it (the window
+/// is also the overlap read with every chunk).
+pub const MAX_PROBE_WINDOW: usize = 16 << 20;
+
 /// Size of the blocks the zero-skip optimisation tests for "all zero".
 pub const ZERO_BLOCK: usize = 4096;
 
@@ -80,10 +88,11 @@ pub struct CarveOptions {
     /// [`PENALTY_OFF_CLUSTER`] confidence points and are not `aligned`.
     pub cluster: Option<(u64, u64)>,
     /// Bytes read per scanner step. Default 64 MiB; at least
-    /// [`MIN_CHUNK_SIZE`].
+    /// [`MIN_CHUNK_SIZE`]; values above [`MAX_CHUNK_SIZE`] are clamped.
     pub chunk_size: usize,
     /// Bytes handed to `FileFormat::probe` (default 64 KiB). Raised
-    /// automatically to the longest signature probe length.
+    /// automatically to the longest signature probe length; values above
+    /// [`MAX_PROBE_WINDOW`] are clamped.
     pub probe_window: usize,
     /// Threads measuring candidates in parallel. 0 means
     /// `std::thread::available_parallelism()`.

@@ -9,6 +9,9 @@
 //! * on a media error (`Io`, `Timeout`) re-reads the good prefix of the
 //!   failed request, then skips exactly the failing sector, zero-fills it and
 //!   records it as "discovered" so reports can name it;
+//! * treats a read that returns no data before the advertised end of the
+//!   source (a shrunk image, an optimistic device size) the same way, instead
+//!   of taking it for the end of the data;
 //! * re-opens the inner source once on `DeviceGone` and retries;
 //! * expands reads to sector boundaries through a bounce buffer when the
 //!   inner source needs aligned I/O;
@@ -28,6 +31,13 @@ use diskrescue_core::{Range, RangeSet, ReadError, ReadErrorKind, SharedSource, S
 /// Retries of a shrinking good prefix before the carver gives up on it and
 /// treats the current position as bad.
 const MAX_PREFIX_RETRIES: u32 = 8;
+
+/// A source that returns no data before the end it advertised (it shrank,
+/// or its size was optimistic) has each such sector zero-filled and
+/// recorded as unreadable, like a media error. After this many such sectors
+/// in a row, the rest of the request is treated the same way at once, so a
+/// source that lost its tail costs one read per sector only briefly.
+const MAX_EMPTY_SECTORS: u32 = 64;
 
 /// Zero-filling, error-absorbing view of a source. See the module docs.
 pub(crate) struct ZeroFill {
@@ -126,13 +136,15 @@ impl ZeroFill {
     fn inner_read(&self, pos: u64, buf: &mut [u8]) -> Result<usize, ReadError> {
         let s = self.sector;
         if !self.aligned_io || (pos % s == 0 && buf.len() as u64 % s == 0) {
-            return self.inner.read_at(pos, buf);
+            // A source claiming more bytes than asked for violates the
+            // contract; never let that run a position past the buffer.
+            return self.inner.read_at(pos, buf).map(|n| n.min(buf.len()));
         }
         let a = pos / s * s;
         let end = pos + buf.len() as u64;
         let b = end.div_ceil(s).saturating_mul(s);
         let mut tmp = vec![0u8; (b - a) as usize];
-        let n = self.inner.read_at(a, &mut tmp)?;
+        let n = self.inner.read_at(a, &mut tmp)?.min(tmp.len());
         let got_end = a + n as u64;
         if got_end <= pos {
             return Ok(0);
@@ -143,14 +155,26 @@ impl ZeroFill {
         Ok(avail)
     }
 
+    /// Zero-fill and record `[pos, sector end)` (clamped to `end`) as
+    /// unreadable; returns the new position.
+    fn skip_sector(&self, start: u64, pos: u64, end: u64, buf: &mut [u8]) -> u64 {
+        let bad_end = (pos + 1).div_ceil(self.sector).saturating_mul(self.sector);
+        let bad_end = bad_end.clamp(pos + 1, end);
+        buf[(pos - start) as usize..(bad_end - start) as usize].fill(0);
+        self.record_bad(Range::new(pos, bad_end));
+        bad_end
+    }
+
     /// Fill `buf` (which maps to `[start, start + buf.len())`, no known holes
-    /// inside) from the inner source, absorbing media errors. Returns the
-    /// number of bytes placed, short only at the end of the source.
+    /// inside, inside the advertised size) from the inner source, absorbing
+    /// media errors and missing data. Returns `buf.len()` unless aborted or
+    /// the source fails for good.
     fn read_piece(&self, start: u64, buf: &mut [u8]) -> Result<usize, ReadError> {
         let end = start + buf.len() as u64;
         let mut pos = start;
         let mut limit = end;
         let mut retries = 0u32;
+        let mut empty = 0u32;
         let mut reopened = false;
         while pos < end {
             if self.aborted() {
@@ -160,10 +184,31 @@ impl ZeroFill {
             let lo = (pos - start) as usize;
             let hi = (lim - start) as usize;
             match self.inner_read(pos, &mut buf[lo..hi]) {
-                Ok(0) => return Ok((pos - start) as usize),
+                Ok(0) => {
+                    // No data before the advertised end: the contract says
+                    // that cannot happen, so do not take it as the end of
+                    // the source (that would silently skip the rest of a
+                    // whole chunk). Treat it as unreadable instead.
+                    empty += 1;
+                    if empty >= MAX_EMPTY_SECTORS {
+                        log::warn!(
+                            "{} returns no data from offset {pos} on, before its advertised end; treating {} bytes as unreadable",
+                            self.inner.describe(),
+                            end - pos
+                        );
+                        buf[lo..].fill(0);
+                        self.record_bad(Range::new(pos, end));
+                        pos = end;
+                    } else {
+                        pos = self.skip_sector(start, pos, end, buf);
+                    }
+                    limit = end;
+                    retries = 0;
+                }
                 Ok(n) => {
                     pos += n as u64;
                     retries = 0;
+                    empty = 0;
                     if pos >= limit {
                         limit = end;
                     }
@@ -176,11 +221,7 @@ impl ZeroFill {
                         retries += 1;
                         continue;
                     }
-                    let bad_end = (pos + 1).div_ceil(self.sector).saturating_mul(self.sector);
-                    let bad_end = bad_end.clamp(pos + 1, end);
-                    buf[lo..(bad_end - start) as usize].fill(0);
-                    self.record_bad(Range::new(pos, bad_end));
-                    pos = bad_end;
+                    pos = self.skip_sector(start, pos, end, buf);
                     limit = end;
                     retries = 0;
                 }
