@@ -146,11 +146,7 @@ impl ImagingProfile {
 
     /// Initial skip distance for a source of `size` bytes.
     pub fn initial_skip(&self, size: u64) -> u64 {
-        let rel = if self.skip_initial_divisor > 0 {
-            size / self.skip_initial_divisor
-        } else {
-            0
-        };
+        let rel = size.checked_div(self.skip_initial_divisor).unwrap_or(0);
         self.skip_initial.max(rel)
     }
 
@@ -177,7 +173,7 @@ impl ImagingProfile {
             skip_initial: 64 * KIB,
             skip_initial_divisor: 100_000,
             skip_max_percent: 1.0,
-            skip_max: 4 * 1024 * MIB,
+            skip_max: 64 * 1024 * MIB,
             skip_growth: 2.0,
             timeout_copy: Duration::from_secs(15),
             timeout_scrape: Duration::from_secs(30),
@@ -228,7 +224,7 @@ impl ImagingProfile {
             skip_initial: MIB,
             skip_initial_divisor: 0,
             skip_max_percent: 1.0,
-            skip_max: 4 * 1024 * MIB,
+            skip_max: 64 * 1024 * MIB,
             skip_growth: 2.0,
             timeout_copy: Duration::from_secs(5),
             timeout_scrape: Duration::from_secs(10),
@@ -370,7 +366,7 @@ impl ImagingProfile {
             skip_initial: 64 * KIB,
             skip_initial_divisor: 100_000,
             skip_max_percent: 1.0,
-            skip_max: 4 * 1024 * MIB,
+            skip_max: 64 * 1024 * MIB,
             skip_growth: 2.0,
             timeout_copy: Duration::from_secs(120),
             timeout_scrape: Duration::from_secs(120),
