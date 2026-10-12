@@ -9,8 +9,10 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-use diskrescue_app::plan::RecoverPlan;
+use diskrescue_app::jobs::{start_image, ImageState};
+use diskrescue_app::plan::{ImagePlan, RecoverPlan};
 use diskrescue_app::preflight::{Preflight, ResolvedRecover};
+use diskrescue_app::JobHandle;
 use diskrescue_core::device::{DeviceInfo, DeviceKind, HealthInfo, Transport};
 use diskrescue_fixtures::sets::{self, Scenario};
 use diskrescue_gui::{Backend, DiskRescueApp, Saved, SystemBackend};
@@ -48,6 +50,15 @@ impl Backend for FakeBackend {
             Some(p) => p,
             None => SystemBackend.preflight_recover(plan),
         }
+    }
+
+    /// Never asks for a password: the "administrator" copy runs in this
+    /// process with normal rights (sources are image files).
+    fn start_image_privileged(
+        &self,
+        plan: ImagePlan,
+    ) -> diskrescue_app::Result<JobHandle<ImageState>> {
+        Ok(start_image(plan))
     }
 }
 
@@ -192,8 +203,10 @@ pub fn type_into(h: &mut Harness<'_, DiskRescueApp>, label: &str, text: &str) {
     h.step();
 }
 
+/// Click the element labelled `label` (through AccessKit, like a screen
+/// reader, so that elements scrolled out of view work too).
 pub fn click(h: &mut Harness<'_, DiskRescueApp>, label: &str) {
-    h.get_by_label(label).click();
+    h.get_by_label(label).click_accesskit();
     h.step();
     h.step();
 }

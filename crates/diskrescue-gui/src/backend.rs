@@ -3,8 +3,10 @@
 
 use std::path::Path;
 
-use diskrescue_app::plan::RecoverPlan;
+use diskrescue_app::jobs::ImageState;
+use diskrescue_app::plan::{ImagePlan, RecoverPlan};
 use diskrescue_app::preflight::{self, Preflight, ResolvedRecover};
+use diskrescue_app::{helper, JobHandle};
 use diskrescue_core::device::DeviceInfo;
 
 /// Device listing, permission probe and safety checks.
@@ -17,6 +19,15 @@ pub trait Backend: Send + Sync + 'static {
 
     /// The safety checks of a recovery plan.
     fn preflight_recover(&self, plan: &RecoverPlan) -> Preflight<ResolvedRecover>;
+
+    /// Copy a device that needs administrator rights (Linux: the
+    /// command-line program under pkexec, which asks for a password).
+    fn start_image_privileged(
+        &self,
+        plan: ImagePlan,
+    ) -> diskrescue_app::Result<JobHandle<ImageState>> {
+        helper::start_image_privileged(plan)
+    }
 }
 
 /// The real system.

@@ -5,7 +5,6 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use diskrescue_app::helper;
 use diskrescue_app::jobs::start_recover;
 use egui::{vec2, Align, Color32, CornerRadius, Layout, Margin, RichText, Sense, Ui};
 use serde::{Deserialize, Serialize};
@@ -590,7 +589,7 @@ impl DiskRescueApp {
         let (title, _) = self.job_title();
         let image_path = image.image.clone();
         let output = then.output.clone();
-        match helper::start_image_privileged(image) {
+        match self.backend.start_image_privileged(image) {
             Ok(h) => {
                 self.job = Some(ActiveJob {
                     title,
@@ -703,5 +702,45 @@ impl eframe::App for DiskRescueApp {
 
     fn clear_color(&self, visuals: &egui::Visuals) -> [f32; 4] {
         clear_color(visuals)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    #[derive(Default)]
+    struct MemStorage(HashMap<String, String>);
+
+    impl eframe::Storage for MemStorage {
+        fn get_string(&self, key: &str) -> Option<String> {
+            self.0.get(key).cloned()
+        }
+        fn set_string(&mut self, key: &str, value: String) {
+            self.0.insert(key.to_string(), value);
+        }
+        fn remove_string(&mut self, key: &str) {
+            self.0.remove(key);
+        }
+        fn flush(&mut self) {}
+    }
+
+    #[test]
+    fn recent_results_are_saved_and_restored() {
+        let mut saved = Saved::default();
+        for i in 0..10 {
+            saved.remember(PathBuf::from(format!("/r/{i}")));
+        }
+        saved.remember(PathBuf::from("/r/3"));
+        assert_eq!(saved.recent_results.len(), 8);
+        assert_eq!(saved.recent_results[0], PathBuf::from("/r/3"));
+        assert_eq!(saved.recent_results[1], PathBuf::from("/r/9"));
+
+        let mut app = DiskRescueApp::new(saved.clone());
+        let mut storage = MemStorage::default();
+        eframe::App::save(&mut app, &mut storage);
+        let back: Saved = eframe::get_value(&storage, eframe::APP_KEY).unwrap();
+        assert_eq!(back, saved);
     }
 }

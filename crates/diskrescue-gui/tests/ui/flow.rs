@@ -9,7 +9,9 @@ use crate::common::*;
 use diskrescue_app::jobs::start_recover;
 use diskrescue_app::plan::RecoverPlan;
 use diskrescue_app::JobOutcome;
+use diskrescue_core::media::MediaCategory;
 use diskrescue_gui::Page;
+use diskrescue_recover::report::{FileRecord, Origin, Outcome, Report};
 
 const JOB_LIMIT: Duration = Duration::from_secs(300);
 const UI_LIMIT: Duration = Duration::from_secs(30);
@@ -171,4 +173,61 @@ fn results_folders_reopen_and_filter() {
     wait_for(&mut h, UI_LIMIT, "the results again", |h| {
         has_label(h, "All (11)")
     });
+}
+
+#[test]
+fn a_damaged_result_is_repaired_with_a_reference_from_the_same_results() {
+    let Some(sc) = damaged_media() else {
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let folder = dir.path().join("Recovered");
+    let videos = folder.join("carved").join("videos");
+    std::fs::create_dir_all(&videos).unwrap();
+    std::fs::copy(sc.root.join("no_moov.mp4"), videos.join("no_moov.mp4")).unwrap();
+    std::fs::copy(
+        sc.root.join("donors/donor.mp4"),
+        videos.join("MVI_0100.MP4"),
+    )
+    .unwrap();
+    let mut report = Report::new(None);
+    for (name, outcome) in [
+        ("no_moov.mp4", Outcome::Damaged),
+        ("MVI_0100.MP4", Outcome::Recovered),
+    ] {
+        let p = videos.join(name);
+        let mut f = FileRecord::new(
+            Origin::Input { path: p.clone() },
+            MediaCategory::Video,
+            std::fs::metadata(&p).unwrap().len(),
+        );
+        f.output = Some(std::path::PathBuf::from("carved/videos").join(name));
+        f.format = Some("mp4".into());
+        f.outcome = outcome;
+        report.add_file(f);
+    }
+
+    let (app, _) = fake_app(vec![]);
+    let mut h = harness(app);
+    h.state_mut()
+        .results
+        .set_report(&folder, std::sync::Arc::new(report));
+    click(&mut h, "Results");
+    assert!(has_label(&h, "Damaged (1)"));
+    click(&mut h, "no_moov.mp4");
+    click(&mut h, "Repair with a reference file...");
+    assert!(has_label(&h, "Use MVI_0100.MP4 as the reference"));
+    click(&mut h, "Use MVI_0100.MP4 as the reference");
+    assert_eq!(h.state().page, Page::Repair);
+    wait_for(&mut h, JOB_LIMIT, "the repair", |h| {
+        has_label_containing(h, "Done: ")
+    });
+    assert!(has_label_containing(&h, "Done: 1 of 1 file repaired"));
+    let repaired = folder
+        .join("repairs")
+        .join("no_moov")
+        .join("repaired")
+        .join("no_moov.mp4");
+    assert!(repaired.is_file(), "{}", repaired.display());
+    assert!(!folder.join("report.previous.json").exists());
 }

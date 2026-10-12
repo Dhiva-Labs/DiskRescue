@@ -179,3 +179,74 @@ fn a_drive_that_needs_administrator_rights_gets_both_options() {
         assert!(has_label(&h, "Copy command"));
     }
 }
+
+#[test]
+fn the_administrator_copy_is_followed_by_recovery_with_normal_rights() {
+    let Some(sc) = camera_card() else {
+        return;
+    };
+    let image = sc.disk_image.clone().unwrap();
+    // A made-up card whose device node is the fixture image.
+    let size = std::fs::metadata(&image).unwrap().len();
+    let card = device(
+        image.to_str().unwrap(),
+        diskrescue_core::device::DeviceKind::SdCard,
+        "",
+        "EOS card",
+        size,
+    );
+    let backend = FakeBackend {
+        needs_privilege: [image.clone()].into_iter().collect(),
+        ..FakeBackend::new(vec![card])
+    };
+    *backend.preflight.lock().unwrap() = Some(Preflight {
+        blockers: vec![blocker(
+            BlockerCode::PermissionDenied,
+            "Permission denied (os error 13).",
+            None,
+        )],
+        warnings: vec![],
+        resolved: None,
+    });
+    let app = diskrescue_gui::DiskRescueApp::with_backend(
+        std::sync::Arc::new(backend),
+        diskrescue_gui::Saved::default(),
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let copy = dir.path().join("card copy.img");
+    let out = dir.path().join("Recovered");
+    let mut h = harness(app);
+    open_wizard(&mut h, "EOS card");
+    type_into(
+        &mut h,
+        "Save recovered files to",
+        &out.display().to_string(),
+    );
+    type_into(&mut h, "Image file", &copy.display().to_string());
+    wait_for(&mut h, LIMIT, "Next", |h| enabled(h, "Next"));
+    click(&mut h, "Next");
+    wait_for(&mut h, LIMIT, "the banner", |h| {
+        enabled(h, "Copy with administrator rights")
+    });
+    click(&mut h, "Copy with administrator rights");
+    assert_eq!(h.state().page, Page::Progress);
+    assert!(has_label(
+        &h,
+        "Step 1 of 2: Copying the drive with administrator rights"
+    ));
+    wait_for(
+        &mut h,
+        Duration::from_secs(300),
+        "the copy and the recovery",
+        |h| has_label(h, "See your recovered files"),
+    );
+    assert!(has_label_containing(
+        &h,
+        "Finished: 11 files were recovered"
+    ));
+    assert_eq!(
+        std::fs::read(&copy).unwrap(),
+        std::fs::read(&image).unwrap()
+    );
+    assert!(out.join("report.json").is_file());
+}

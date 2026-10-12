@@ -14,7 +14,7 @@ fn main() -> eframe::Result<()> {
             .with_min_inner_size([900.0, 600.0]),
         ..Default::default()
     };
-    eframe::run_native(
+    let result = eframe::run_native(
         "DiskRescue",
         options,
         Box::new(|cc| {
@@ -24,5 +24,12 @@ fn main() -> eframe::Result<()> {
                 .unwrap_or_default();
             Ok(Box::new(DiskRescueApp::new(saved)))
         }),
-    )
+    );
+    if let Err(e) = &result {
+        eprintln!(
+            "DiskRescue could not open its window ({e}). It needs a graphical desktop; from a \
+             terminal, use the command-line program instead: diskrescue --help"
+        );
+    }
+    result
 }
