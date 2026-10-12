@@ -41,7 +41,7 @@ use std::collections::{HashSet, VecDeque};
 use diskrescue_core::format::NestedRole;
 use diskrescue_core::source::SharedSource;
 use diskrescue_core::util::bytes::{ascii_trimmed, Endian};
-use diskrescue_core::Result;
+use diskrescue_core::{Range, Result};
 
 use crate::jpegmini;
 use crate::makernote;
@@ -486,6 +486,90 @@ struct IfdInfo {
     jpeg_len: Option<u64>,
 }
 
+/// Most offsets kept in each list of [`Refs`].
+const MAX_REFS: usize = 1 << 16;
+/// Leading bytes of an embedded JPEG that may hold APPn segments (Exif with
+/// its own thumbnail, MPF) and therefore other JPEG or TIFF signatures.
+const JPEG_HEADER_SPAN: u64 = 128 * 1024;
+/// Sector grid on which other files would start (see `crate::foreign`).
+const GRID: u64 = 512;
+
+/// What the walk learned about where things are, so that the caller can
+/// check the declared extent against the bytes (`raw::verify_extent`).
+/// Offsets are file-relative.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct Refs {
+    /// Offsets on the sector grid that an IFD entry points at (strips,
+    /// tiles, JPEG streams, out-of-line values). A JPEG start there is part
+    /// of the file.
+    pub pointed: Vec<u64>,
+    /// Offsets where a JPEG stream starts (`FF D8`): `JPEGInterchangeFormat`,
+    /// RW2 `JpgFromRaw` and maker-note previews always, the strips and tiles
+    /// of a JPEG-compressed image as a group (see [`JpegRef::group`]).
+    pub jpeg_starts: Vec<JpegRef>,
+    /// Ranges that may legitimately hold JPEG or TIFF signatures anywhere:
+    /// out-of-line values (maker notes, Photoshop resources, embedded
+    /// original raw files) and the leading bytes of embedded JPEG previews.
+    pub exempt: Vec<Range>,
+    /// End of the furthest plausible IFD the walk parsed.
+    pub structure_end: u64,
+}
+
+/// An offset where the structure says a JPEG stream starts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct JpegRef {
+    /// File-relative offset.
+    pub off: u64,
+    /// Tag that points there.
+    pub tag: u16,
+    /// For the strips or tiles of one JPEG-compressed image: an id shared
+    /// by all of them. Old-style JPEG (compression 6) strips need not start
+    /// with SOI, and some writers put other data in compression 7 segments,
+    /// so a missing `FF D8` only counts when the first segment of the group
+    /// has one.
+    pub group: Option<u32>,
+}
+
+impl Refs {
+    fn point(&mut self, start: u64, off: u64) {
+        if self.pointed.len() < MAX_REFS * 16 && start.wrapping_add(off) % GRID == 0 {
+            self.pointed.push(off);
+        }
+    }
+
+    fn jpeg(&mut self, off: u64, tag: u16, group: Option<u32>) {
+        if self.jpeg_starts.len() < MAX_REFS {
+            self.jpeg_starts.push(JpegRef { off, tag, group });
+        }
+    }
+
+    fn exempt(&mut self, off: u64, len: u64) {
+        if len >= 4 && self.exempt.len() < MAX_REFS {
+            self.exempt.push(Range::new(off, off.saturating_add(len)));
+        }
+    }
+
+    /// Sort and deduplicate the lists for lookups.
+    fn seal(&mut self) {
+        self.pointed.sort_unstable();
+        self.pointed.dedup();
+        self.jpeg_starts.sort_unstable();
+        self.jpeg_starts.dedup_by_key(|j| j.off);
+        self.exempt.sort_unstable_by_key(|r| (r.start, r.end));
+        self.exempt.dedup();
+    }
+
+    /// Whether an IFD entry points at `off`.
+    pub(crate) fn is_pointed(&self, off: u64) -> bool {
+        self.pointed.binary_search(&off).is_ok()
+    }
+
+    /// Whether `off` lies in a range that may hold JPEG or TIFF signatures.
+    pub(crate) fn is_exempt(&self, off: u64) -> bool {
+        self.exempt.iter().any(|r| r.contains(off))
+    }
+}
+
 /// Incremental walker; `start` validates the header and IFD0, `run` does the
 /// rest.
 pub(crate) struct Walker<'a> {
@@ -501,6 +585,8 @@ pub(crate) struct Walker<'a> {
     seen_previews: HashSet<(u64, u64)>,
     cr2_pending: Option<u64>,
     budget: u64,
+    refs: Refs,
+    groups: u32,
 }
 
 impl<'a> Walker<'a> {
@@ -611,11 +697,19 @@ impl<'a> Walker<'a> {
             seen_previews: HashSet::new(),
             cr2_pending: cr2.map(|c| c.2),
             budget: ARRAY_BUDGET,
+            refs: Refs::default(),
+            groups: 0,
         })
     }
 
     /// Walk everything reachable from IFD0.
-    pub(crate) fn run(mut self) -> TiffWalk {
+    pub(crate) fn run(self) -> TiffWalk {
+        self.run_with_refs().0
+    }
+
+    /// Walk everything reachable from IFD0 and also return where the walk
+    /// found references into the file.
+    pub(crate) fn run_with_refs(mut self) -> (TiffWalk, Refs) {
         self.queue.push_back(Job {
             off: self.head.ifd0_offset,
             kind: Kind::Main,
@@ -771,7 +865,11 @@ impl<'a> Walker<'a> {
         let endian = self.head.endian;
         let (csz, esz, nsz): (u64, u64, u64) = if self.big { (8, 20, 8) } else { (2, 12, 4) };
         let n = ifd.entries.len() as u64;
-        self.add_end(ifd.offset + csz + n * esz + nsz);
+        let ifd_end = ifd.offset + csz + n * esz + nsz;
+        self.add_end(ifd_end);
+        if plausible_ifd0(&ifd) {
+            self.refs.structure_end = self.refs.structure_end.max(ifd_end);
+        }
         let is_ifd0 = job.kind == Kind::Main && job.idx == 0;
         if ifd.entries.windows(2).any(|w| w[1].tag <= w[0].tag) {
             self.anomaly(format!(
@@ -795,6 +893,15 @@ impl<'a> Walker<'a> {
                     continue;
                 }
                 let end = e.value_or_offset.saturating_add(len);
+                self.refs.point(self.win.start(), e.value_or_offset);
+                // Blobs (maker notes, Photoshop resources, embedded original
+                // files) may hold JPEG or TIFF headers; offset tables and
+                // values that point far past the data do not count.
+                let table = matches!(e.tag, 0x0111 | 0x0117 | 0x0144 | 0x0145 | 0x014A);
+                let sane = end <= self.win.avail().saturating_add(VALUE_SLACK);
+                if !table && (payload_tag || sane) {
+                    self.refs.exempt(e.value_or_offset, len);
+                }
                 if payload_tag {
                     self.add_payload(e.value_or_offset, len);
                 } else {
@@ -883,6 +990,7 @@ impl<'a> Walker<'a> {
                 }
                 0x0118 if self.is_rw2() && is_ifd0 => self.out.rw2_raw_offset = sc,
                 0x002E | 0x0127 if self.is_rw2() && is_ifd0 && !e.inline => {
+                    self.refs.jpeg(e.value_or_offset, e.tag, None);
                     self.consider_preview(e.value_or_offset, len, false);
                 }
                 _ => {}
@@ -894,6 +1002,7 @@ impl<'a> Walker<'a> {
             if let (Some(off), Some(len)) = (off, len) {
                 if off >= 8 {
                     self.add_payload(off, len);
+                    self.refs.point(self.win.start(), off);
                 }
             }
         }
@@ -969,11 +1078,17 @@ impl<'a> Walker<'a> {
 
     /// Per-IFD post-processing once all tags have been seen.
     fn finish_ifd(&mut self, info: &IfdInfo, job: &Job) {
-        // Strips and tiles.
+        // Strips and tiles. Each strip or tile of a new-style JPEG image
+        // (compression 7, or 34892 lossy DNG) is a JPEG stream of its own.
         let mut payload_bytes: u64 = 0;
-        for (offs, counts, what) in [
-            (&info.strip_offsets, &info.strip_counts, "strip"),
-            (&info.tile_offsets, &info.tile_counts, "tile"),
+        let jpeg_segments = matches!(info.compression, Some(7 | 34892))
+            || (info.compression == Some(6)
+                && info.jpeg_off.is_none()
+                && info.strip_offsets.len() == 1);
+        let start = self.win.start();
+        for (offs, counts, what, tag) in [
+            (&info.strip_offsets, &info.strip_counts, "strip", 0x0111u16),
+            (&info.tile_offsets, &info.tile_counts, "tile", 0x0144),
         ] {
             if offs.is_empty() && counts.is_empty() {
                 continue;
@@ -993,6 +1108,10 @@ impl<'a> Walker<'a> {
                 }
                 continue;
             }
+            let group = jpeg_segments.then(|| {
+                self.groups += 1;
+                self.groups
+            });
             for (&o, &c) in offs.iter().zip(counts.iter()) {
                 if o < 8 {
                     self.anomaly(format!("{what} offset {o} points into the file header"));
@@ -1003,6 +1122,10 @@ impl<'a> Walker<'a> {
                 }
                 payload_bytes = payload_bytes.saturating_add(c);
                 self.add_payload(o, c);
+                self.refs.point(start, o);
+                if group.is_some() {
+                    self.refs.jpeg(o, tag, group);
+                }
             }
         }
         // Compare an uncompressed raster against its geometry.
@@ -1039,6 +1162,8 @@ impl<'a> Walker<'a> {
         if let (Some(o), Some(l)) = (info.jpeg_off, info.jpeg_len) {
             if o >= 8 && l > 0 {
                 self.add_payload(o, l);
+                self.refs.point(start, o);
+                self.refs.jpeg(o, 0x0201, None);
                 let thumb = job.kind == Kind::Main && job.idx >= 1;
                 self.consider_preview(o, l, thumb);
             }
@@ -1087,6 +1212,7 @@ impl<'a> Walker<'a> {
         } else {
             NestedRole::Preview
         };
+        self.refs.exempt(off, len.min(JPEG_HEADER_SPAN));
         self.out.previews.push(Preview {
             offset: off,
             len,
@@ -1096,7 +1222,7 @@ impl<'a> Walker<'a> {
         });
     }
 
-    fn finish(mut self) -> TiffWalk {
+    fn finish(mut self) -> (TiffWalk, Refs) {
         // Maker-note pointers.
         if let Some((off, len)) = self.out.makernote {
             let make = self.out.make.clone().unwrap_or_default();
@@ -1121,6 +1247,8 @@ impl<'a> Walker<'a> {
                     }
                 }
                 self.add_payload(o, l);
+                self.refs.point(self.win.start(), o);
+                self.refs.jpeg(o, 0x927C, None);
                 self.consider_preview(o, l, false);
             }
         }
@@ -1139,8 +1267,11 @@ impl<'a> Walker<'a> {
         }
         if let Some(off) = self.out.rw2_raw_offset {
             self.add_payload(off, 0);
+            self.refs.point(self.win.start(), off);
         }
-        self.out
+        let mut refs = std::mem::take(&mut self.refs);
+        refs.seal();
+        (self.out, refs)
     }
 }
 

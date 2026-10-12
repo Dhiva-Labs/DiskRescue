@@ -22,9 +22,20 @@
 //! up to 65535, a pixel-array offset of at most 64 KiB that clears the
 //! headers, and a computed size of at most 1 GiB.
 //!
+//! # Overwritten tails
+//!
+//! The declared size is backed by nothing but the header: the pixel array
+//! has no structure. When the file was cut short and other files were
+//! written after it, the size still covers them. The pixel array is
+//! therefore scanned for the start of another file at sector-aligned offsets
+//! (see `crate::foreign`; a JPEG or PNG payload of compression 4 / 5 is the
+//! file's own). Such a start ends the bitmap: `Truncated` at that offset with
+//! lower confidence.
+//!
 //! # Limits
 //!
-//! The pixel data itself is not examined, so the confidence is `MEDIUM`.
+//! The pixel data itself is not examined, so the confidence is at most
+//! `MEDIUM`: the length is only backed by the header.
 
 use diskrescue_core::format::{
     Confidence, FileFormat, Measured, Nested, NestedRole, Signature, Validation,
@@ -34,7 +45,8 @@ use diskrescue_core::source::SharedSource;
 use diskrescue_core::util::bytes::{u16le, u32le};
 use diskrescue_core::{Range, Result};
 
-use crate::common::{sized, validate_with, Inspected};
+use crate::common::{cut_at, foreign_note, sized, validate_with, Inspected};
+use crate::foreign::{self, Sig};
 use crate::win::{read_error, Win};
 
 const MAX_SIZE: u64 = 1 << 30;
@@ -222,6 +234,14 @@ fn inspect(src: &SharedSource, start: u64, limit: u64) -> Result<Option<Inspecte
     }
     let mut m = sized(&win, len, conf, "the bitmap");
     m.notes.extend(notes);
+    // Only the header backs the size: look for another file in the pixels.
+    let payload = matches!(h.compression, 4 | 5).then(|| Range::with_len(off, h.size_image as u64));
+    let allowed = |at: u64, sig: Sig| {
+        matches!(sig, Sig::Jpeg | Sig::Png | Sig::Tiff) && payload.is_some_and(|r| r.contains(at))
+    };
+    if let Some(hit) = foreign::scan(&win, off, m.len, &allowed) {
+        cut_at(&mut m, hit.offset, foreign_note(hit, len, "its header"));
+    }
     let mut meta = MediaMeta {
         width: Some(h.width),
         height: Some(h.height),
@@ -238,7 +258,7 @@ fn inspect(src: &SharedSource, start: u64, limit: u64) -> Result<Option<Inspecte
     if matches!(h.compression, 4 | 5) && h.size_image > 0 {
         m.nested.push(Nested {
             range: Range::with_len(off, h.size_image as u64)
-                .intersect(Range::new(0, len))
+                .intersect(Range::new(0, m.len))
                 .unwrap_or(Range::new(0, 0)),
             format: Some(if h.compression == 4 { "jpeg" } else { "png" }.into()),
             role: NestedRole::Container,

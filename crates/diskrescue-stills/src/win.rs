@@ -131,6 +131,36 @@ impl Win {
         }
         Ok(v)
     }
+
+    /// Read up to `buf.len()` bytes at `off` straight from the source,
+    /// bypassing the block cache (for sparse probes that would otherwise
+    /// pull a whole cache block per sample). Returns the number of bytes
+    /// read, `None` when the medium failed.
+    pub(crate) fn peek(&self, off: u64, buf: &mut [u8]) -> Option<usize> {
+        if off >= self.avail {
+            return Some(0);
+        }
+        let want = ((self.avail - off).min(buf.len() as u64)) as usize;
+        let mut done = 0usize;
+        while done < want {
+            match self
+                .cache
+                .inner()
+                .read_at(off + done as u64, &mut buf[done..want])
+            {
+                Ok(0) => break,
+                Ok(n) => done += n,
+                Err(_) => return None,
+            }
+        }
+        Some(done)
+    }
+
+    /// File-relative ranges of the window the source already knows to be
+    /// unreadable.
+    pub(crate) fn unreadable(&self) -> Option<diskrescue_core::RangeSet> {
+        self.cache.inner().unreadable().filter(|s| !s.is_empty())
+    }
 }
 
 /// Forward read-ahead over a [`Win`].

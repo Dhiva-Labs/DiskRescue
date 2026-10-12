@@ -32,10 +32,21 @@
 //! `Truncated` with `err_offset` at the end of the readable data. Panasonic
 //! RW2 raw data has no stored length; see [`measure_rw2`] for the estimate.
 //!
+//! The extent is then checked against the bytes (see [`verify_extent`]):
+//! JPEG streams the IFDs point at must start with `FF D8`, and no other file
+//! may start on the sector grid past the last verified structure; either
+//! failure ends the file there (`Truncated`, confidence lowered by 30).
+//!
+//! An Exif block measured on its own (IFD0 with Exif/GPS pointers but no
+//! strips, tiles, JPEG stream or SubIFDs) is not a picture: confidence
+//! `LOW` and the note "EXIF block without image data".
+//!
 //! # Limits
 //!
 //! Pixel data is not decoded, so a damaged strip is not noticed. The quality
 //! of a measurement is the quality of the IFDs.
+
+use std::collections::HashMap;
 
 use diskrescue_core::format::{
     Confidence, ExtentStatus, FileFormat, Measured, Nested, Signature, Validation,
@@ -44,11 +55,16 @@ use diskrescue_core::media::{MediaCategory, MediaMeta};
 use diskrescue_core::source::SharedSource;
 use diskrescue_core::{Range, Result};
 
-use crate::common::{starts_with_ci, validate_with, Inspected};
-use crate::tiff::{exif_meta, Head, Magic, Reject, TiffWalk, Walker};
+use crate::common::{cut_at, foreign_note, starts_with_ci, validate_with, Inspected};
+use crate::foreign::{self, Sig};
+use crate::tiff::{exif_meta, Head, Magic, Refs, Reject, TiffWalk, Walker};
 use crate::win::{read_error, Win};
 
 const MAX_SIZE: u64 = 4 << 30;
+/// Most `FF D8` checks of JPEG offsets per file (spread over all of them).
+const MAX_JPEG_CHECKS: usize = 1024;
+/// Note on an Exif block measured on its own.
+pub(crate) const EXIF_BLOCK_NOTE: &str = "EXIF block without image data";
 
 /// The concrete kind of a TIFF-structured file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -253,6 +269,25 @@ fn nested_of(w: &TiffWalk, len: u64) -> Vec<Nested> {
     v
 }
 
+/// True when the file is an Exif block rather than a picture: a classic
+/// TIFF whose IFD0 points at Exif or GPS data but holds no image data of its
+/// own (no strips, tiles, JPEG stream, SubIFDs or RW2 raw data). That is what
+/// sits inside a JPEG APP1, a WebP `EXIF`, a PNG `eXIf` or a HEIF Exif item;
+/// an IFD1 thumbnail does not make it a photo.
+fn is_exif_block(w: &TiffWalk) -> bool {
+    if w.magic != Magic::Classic || w.cr2.is_some() {
+        return false;
+    }
+    let Some(ifd0) = w.ifds.iter().find(|i| i.offset == w.ifd0_offset) else {
+        return false;
+    };
+    let has = |tag: u16| ifd0.find(tag).is_some();
+    let image = [0x0111, 0x0144, 0x0201, 0x014A, 0x0118, 0x002E, 0x0127]
+        .into_iter()
+        .any(has);
+    !image && (has(0x8769) || has(0x8825))
+}
+
 /// Turn a finished walk into a measurement.
 fn build(variant: Variant, w: &TiffWalk) -> Inspected {
     let declared = w.max_extent;
@@ -297,7 +332,98 @@ fn build(variant: Variant, w: &TiffWalk) -> Inspected {
     m.meta = build_meta(variant, w);
     m.nested = nested_of(w, m.len);
     m.notes.extend(w.notes.iter().cloned());
+    if is_exif_block(w) {
+        // Not a picture: never carved as a photo on its own strength.
+        m.confidence = m.confidence.min(Confidence::LOW);
+        m.notes.push(EXIF_BLOCK_NOTE.into());
+    }
     Inspected::new(m, expected)
+}
+
+/// Check the measured extent against the bytes it covers.
+///
+/// Strips, tiles and raw data are opaque, but two things are cheap to check:
+///
+/// * every offset where the structure says a JPEG stream starts
+///   (`JPEGInterchangeFormat`, JPEG-compressed strips and tiles, `JpgFromRaw`,
+///   maker-note previews) must hold `FF D8`;
+/// * no other file may start on the sector grid inside the extent (see
+///   [`crate::foreign`]). A JPEG start is the file's own when an IFD entry
+///   points at it or it lies in a blob or JPEG header that may contain one;
+///   a TIFF header likewise only inside such a blob or JPEG header.
+///
+/// A failure past the last plausible IFD and verified JPEG start ends the
+/// file there (`Truncated`): the size fields describe bytes that are no
+/// longer this file's. A failure before that point, where the file's own
+/// structure is still intact further on, is only noted (an overwritten
+/// middle; the carver handles the embedded file).
+fn verify_extent(win: &Win, refs: &Refs, ins: &mut Inspected) {
+    let declared = ins.expected.unwrap_or(ins.measured.len);
+    let m = &mut ins.measured;
+    if m.status == ExtentStatus::UnknownLength || m.len == 0 {
+        return;
+    }
+    // JPEG starts, spread evenly when there are very many (tiled DNGs). A
+    // group of strips or tiles only counts once its first one is a JPEG.
+    let check = |off: u64| -> Option<bool> {
+        let mut b = [0u8; 2];
+        match win.peek(off, &mut b) {
+            Some(2) => Some(b == [0xFF, 0xD8]),
+            _ => None, // beyond the readable data or unreadable: no evidence
+        }
+    };
+    let js = &refs.jpeg_starts;
+    let mut group_ok: HashMap<u32, bool> = HashMap::new();
+    for j in js {
+        if let Some(g) = j.group {
+            group_ok
+                .entry(g)
+                .or_insert_with(|| j.off < m.len && check(j.off) == Some(true));
+        }
+    }
+    let step = js.len().div_ceil(MAX_JPEG_CHECKS).max(1);
+    let mut verified_end = refs.structure_end;
+    let mut missing: Vec<(u64, u16)> = Vec::new();
+    for j in js.iter().step_by(step).chain(js.last()) {
+        if j.off >= m.len || j.group.is_some_and(|g| !group_ok[&g]) {
+            continue;
+        }
+        match check(j.off) {
+            Some(true) => verified_end = verified_end.max(j.off + 2),
+            Some(false) => missing.push((j.off, j.tag)),
+            None => {}
+        }
+    }
+    let mut cut: Option<(u64, String)> = None;
+    for &(off, tag) in &missing {
+        if off >= verified_end {
+            if cut.as_ref().is_none_or(|c| off < c.0) {
+                cut = Some((
+                    off,
+                    format!(
+                        "no JPEG data (FF D8) at offset {off}, where tag {tag:#06x} points: the file is cut short or overwritten from there on"
+                    ),
+                ));
+            }
+        } else {
+            m.confidence = m.confidence.lowered(5);
+            m.notes.push(format!(
+                "no JPEG data (FF D8) at offset {off}, where tag {tag:#06x} points"
+            ));
+        }
+    }
+    let allowed = |off: u64, sig: Sig| match sig {
+        Sig::Jpeg => refs.is_pointed(off) || refs.is_exempt(off),
+        Sig::Tiff => refs.is_exempt(off),
+        _ => false,
+    };
+    let scan_to = cut.as_ref().map_or(m.len, |c| c.0);
+    if let Some(hit) = foreign::scan(win, verified_end, scan_to, &allowed) {
+        cut = Some((hit.offset, foreign_note(hit, declared, "its structure")));
+    }
+    if let Some((at, note)) = cut {
+        cut_at(m, at, note);
+    }
 }
 
 /// Measurement of a Panasonic RW2 whose raw data has no stored length.
@@ -392,8 +518,9 @@ fn inspect_family(
     if !accept.allows(variant) {
         return Ok(None);
     }
-    let walk = walker.run();
-    let built = build(variant, &walk);
+    let (walk, refs) = walker.run_with_refs();
+    let mut built = build(variant, &walk);
+    verify_extent(&win, &refs, &mut built);
     crate::common::log_measured(
         &win,
         variant.id(),
