@@ -178,7 +178,7 @@ transport uevent`.
 | `serial` | `307F71PHFGQL        ` | 20 chars, space padded — trim |
 | `firmware_rev` | `AGHA4101` | 8 chars |
 | `transport` | `pcie` | also `rdma`, `tcp`, `fc`, `loop`, `apple` |
-| `state` | `live` | also `new`, `resetting`, `connecting`, `deleting`, `dead` |
+| `state` | `live` | also `new`, `resetting`, `connecting`, `deleting`, `deleting (no IO)`, `dead` (sysfs.c state table) |
 | `subsysnqn` | `nqn.2017-03.jp.co.toshiba:…` | |
 | `cntrltype` | `io` | `io`/`discovery`/`admin` |
 | `reset_controller`, `rescan_controller` | write-only | **never write** |
@@ -188,9 +188,22 @@ With `CONFIG_NVME_MULTIPATH` (default on distro kernels) the realpath of
 `/sys/devices/virtual/nvme-subsystem/nvme-subsys0/nvme0n1`, and `device` then
 points at `nvme-subsys0` which carries `model`, `serial`, `subsysnqn` but **no
 `transport`**; the controllers are `nvme-subsys0/nvme0`, `nvme1`… — read
-`transport`/`state` from any child matching `nvme[0-9]*`. UNVERIFIED (layout
-recalled from kernel multipath docs; the dev box shows the non-multipath form
-`/sys/devices/pci…/nvme/nvme0/nvme0n1`).
+`transport`/`state` from any child matching `nvme[0-9]*` (each is a symlink
+to the controller: `nvme_init_subsystem()` does
+`sysfs_create_link(&subsys->dev.kobj, &ctrl->device->kobj, dev_name(ctrl->device))`;
+the subsystem device has no parent and class `nvme-subsystem`, hence the
+`/sys/devices/virtual/nvme-subsystem/` realpath; `nvme_subsys_attrs` =
+`model serial firmware_rev subsysnqn subsystype [iopolicy]`). The head is
+created only when the subsystem's CMIC bit 1 (multi-controller) is set and
+`nvme_core.multipath=Y` (or `multipath_always_on`, ≥ 6.16), so consumer
+PCIe drives keep the plain form even on multipath kernels (observed on the
+dev box: `nvme_core/parameters/multipath = Y`, yet
+`realpath /sys/block/nvme0n1` = `/sys/devices/pci…/nvme/nvme0/nvme0n1`, while
+`/sys/class/nvme-subsystem/nvme-subsys0/nvme0` → the controller exists).
+Per-path disks `nvme<C>c<X>n<N>` under the controller carry
+`GENHD_FL_HIDDEN` (`hidden=1`) and **do** appear in `/sys/block` — the
+`hidden` skip in §3.1 drops them. Verified against
+drivers/nvme/host/{core.c,multipath.c,sysfs.c}.
 
 **MMC/SD card (mmcblk<N>)**
 `/sys/block/mmcblk0/device` → `/sys/devices/.../mmc_host/mmc0/mmc0:<rca>/`.
@@ -248,8 +261,9 @@ usb_interface attributes: `bInterfaceClass` (`08` = mass storage),
 has no model; udev uses `ATTRS{serial}` when the hypervisor sets one.
 
 **Virtual devices**: realpath starts with `/sys/devices/virtual/block/`
-for `loop*`, `dm-*`, `md*`, `zram*`, `nbd*`, `ram*`, `nvme-subsystem`
-multipath heads (UNVERIFIED for the last). `/sys/block/loop0/loop/backing_file`
+for `loop*`, `dm-*`, `md*`, `zram*`, `nbd*`, `ram*`. NVMe multipath heads
+live under `/sys/devices/virtual/nvme-subsystem/` (not `.../virtual/block/`)
+and are real hardware — see §2.4 ordering. `/sys/block/loop0/loop/backing_file`
 is absent (dir missing) for unbound loops.
 
 ### 2.4 Transport detection from the realpath
@@ -259,10 +273,11 @@ wins:
 
 | Substring | Transport | Note |
 |---|---|---|
-| `/devices/virtual/` | `Virtual` | then refine by name prefix (`loop`, `dm-`, `md`, `zram`, `nbd`, `ram`) |
+| `/nvme-subsystem/` | `Nvme` | **must precede the `/devices/virtual/` test**: multipath heads resolve to `/sys/devices/virtual/nvme-subsystem/nvme-subsysN/nvmeNnM` and would otherwise be misclassified as `Virtual` |
+| `/devices/virtual/block/` | `Virtual` | then refine by name prefix (`loop`, `dm-`, `md`, `zram`, `nbd`, `ram`) |
 | `/usb` followed by digit, i.e. regex `/usb[0-9]+/` | `Usb` | present for anything behind a USB host; check *before* `/ata` because a USB disk is still a SCSI device |
 | `/ata[0-9]+/` | `Ata` (libata: SATA/PATA) | |
-| `/nvme/` or `/nvme-subsystem/` | `Nvme` | |
+| `/nvme/` | `Nvme` | |
 | `/mmc_host/` | `Mmc` | |
 | `/virtio[0-9]+/` | `Virtio` | |
 | `/ccw/` | `Ccw` (s390 DASD) | treat as `Unknown` |
@@ -288,7 +303,7 @@ others), e.g. `/run/udev/data/b259:0`. Text, one record per line:
 | `Q:` | current tag | `Q:systemd` |
 | `I:` | `USEC_INITIALIZED` (µs since boot) | `I:3000006` |
 | `V:` | db format version | `V:1` |
-| `W:` | inotify watch handle | |
+| `W:` | deprecated (was the inotify watch handle); ignore (`sd-device.c` `handle_db_line`: `case 'W': /* Deprecated. */ return 0;`) | |
 
 Source: systemd `src/libsystemd/sd-device/device-private.c`. The file only
 exists after udev has processed the device; on a system without systemd-udev
@@ -297,7 +312,7 @@ no privileges (`/run/udev/data` is world-readable). Properties that matter:
 
 | Key | Set by | Meaning |
 |---|---|---|
-| `ID_BUS` | `ata_id` → `ata`; `usb_id` → `usb`; `scsi_id` → `scsi`; `nvme` rules → (absent, use `ID_NSID`) | transport as udev saw it |
+| `ID_BUS` | `ata_id` → `ata`; `usb_id` → `usb` **only if `ID_BUS` is still unset**; `scsi_id` → `scsi`; `nvme` rules → (absent, use `ID_NSID`) | transport as udev saw it. On a non-removable USB disk whose bridge supports SAT, `ata_id` runs first (rule below) and wins: `ID_BUS=ata`, `ID_SERIAL=MODEL_SERIAL`, and the by-id link is `ata-…`; `usb_id` (always imported for USB, `IMPORT{builtin}="usb_id"`) then adds only the `ID_USB_*` keys (`udev-builtin-usb_id.c`: legacy `ID_BUS/ID_MODEL/ID_SERIAL/ID_VENDOR/ID_REVISION/ID_TYPE/ID_INSTANCE` are added only when `ID_BUS` is absent). So **do not** require `ID_BUS=usb` to recognise a USB disk; use sysfs transport. |
 | `ID_SERIAL` | `ata_id`: `MODEL_SERIAL` (or just `MODEL` if no serial); `usb_id`: `VENDOR_MODEL_SERIAL-INSTANCE` where INSTANCE is `target:lun`, e.g. `SanDisk_Cruzer_4C530001…-0:0`; nvme rules: `MODEL_SERIAL` (+`_NSID` variant); mmc rules: `$attr{serial}` | the string used in `by-id` names |
 | `ID_SERIAL_SHORT` | the bare serial | |
 | `ID_MODEL`, `ID_VENDOR`, `ID_REVISION` | | |
@@ -306,7 +321,7 @@ no privileges (`/run/udev/data` is world-readable). Properties that matter:
 | `ID_USB_VENDOR_ID`, `ID_USB_MODEL_ID` | hex | from `idVendor`/`idProduct` |
 | `ID_USB_SERIAL`, `ID_USB_SERIAL_SHORT` | | USB string descriptor serial; `usb_id` drops it if it contains bytes < 0x20, > 0x7f or `,` |
 | `ID_USB_TYPE` / `ID_TYPE` | `disk`, `cd`, `floppy`, `generic` | from SCSI type |
-| `ID_ATA_ROTATION_RATE_RPM` | `ata_id` from IDENTIFY word 217 | present only when the drive reports it; value `0` for non-rotating (word 217 == 1), else the RPM. UNVERIFIED (exact `=0` mapping recalled from ata_id.c, not re-read). |
+| `ID_ATA_ROTATION_RATE_RPM` | `ata_id` from IDENTIFY word 217 | present only when the drive reports it: word `0x0001` → `=0` (non-rotating), `0x0401`–`0xFFFE` → `=<rpm>`, any other value → key omitted (ata_id.c: `if (word == 0x0001) printf("ID_ATA_ROTATION_RATE_RPM=0\n"); else if (word >= 0x0401 && word <= 0xfffe) printf("…=%d\n", word);`). ata_id obtains IDENTIFY via SG_IO ATA PASS-THROUGH (12-byte `0xa1` for ATA, 16-byte `0x85` for ATAPI) and falls back to `HDIO_GET_IDENTITY`. |
 | `ID_ATA_SATA`, `ID_ATA_SATA_SIGNAL_RATE_GEN1/2` | `1` | |
 | `ID_WWN`, `ID_WWN_WITH_EXTENSION` | `0x5000c500…` / `eui.…` for nvme | |
 | `ID_PATH`, `ID_PATH_TAG` | `pci-0000:21:00.0-nvme-1`, `pci-0000:00:14.0-usb-0:3:1.0-scsi-0:0:0:0` | physical path; stable across re-plug *into the same port* |
@@ -315,6 +330,8 @@ no privileges (`/run/udev/data` is world-readable). Properties that matter:
 
 Important for USB: rule
 `KERNEL=="sd*[!0-9]|sr*", ENV{ID_SERIAL}!="?*", ATTR{removable}=="0", SUBSYSTEMS=="usb", IMPORT{program}="ata_id --export $devnode"`
+(verified verbatim in the local systemd 259 `60-persistent-storage.rules`,
+followed by the unconditional `KERNEL=="sd*[!0-9]|sr*", SUBSYSTEMS=="usb", IMPORT{builtin}="usb_id"`)
 means udev already tried ATA IDENTIFY through the bridge (SAT) for
 **non-removable** USB disks; if `ID_ATA_ROTATION_RATE_RPM` is in the db, the
 bridge supports pass-through and the value is authoritative for HDD vs SSD.
@@ -329,7 +346,7 @@ db; the in-process parser above avoids the C dependency.
 | Pattern | Transport | Composition |
 |---|---|---|
 | `ata-<ID_SERIAL>` | SATA/PATA via libata | `MODEL_SERIAL` with spaces → `_` |
-| `usb-<ID_USB_SERIAL>` and `usb-<ID_SERIAL>` | USB | `VENDOR_MODEL_SERIAL-0:0`; also `wwn-…` if `ID_WWN_WITH_EXTENSION` present |
+| `usb-<ID_USB_SERIAL>` (always, rule `ENV{ID_USB_SERIAL}=="?*"`) and `<ID_BUS>-<ID_SERIAL>` (rule `SYMLINK+="disk/by-id/$env{ID_BUS}-$env{ID_SERIAL}"`, i.e. `usb-…`, or `ata-MODEL_SERIAL` when `ata_id` succeeded through the bridge) | USB | `VENDOR_MODEL_SERIAL-0:0`; also `wwn-…` if `ID_WWN_WITH_EXTENSION` present |
 | `nvme-<MODEL>_<SERIAL>`, `nvme-<MODEL>_<SERIAL>_<NSID>`, `nvme-eui.<hex>` / `nvme-nguid.<hex>` / `nvme-uuid.<hex>` | NVMe | observed: `nvme-KXG60ZNV1T02_KIOXIA_307F71PHFGQL`, `…_1`, `nvme-eui.00000000000000018ce38e05002143c9` |
 | `mmc-<NAME>_<SERIAL>` | SD/MMC | e.g. `mmc-SL32G_0x1b2c3d4e` |
 | `scsi-<scsi_id>` | SAS/FC/RAID | `scsi-3<naa>`, `scsi-S<vendor>_<model>_<serial>`, `scsi-1<t10>` |
@@ -360,20 +377,34 @@ two identical serial-less sticks collide; `by-path` disambiguates by port.
 | 0–1 | type / page code `0xB1` |
 | 2–3 | page length (`0x003C`) |
 | 4–5 | **medium rotation rate**, big-endian: `0x0000` not reported, `0x0001` non-rotating (SSD), `0x0401`–`0xFFFE` RPM |
-| 6 | product type (0 not indicated, 1 CFast, 2 CompactFlash, 3 memory stick, 4 MMC, 5 SD, 6 XQD, 7 Universal Flash) |
-| 7 | bits 7:6 WABEREQ, 5:4 WACEREQ, 3:0 nominal form factor (`1` 5.25", `2` 3.5", `3` 2.5", `4` 1.8", `5` < 1.8") |
-| 8 | bits 5:4 ZONED (sd.c: `(data[8] >> 4) & 3`; 1 = host-aware, 2 = host-managed via ZBC) |
+| 6 | product type (0 not indicated, 1 CFast, 2 CompactFlash, 3 MemoryStick, 4 MultiMediaCard, 5 SD card, 6 XQD, 7 Universal Flash Storage card; ≥ 0xF0 vendor specific) — sg3_utils `product_type_arr[]` |
+| 7 | bits 7:6 WABEREQ, 5:4 WACEREQ, 3:0 nominal form factor (`0` not reported, `1` 5.25", `2` 3.5", `3` 2.5", `4` 1.8", `5` < 1.8") — sg3_utils `decode_block_dev_ch_vpd()` |
+| 8 | bit 6 MACT, bits 5:4 ZONED (sd.c: `(data[8] >> 4) & 3`; 1 = host-aware, 2 = host-managed via ZBC), bit 2 RBWZ, bit 1 FUAB, bit 0 VBULS; sg3_utils requires page length ≥ 64 bytes total to decode |
 
-sd.c: `if (!vpd || vpd->len <= 8) return;` then
-`rot = get_unaligned_be16(&vpd->data[4]); if (rot == 1) → non-rotational`.
-So a bridge that drops the page leaves `rotational=1`.
+sd.c `sd_read_block_characteristics()`: `if (!vpd || vpd->len <= 8) return;` then
+`rot = get_unaligned_be16(&vpd->data[4]); if (rot == 1) → lim->features &= ~(BLK_FEAT_ROTATIONAL | BLK_FEAT_ADD_RANDOM)`
+and `sdkp->zoned = (vpd->data[8] >> 4) & 3`.
+So a bridge that drops the page leaves `rotational=1`. Rotation-rate
+value ranges per SBC-4 / sg3_utils `decode_block_dev_ch_vpd()`: `0x0000` not
+reported, `0x0001` non-rotating, `0x0002`–`0x0400` and `0xFFFF` reserved,
+`0x0401`–`0xFFFE` RPM. libata synthesises this page for SATA disks
+(`ata_scsiop_inq_b1`: `rbuf[3] = 0x3c`, bytes 4–5 from word 217, byte 7 form
+factor, byte 8 = zoned << 4).
 
 **ATA IDENTIFY DEVICE (512 bytes, 256 little-endian 16-bit words; strings are
 byte-swapped within each word)** — obtained via `HDIO_GET_IDENTITY`
-(`0x030d`, arg = 512-byte buffer; libata serves it without a capability
-check — UNVERIFIED) or SG_IO ATA PASS-THROUGH (needs `CAP_SYS_RAWIO` on a
-read-only open; ATA_12/ATA_16 are not in the read-safe command list of
-`scsi_cmd_allowed()` — their presence in the write list is UNVERIFIED):
+(`0x030d`, arg = 512-byte buffer; libata serves it **without any capability
+check**: `ata_sas_scsi_ioctl()` → `case HDIO_GET_IDENTITY: return ata_get_identity(ap, scsidev, arg);`
+copies `dev->id` (256 words, host-endian) and returns `ENOMSG` when no ATA
+device is attached; only `HDIO_DRIVE_CMD`/`HDIO_DRIVE_TASK` check
+`capable(CAP_SYS_ADMIN) && capable(CAP_SYS_RAWIO)`. The call reaches libata
+through `sd_ioctl` → `scsi_ioctl` → `hostt->ioctl`, so it is `-ENODEV` while
+the device is in error recovery/offline, `-EINVAL` on hosts with no `ioctl`
+op (usb-storage, uas) and `-ENOTTY` on NVMe) or SG_IO ATA PASS-THROUGH
+(`ATA_12` `0xa1` / `ATA_16` `0x85` appear in **neither** list of
+`scsi_cmd_allowed()` — not the read-safe list and not the `open_for_write`
+list — so `sg_io()` returns `EPERM` without `CAP_SYS_RAWIO` on any open mode,
+read-only or read-write; verified in drivers/scsi/scsi_ioctl.c):
 
 | Words | Field |
 |---|---|
@@ -437,7 +468,13 @@ Numeric values: `_IO(0x12, n)` = `0x1200 | n`; `_IOR(0x12, n, size_t)` =
 | `BLKFLSBUF` | `0x1261` | — | drops page cache for the bdev | `CAP_SYS_ADMIN`, returns `EACCES` otherwise — **not used** |
 | `BLKRRPART` | `0x125F` | — | re-read partition table | `CAP_SYS_ADMIN` — **not used** (fails with `EBUSY` when mounted anyway) |
 | `HDIO_GETGEO` | `0x0301` | `struct hd_geometry` | fake CHS | not needed |
-| `HDIO_GET_IDENTITY` | `0x030d` | 512 bytes | ATA IDENTIFY (libata, SATA only; `EINVAL`/`ENOTTY` on NVMe/USB) | none (UNVERIFIED) |
+| `HDIO_GET_IDENTITY` | `0x030d` | 512 bytes | ATA IDENTIFY (libata, SATA only; `EINVAL` on usb-storage/uas, `ENOTTY` on NVMe, `ENOMSG` if libata has no device) | none (libata-scsi.c `ata_sas_scsi_ioctl`) |
+
+All values above were checked against `/usr/include/linux/fs.h` and
+`/usr/include/linux/hdreg.h` on the dev box (`BLKGETDISKSEQ _IOR(0x12,128,__u64)`,
+`BLKGETSIZE64 _IOR(0x12,114,size_t)`). The `libc` crate 0.2.190 exports only
+`BLKSSZGET`, `BLKPBSZGET`, `BLKIOMIN`, `BLKIOOPT` of these (see §6) — define
+the rest locally.
 
 On a **regular file** opened as a source (an existing image), every `BLK*`
 ioctl fails with `ENOTTY`; use `fstat().st_size` and assume 512-byte logical
@@ -447,8 +484,10 @@ sectors unless the user overrides (imaging spec `--sector-size`).
 
 Socket: `socket(AF_NETLINK, SOCK_RAW | SOCK_CLOEXEC | SOCK_NONBLOCK, 15)`,
 `bind` with `sockaddr_nl { nl_family: AF_NETLINK, nl_pid: 0, nl_groups: 1 }`.
-Group **1** = raw kernel uevents (no privileges needed to listen on modern
-kernels; `EPERM` on bind in some containers → fall back to polling). Group
+Group **1** = raw kernel uevents (no privileges needed: `uevent_net_init`
+registers the family with `.groups = 1, .flags = NL_CFG_F_NONROOT_RECV`, and
+`kobject_uevent_env` broadcasts with `netlink_broadcast(uevent_sock, skb, 0, 1, …)`;
+`EPERM` on bind in some containers/user namespaces → fall back to polling). Group
 **2** = udev's post-processing broadcast (what `udevadm monitor -u` shows),
 messages carry a 40-byte header: `char prefix[8] = "libudev\0"`,
 `u32 magic = htonl(0xfeedcafe)`, `u32 header_size`, `u32 properties_off`,
@@ -457,7 +496,10 @@ messages carry a 40-byte header: `char prefix[8] = "libudev\0"`,
 `properties_off`.
 
 Kernel (group 1) message = one datagram, **no `nlmsghdr`**, ≤ 2048 bytes
-(`UEVENT_BUFFER_SIZE`):
+(`UEVENT_BUFFER_SIZE`, `include/linux/kobject.h`; at most `UEVENT_NUM_ENVP` =
+64 variables; header built as `sprintf(scratch, "%s@%s", action_string, devpath)`,
+`SEQNUM=%llu` is appended last, `SYNTH_UUID=` only for uevents triggered by a
+write to a sysfs `uevent` file):
 
 ```
 "<action>@<devpath>\0" "ACTION=<action>\0" "DEVPATH=<devpath>\0" "SUBSYSTEM=block\0"
@@ -486,7 +528,7 @@ is in `PATH`; it needs root (SG_IO/NVMe admin pass-through). Parse with
 
 | JSON path | Type | Use |
 |---|---|---|
-| `smartctl.exit_status` | int | bit 0 cmdline error, bit 1 device open failed, bit 2 command failed, **bit 3 DISK FAILING**, bit 4 prefail attribute ≤ threshold, bit 5 attribute was ≤ threshold in the past, bit 6 error log has errors, bit 7 self-test log has errors. UNVERIFIED (from smartctl(8) memory). |
+| `smartctl.exit_status` | int | bit 0 command line did not parse, bit 1 device open failed / no IDENTIFY DEVICE structure / device in low-power mode, bit 2 some SMART or other ATA command failed or SMART data checksum error, **bit 3 SMART status check returned "DISK FAILING"**, bit 4 prefail attributes ≤ threshold, bit 5 DISK OK but some usage/prefail attribute was ≤ threshold in the past, bit 6 device error log contains records of errors, bit 7 self-test log contains records of errors (smartctl(8) RETURN VALUES, smartmontools 7.4). |
 | `smartctl.messages[].{string,severity}` | | show to user |
 | `device.{name,info_name,type,protocol}` | | `type`: `sat`, `ata`, `nvme`, `scsi`, `usbjmicron`…; `protocol`: `ATA`/`NVMe`/`SCSI` |
 | `model_name`, `serial_number`, `firmware_version` | string | cross-check identity |
@@ -515,7 +557,9 @@ NULL, NULL, DIGCF_PRESENT|DIGCF_DEVICEINTERFACE)` +
 `SetupDiEnumDeviceInterfaces` + `SetupDiGetDeviceInterfaceDetailW` to get
 `\\?\scsi#disk&ven_…` paths, then `IOCTL_STORAGE_GET_DEVICE_NUMBER` to learn
 `DeviceNumber` N. `GUID_DEVINTERFACE_DISK = {53F56307-B6BF-11D0-94F2-00A0C91EFB8B}`
-(UNVERIFIED, from memory of ntddstor.h).
+(windows-sys 0.61.2 `Win32::System::Ioctl::GUID_DEVINTERFACE_DISK =
+GUID::from_u128(0x53f56307_b6bf_11d0_94f2_00a0c91efb8b)` — note it lives in
+the `Ioctl` module, not in `DeviceAndDriverInstallation`).
 
 **IOCTL codes** (`CTL_CODE(DeviceType, Function, Method, Access)` =
 `(DeviceType << 16) | (Access << 14) | (Function << 2) | Method`;
@@ -527,7 +571,8 @@ NULL, NULL, DIGCF_PRESENT|DIGCF_DEVICEINTERFACE)` +
 | `IOCTL_STORAGE_GET_DEVICE_NUMBER` | `0x002D1080` (2953344) | `FILE_ANY_ACCESS` | out `STORAGE_DEVICE_NUMBER { DeviceType: u32, DeviceNumber: u32, PartitionNumber: u32 }` |
 | `IOCTL_DISK_GET_DRIVE_GEOMETRY_EX` | `0x000700A0` (458912) | `FILE_ANY_ACCESS` | out `DISK_GEOMETRY_EX` (variable; pass ≥ 256 bytes) |
 | `IOCTL_DISK_GET_LENGTH_INFO` | `0x0007405C` (475228) | **`FILE_READ_ACCESS`** → handle must have `GENERIC_READ` → elevation | out `GET_LENGTH_INFORMATION { Length: i64 }` |
-| `IOCTL_DISK_GET_DRIVE_LAYOUT_EX` | `0x00070050` | `FILE_ANY_ACCESS` | partition table as Windows sees it (UNVERIFIED value) |
+| `IOCTL_DISK_GET_DRIVE_LAYOUT_EX` | `0x00070050` (458832) | `FILE_ANY_ACCESS` | partition table as Windows sees it (`CTL_CODE(IOCTL_DISK_BASE, 0x14, METHOD_BUFFERED, FILE_ANY_ACCESS)`; windows-sys 0.61.2 `= 458832`) |
+| `IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS` | `0x00560000` (5636096) | `FILE_ANY_ACCESS` | on a volume handle (`\\.\C:`): `VOLUME_DISK_EXTENTS { NumberOfDiskExtents: u32, Extents: [DISK_EXTENT { DiskNumber: u32, StartingOffset: i64, ExtentLength: i64 }] }`; `ERROR_MORE_DATA (234)` → re-query with a bigger buffer (windows-sys 0.61.2 `= 5636096`) |
 
 `STORAGE_PROPERTY_QUERY { PropertyId: u32, QueryType: u32 (PropertyStandardQuery = 0, PropertyExistsQuery = 1), AdditionalParameters: [u8; 1] }`.
 
@@ -540,9 +585,9 @@ NULL, NULL, DIGCF_PRESENT|DIGCF_DEVICEINTERFACE)` +
 `StorageDeviceTemperatureProperty = 52`.
 
 `STORAGE_DEVICE_DESCRIPTOR` (response to `StorageDeviceProperty`; query
-once with a 12-byte `STORAGE_DESCRIPTOR_HEADER { Version: u32, Size: u32 }`
-buffer — actually pass the header struct and read `Size` — then re-query with
-`Size` bytes):
+once with an **8-byte** `STORAGE_DESCRIPTOR_HEADER { Version: u32, Size: u32 }`
+as the output buffer, read `Size`, then re-query with `Size` bytes — the
+Microsoft remarks on `STORAGE_DEVICE_DESCRIPTOR` prescribe exactly this):
 
 | Offset | Type | Field |
 |---|---|---|
@@ -563,15 +608,20 @@ buffer — actually pass the header struct and read `Size` — then re-query wit
 `STORAGE_BUS_TYPE`: `Unknown 0, Scsi 1, Atapi 2, Ata 3, 1394 4, Ssa 5,
 Fibre 6, **Usb 7**, RAID 8, iScsi 9, Sas 10, **Sata 11**, **Sd 12**,
 **Mmc 13**, Virtual 14, FileBackedVirtual 15, Spaces 16, **Nvme 17**, SCM 18,
-Ufs 19, Nvmeof 20, Max 21, MaxReserved 0x7F`.
+Ufs 19, Nvmeof 20, Max 21, MaxReserved 0x7F` (current winioctl.h per Microsoft
+Learn). **windows-sys 0.61.2 is generated from an older header**: it has no
+`BusTypeNvmeof` and defines `BusTypeMax = 20`; the enum is in
+`Win32::Storage::FileSystem::STORAGE_BUS_TYPE` (= `i32`), not in `Ioctl`.
 
 Serial strings from this descriptor are frequently **byte-swapped pairs** for
 ATA (`"3W2K1FDS"` for `W32KF1SD`) and may be hex-encoded for USB; normalise
 by trimming and, for `BusTypeAta/Sata`, un-swapping when the string looks
 like swapped ATA (UNVERIFIED heuristic — some drivers already fix it).
 
-`DEVICE_SEEK_PENALTY_DESCRIPTOR { Version: u32, Size: u32, IncursSeekPenalty: u8 }`
-(Windows 7+): `IncursSeekPenalty != 0` → rotational. Returns
+`DEVICE_SEEK_PENALTY_DESCRIPTOR { Version: u32, Size: u32, IncursSeekPenalty: BOOLEAN }`
+(Windows 7+; windows-sys 0.61.2 types `BOOLEAN` fields — `IncursSeekPenalty`,
+`RemovableMedia`, `CommandQueueing` — as Rust `bool`; when parsing raw byte
+blobs read them as `u8`): `IncursSeekPenalty != 0` → rotational. Returns
 `ERROR_INVALID_FUNCTION (1)` / `ERROR_NOT_SUPPORTED (50)` for devices that
 don't answer (many USB bridges) → unknown, not HDD.
 
@@ -589,7 +639,12 @@ works with `dwDesiredAccess = 0` (unlike `GET_LENGTH_INFO`); `MediaType`
 `OPEN_EXISTING`, `FILE_FLAG_NO_BUFFERING (0x20000000) | FILE_FLAG_SEQUENTIAL_SCAN`.
 Opening a physical drive with `GENERIC_READ` requires an elevated
 (administrator) token since Vista; `ERROR_ACCESS_DENIED (5)` → tell the user
-to re-run elevated. UNVERIFIED (behaviour well known, not re-read from docs).
+to re-run elevated. Source: CreateFileA, "Physical Disks and Volumes":
+"Direct access to the disk or to a volume is restricted … The caller must
+have administrative privileges … The dwCreationDisposition parameter must
+have the OPEN_EXISTING flag … The dwDesiredAccess parameter can be zero,
+allowing the application to query device attributes without accessing a
+device"; Windows XP/Server 2003 are listed as not restricted.
 Requirements with `FILE_FLAG_NO_BUFFERING` (and for device handles always):
 offset and length multiples of the **logical** sector size; buffer address
 aligned to the **physical** sector size (use `VirtualAlloc`, page aligned).
@@ -613,7 +668,16 @@ StorageAccessAlignmentProperty, PropertyStandardQuery, BusTypeUsb,
 BusTypeNvme, BusTypeSata, BusTypeSd, BusTypeMmc}`;
 `Win32::Foundation::{INVALID_HANDLE_VALUE, GetLastError, CloseHandle, GENERIC_READ}`;
 `Win32::Devices::DeviceAndDriverInstallation::SetupDi*` (feature
-`Win32_Devices_DeviceAndDriverInstallation`). Cargo features:
+`Win32_Devices_DeviceAndDriverInstallation`); `GUID_DEVINTERFACE_DISK` and
+`VOLUME_DISK_EXTENTS`/`DISK_EXTENT` are in `Win32::System::Ioctl`;
+`STORAGE_BUS_TYPE` and the `BusType*` constants are in
+`Win32::Storage::FileSystem`. Numeric constants confirmed from the crate
+source: `FILE_FLAG_NO_BUFFERING = 0x20000000`, `FILE_FLAG_SEQUENTIAL_SCAN =
+0x08000000`, `GENERIC_READ = 0x80000000`, `FILE_GENERIC_READ = 0x120089`,
+`ERROR_FILE_NOT_FOUND 2`, `ERROR_ACCESS_DENIED 5`, `ERROR_NOT_READY 21`,
+`ERROR_CRC 23`, `ERROR_SECTOR_NOT_FOUND 27`, `ERROR_NOT_SUPPORTED 50`,
+`ERROR_NO_MEDIA_IN_DRIVE 1112`, `ERROR_IO_DEVICE 1117`,
+`ERROR_DEVICE_NOT_CONNECTED 1167`, `RemovableMedia 11`, `FixedMedia 12`. Cargo features:
 `Win32_Foundation`, `Win32_Storage_FileSystem`, `Win32_System_IO`,
 `Win32_System_Ioctl`, `Win32_Devices_DeviceAndDriverInstallation`,
 `Win32_System_Memory` (VirtualAlloc).
@@ -635,11 +699,24 @@ BusTypeNvme, BusTypeSata, BusTypeSd, BusTypeMmc}`;
   `Apple Fabric`), `VirtualOrPhysical` (`Physical`/`Virtual`), `WholeDisk`
   (bool), `IORegistryEntryName`, `Content` (`GUID_partition_scheme`,
   `FDisk_partition_scheme`), `SMARTStatus` (`Verified`/`Not Supported`),
-  `MediaType` (`Generic`). UNVERIFIED: exact plist key spellings were taken
-  from secondary sources; `diskutil list -plist` gives `AllDisksAndPartitions`.
+  `MediaType` (`Generic`). Key spellings confirmed from two plist-consuming
+  programs (munkireport `disk_report/scripts/disk_info`, Go `mountefi/disk`):
+  `DeviceIdentifier`, `DeviceNode`, `WholeDisk`, `ParentWholeDisk`, `Content`,
+  `MountPoint`, `FilesystemName`, `FilesystemType`, `VolumeName`, `VolumeUUID`,
+  `DiskUUID`, `BusProtocol`, `SolidState`, `Internal`, `Ejectable`,
+  `SMARTStatus`, `TotalSize`, `FreeSpace`; `diskutil list -plist` gives
+  `AllDisksAndPartitions` (each with `Partitions`/`APFSVolumes`), `AllDisks`,
+  `WholeDisks`, `VolumesFromDisks`. UNVERIFIED (no primary source found):
+  `MediaName`, `DeviceBlockSize`, `Size`, `Removable`/`RemovableMedia`,
+  `VirtualOrPhysical`, `IORegistryEntryName`, `MediaType` — treat as optional
+  and fall back to `DKIOCGETBLOCKSIZE`/`DKIOCGETBLOCKCOUNT` for sector data.
 - `ioctl(fd, DKIOCGETBLOCKSIZE, &u32)` and `DKIOCGETBLOCKCOUNT (&u64)` from
-  `<sys/disk.h>` give the sector size and count without `diskutil`. UNVERIFIED
-  constants; use the `libc` crate's definitions if present.
+  `<sys/disk.h>` give the sector size and count without `diskutil`. xnu
+  `bsd/sys/disk.h`: `DKIOCGETBLOCKSIZE = _IOR('d', 24, uint32_t)` =
+  `0x40046418`, `DKIOCGETBLOCKCOUNT = _IOR('d', 25, uint64_t)` = `0x40086419`,
+  `DKIOCGETPHYSICALBLOCKSIZE = _IOR('d', 77, uint32_t)` = `0x4004644D`
+  (`_IOR` = `0x40000000 | (sizeof << 16) | ('d' << 8) | n`). The `libc` crate
+  0.2.190 does **not** export these; define them locally.
 
 ---
 
@@ -848,8 +925,10 @@ matched, and the instruction "choose an output directory on a different
 disk". If `mounts_for(src)` is non-empty but the output is elsewhere: print
 each hit, say that a mounted source may give inconsistent reads and
 that the mounting filesystem may *write* (journal replay, atime, fsck) and
-recommend `umount` (never do it for the user; ddrescue manual: "Never try to
-rescue a r/w mounted partition... not even read-only"). Proceed only with
+recommend `umount` (never do it for the user; ddrescue manual, verbatim:
+"Never try to rescue a r/w mounted partition. The resulting copy may be
+useless." and "It is best that the device or partition to be rescued is not
+mounted at all, not even read-only."). Proceed only with
 `--i-know-its-mounted`.
 
 Additional pre-flight: if `udisksd` is running (`/run/udisks2` exists or
@@ -864,12 +943,14 @@ fn open_source(devnode) -> OpenedDevice:
     flags = O_RDONLY | O_CLOEXEC | O_NOCTTY | O_NONBLOCK?   # O_NONBLOCK is ignored for block devices; omit
     fd = open(devnode, O_RDONLY | O_CLOEXEC | O_DIRECT)
     mode = Direct
-    if fd == Err(EINVAL):                 # O_DIRECT unsupported: tmpfs < 6.6, some FUSE, 9p, overlay
+    if fd == Err(EINVAL):                 # O_DIRECT unsupported: regular files on tmpfs < 6.6, some FUSE, 9p, overlay (never for a block device)
         fd = open(devnode, O_RDONLY | O_CLOEXEC); mode = Buffered
         warn("direct I/O unavailable on {devnode}; the kernel page cache may mask errors — use posix_fadvise DONTNEED between passes")
     if fd == Err(EACCES|EPERM): return Err(NeedPrivilege(explain_permissions(devnode)))
     if fd == Err(ENXIO|ENODEV|ENOENT): return Err(Gone)
-    if fd == Err(EBUSY): return Err(ExclusivelyHeld)    # O_EXCL holder (mounted + O_EXCL writers): we never pass O_EXCL ourselves
+    if fd == Err(EBUSY): return Err(ExclusivelyHeld)    # defensive only: block/bdev.c never returns EBUSY for a non-exclusive O_RDONLY open
+                                                         # (bd_prepare_to_claim runs only with BLK_OPEN_EXCL; bdev_may_open rejects only writers);
+                                                         # a mounted or O_EXCL-held disk still opens read-only
     if fd == Err(ENOMEDIUM): return Err(NoMedia)        # sr / card reader without card
     st = fstat(fd)
     if S_ISBLK(st.st_mode):
@@ -888,8 +969,10 @@ fn open_source(devnode) -> OpenedDevice:
 Rules for `pread` under `Direct`:
 
 - `offset % lbs == 0`, `len % lbs == 0`, `buf as usize % align == 0`;
-  otherwise `EINVAL` (block/fops.c `blkdev_dio_invalid`: checks
-  `(pos | count) & (lbs - 1)`). The last partial sector of a device whose
+  otherwise `EINVAL` (block/fops.c `blkdev_dio_invalid`: returns
+  `(iocb->ki_pos | iov_iter_count(iter)) & (bdev_logical_block_size(bdev) - 1)`;
+  the user-buffer address is checked separately against
+  `queue/dma_alignment` by `blkdev_iov_iter_get_pages`). The last partial sector of a device whose
   size is not a multiple of `lbs` cannot exist (sizes are sector multiples);
   for regular-file sources round the final read up to `lbs` and truncate the
   result to `size - offset`.
@@ -939,7 +1022,11 @@ fn watch(dev: &DeviceInfo) -> LivenessEvents:
 on read error:
     EIO:            media/link error, device still present -> imaging engine retry logic
     0 bytes (short) before size: capacity was set to 0 by del_gendisk -> check sysfs -> Removed
-    ENXIO, ENODEV:  gone (ENODEV seen from some drivers — UNVERIFIED which; treat both as Removed)
+    ENXIO:          open() of a dead/absent disk (block/bdev.c: `if (!disk_live(disk)) ret = -ENXIO`)
+    ENODEV:         ioctls routed through the SCSI midlayer (HDIO_*, SG_IO) while the sdev is in error recovery,
+                    offline or deleted (scsi_ioctl.c: `if (!scsi_block_when_processing_errors(sdev)) return -ENODEV;`);
+                    plain pread() on a dead disk yields 0 bytes (capacity 0) or EIO (bio_io_error), never ENODEV.
+                    Treat ENXIO and ENODEV both as Removed; the per-driver survey beyond SCSI/bdev is UNVERIFIED
     ENOMEDIUM:      media ejected (sr, card reader)
     ETIMEDOUT:      not returned by the block layer; timeouts surface as EIO after `device/timeout` × retries
 ```
@@ -975,7 +1062,7 @@ for n in 0..64:
 open for imaging: CreateFileW(path, GENERIC_READ, SHARE_READ|SHARE_WRITE, null, OPEN_EXISTING, FILE_FLAG_NO_BUFFERING|FILE_FLAG_SEQUENTIAL_SCAN, null)
     on ERROR_ACCESS_DENIED(5): NeedPrivilege("run as administrator")
 output guard: GetVolumePathNameW(out_dir) -> volume root -> CreateFileW(r"\\.\C:", 0, ..) -> IOCTL_STORAGE_GET_DEVICE_NUMBER -> DeviceNumber == n ? Refuse
-             (also IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS for spanned/striped volumes: any extent DiskNumber == n ? Refuse — UNVERIFIED code value 0x00560000)
+             (also IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS = 0x00560000 for spanned/striped volumes: any extent DiskNumber == n ? Refuse)
 ```
 
 ---
@@ -1002,7 +1089,8 @@ output guard: GetVolumePathNameW(out_dir) -> volume root -> CreateFileW(r"\\.\C:
    after command timeouts; the disk disappears (`remove` uevent) and comes
    back with a new name (`sdb` → `sdc`) and a new `diskseq`; `devnum`
    increments; `devpath` (port) unchanged. `refind()` by serial, else by
-   `devpath` + size. Reopen; the old fd returns `0` or `EIO` forever.
+   `devpath` + size. Reopen; the old fd returns `0` (capacity set to 0 by
+`__blk_mark_disk_dead`) or `EIO` forever.
 5. **Stale page cache.** Without `O_DIRECT` a retry of a sector that errored
    may be served from the cache if an earlier read of a *larger* range
    succeeded partially; the ddrescue manual recommends `-d`. If `O_DIRECT`
@@ -1146,7 +1234,7 @@ Variants (same script with parameters, one per test case):
 | `sata_hdd` | realpath `…/ata1/host0/target0:0:0/0:0:0:0/block/sda`, vendor `ATA     `, `vpd_pgb1` rate 5400, udev `ID_BUS=ata`, `ID_SERIAL=WDC_WD10EZEX_WD-WCC6Y…` | `Hdd`, High |
 | `sata_ssd` | vpd_pgb1 rate `00 01`, `rotational=0` | `SsdSata`, High |
 | `nvme` | recorded from the dev box (`/sys/block/nvme0n1`, padded model/serial) | `SsdNvme`; model trimmed; wwid `eui.…` |
-| `nvme_multipath` | realpath under `/sys/devices/virtual/nvme-subsystem/nvme-subsys0/`, `device/` lacks `transport`, child `nvme0/transport=pcie` | `SsdNvme`; transport found via child (UNVERIFIED layout) |
+| `nvme_multipath` | realpath under `/sys/devices/virtual/nvme-subsystem/nvme-subsys0/`, `device/` lacks `transport`, child symlink `nvme0 -> ../../../pci…/nvme/nvme0` with `transport=pcie`; sibling hidden `nvme0c0n1` (`hidden=1`) | `SsdNvme`, not `Virtual`; transport found via child; hidden sibling skipped |
 | `mmc_sd` | `…/mmc_host/mmc0/mmc0:aaaa/block/mmcblk0`, `device/type=SD`, `csd` with bits 127:126 = 1 | `SdMmc{Sd, Sdhc_or_Sdxc}` |
 | `mmc_emmc` | `type=MMC`, siblings `mmcblk0boot0`, `mmcblk0rpmb` | `SdMmc{Emmc}`; boot/rpmb not candidates |
 | `optical` | `sr0`, `device/type=5`, `lbs=2048` | `Optical` |
@@ -1180,7 +1268,9 @@ when `statvfs` mock says 1 GiB), output on LVM over the source
   tmp dir), and on `tmpfs` either works (kernel ≥ 6.6) or fails with
   `EINVAL` → buffered fallback (test both by placing the image under
   `/dev/shm` when it exists; assert *a* valid mode is chosen, not which).
-  UNVERIFIED: tmpfs direct-I/O support version.
+  tmpfs gained `O_DIRECT` in Linux 6.6 (commit e88e0d366f9c "tmpfs: trivial
+  support for direct IO", Hugh Dickins, 2023-08-11); older kernels return
+  `EINVAL` from `open(2)`.
 - Alignment unit tests: `pread_aligned(off=511, len=512)` on the `Direct`
   mode must be rejected by our own precheck with `InvalidAlignment` before
   reaching the kernel; `len` not multiple of `lbs` likewise.
@@ -1220,7 +1310,7 @@ Versions are `max_stable_version` from crates.io on 2026-10-12.
 | Crate | Version | Use | Notes |
 |---|---|---|---|
 | `rustix` | 1.1.5 | `open` with `OFlags::DIRECT|CLOEXEC`, `pread`, `fstat`, `statx`, `ioctl` helpers (`rustix::ioctl::{Getter, NoArg}`), `posix_fadvise`, netlink socket (`rustix::net`) | pure Rust, no libc on Linux (`use-libc` optional). Preferred over `nix`. |
-| `libc` | 0.2.190 | constants `BLKGETSIZE64`, `BLKSSZGET`, `BLKPBSZGET`, `BLKROGET`, `major()/minor()`, `NETLINK_KOBJECT_UEVENT`, `sockaddr_nl`, `HDIO_GET_IDENTITY` | `libc` exports the `BLK*` constants on Linux; `BLKGETDISKSEQ` may be missing → define locally (`0x80081280`). UNVERIFIED which `BLK*` constants `libc` 0.2.190 exports. |
+| `libc` | 0.2.190 | `NETLINK_KOBJECT_UEVENT` (= 15), `sockaddr_nl`, `ENOMEDIUM`, `POSIX_FADV_DONTNEED`, `BLKSSZGET`/`BLKPBSZGET`/`BLKIOMIN`/`BLKIOOPT` | Checked in the crate source (`src/unix/linux_like/linux/arch/generic/mod.rs`): on Linux it exports **only** `BLKSSZGET 0x1268`, `BLKPBSZGET 0x127B`, `BLKIOMIN 0x1278`, `BLKIOOPT 0x1279`. **Not exported**: `BLKGETSIZE64`, `BLKGETDISKSEQ`, `BLKROGET`, `BLKALIGNOFF`, `BLKSECTGET`, `HDIO_GET_IDENTITY`, `HDIO_GETGEO`, and the Apple `DKIOC*` — define them locally from §2.9/§2.13 (x86_64 values; MIPS/PowerPC/SPARC use the `0x2000….` encoding). `major()`/`minor()` helpers: use `rustix::fs::{major, minor}` or glibc's `gnu_dev_major` semantics. |
 | `nix` | 0.31.3 | alternative to rustix (`nix::sys::stat`, `nix::fcntl::posix_fadvise`, `ioctl_read!` macros) | use only one of nix/rustix; rustix chosen |
 | `udev` | 0.9.3 | libudev bindings (`Enumerator`, `MonitorBuilder` for group 2 events) | **optional feature** `udev-native`; default path parses `/run/udev/data` and raw netlink in-process to avoid the C dependency and to work on musl static builds |
 | `serde` + `serde_json` | 1.0.x / 1.0.154 | `smartctl -j`, `lsblk -J` fallback, `DeviceInfo` serialisation for the report | |
@@ -1228,8 +1318,8 @@ Versions are `max_stable_version` from crates.io on 2026-10-12.
 | `windows-sys` | 0.61.2 | all Win32 calls in §2.12 | features listed in §2.12 |
 | `plist` | 1.10.1 | `diskutil info -plist` on macOS | |
 | `io-uring` | 0.7.15 | optional future: batched `pread` with per-request timeouts (`IORING_OP_READ` + `IORING_OP_LINK_TIMEOUT`) | not needed for v1 |
-| `thiserror` | 2.x | error enums (`OpenError::NeedPrivilege`, `Refusal`) | UNVERIFIED version |
-| `tempfile` (dev) | 3.x | fixture trees | UNVERIFIED version |
+| `thiserror` | 2.0.21 | error enums (`OpenError::NeedPrivilege`, `Refusal`) | |
+| `tempfile` (dev) | 3.27.0 | fixture trees | |
 
 Avoid `sysinfo`/`block-utils`: they hide the exact attribute reads this spec
 depends on and do not expose VPD or udev data.
@@ -1263,10 +1353,28 @@ Primary (fetched or inspected 2026-10-12):
 - smartctl JSON key paths as consumed by Proxmox (`pve-storage` patch) — https://lists.proxmox.com/pipermail/pve-devel/2021-May/048155.html
 - crates.io API for crate versions (nix, rustix, libc, udev, windows-sys, plist, serde_json, io-uring, memmap2)
 
-Secondary / recalled (tagged UNVERIFIED in text):
+Verified in the 2026-10-12 fact-check pass (sources used, all primary unless noted):
 
-- macOS `diskutil info -plist` keys — https://dev.to/kishanbsh/getting-hard-disk-info-in-mac-using-terminal-2fn5
-- SBC-4 VPD page B1 byte layout beyond bytes 4–5 and 8 (product type, form factor) — from T10 SBC-4 memory; cross-checked only for bytes 4–5/8 via sd.c
-- ATA/ACS IDENTIFY word map (10–19, 23–26, 27–46, 106, 108–111, 117–118, 217) — confirmed by ata_id.c summary
-- smartctl exit-status bits — smartctl(8) memory
-- `GUID_DEVINTERFACE_DISK`, Windows elevation requirement for `GENERIC_READ` on `\\.\PhysicalDriveN`, `IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS` value — memory of ntddstor.h / winioctl.h
+- Linux `drivers/ata/libata-scsi.c` (`ata_sas_scsi_ioctl` HDIO_GET_IDENTITY without capability check, `ata_scsiop_inq_80`/`_b1`) — https://raw.githubusercontent.com/torvalds/linux/master/drivers/ata/libata-scsi.c
+- Linux `drivers/scsi/scsi_ioctl.c` re-read: `scsi_cmd_allowed()` has no ATA_12/ATA_16 in either list; `-ENODEV` from `scsi_block_when_processing_errors`; `-EINVAL` when `hostt->ioctl` is NULL; `sg_io` → `-EPERM`
+- Linux `drivers/nvme/host/core.c`, `multipath.c`, `sysfs.c` (subsystem link `sysfs_create_link(&subsys->dev.kobj, …)`, head parent `subsys->dev`, CMIC gate, `multipath_always_on`, `nvme%dc%dn%d` hidden path disks, state/cntrltype/dctype strings, trimmed `%.*s` model/serial) — https://raw.githubusercontent.com/torvalds/linux/master/drivers/nvme/host/{core.c,multipath.c,sysfs.c}
+- Linux `include/linux/kobject.h` (`UEVENT_BUFFER_SIZE 2048`, `UEVENT_NUM_ENVP 64`, `kobject_action`) and `lib/kobject_uevent.c` (`NL_CFG_F_NONROOT_RECV`, group 1)
+- Linux `Documentation/ABI/testing/sysfs-devices-removable` (`removable`/`fixed`/`unknown`, driver-core attribute since 5.14) and `drivers/usb/core/hub.c` `set_usb_port_removable()`
+- Linux `drivers/mmc/core/sd.c` (`mmc_decode_cid` bit offsets, `csd_struct = unstuff_bits(resp,126,2)`, `MMC_DEV_ATTR` formats) and `bus.c` `type_show`
+- systemd `src/libsystemd/sd-device/sd-device.c` `handle_db_line` (`S L E G Q I V`; `W` deprecated) — https://raw.githubusercontent.com/systemd/systemd/main/src/libsystemd/sd-device/sd-device.c
+- systemd `src/udev/udev-builtin-usb_id.c` (legacy `ID_BUS`/`ID_SERIAL` only when `ID_BUS` unset; serial sanitising `< 0x20`, `> 0x7f`, `,`) and `src/udev/ata_id/ata_id.c` (word 217 mapping, SG_IO `0xa1`/`0x85` then `HDIO_GET_IDENTITY`)
+- Local `/lib/udev/rules.d/60-persistent-storage.rules` (systemd 259): ata_id-on-USB rule, unconditional `usb_id` import, `$env{ID_BUS}-$env{ID_SERIAL}` and `usb-$env{ID_USB_SERIAL}` links, nvme `ID_SERIAL` with `_NSID`, `by-diskseq`
+- sg3_utils `src/sg_vpd_common.c` `decode_block_dev_ch_vpd()` (reference decoder for SBC-4 VPD B1: rotation-rate ranges, product type, form factor, byte 8 bits) — https://raw.githubusercontent.com/hreinecke/sg3_utils/master/src/sg_vpd_common.c
+- smartctl(8) RETURN VALUES (smartmontools 7.4, Debian trixie man page) — https://manpages.debian.org/trixie/smartmontools/smartctl.8.en.html
+- Linux 6.6 commit e88e0d366f9c "tmpfs: trivial support for direct IO"
+- Microsoft Learn CreateFileA, "Physical Disks and Volumes" (administrative privileges, OPEN_EXISTING, `dwDesiredAccess = 0`) — https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-createfilea ; STORAGE_BUS_TYPE / STORAGE_PROPERTY_ID / STORAGE_DEVICE_DESCRIPTOR pages re-read
+- windows-sys 0.61.2 crate source (`~/.cargo/registry`): `IOCTL_DISK_GET_DRIVE_LAYOUT_EX = 458832`, `IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS = 5636096`, `GUID_DEVINTERFACE_DISK`, `BusTypeMax = 20` (no `BusTypeNvmeof`), `BOOLEAN` → `bool`, module locations
+- libc 0.2.190 crate source: Linux `BLK*` exports limited to `BLKSSZGET/BLKPBSZGET/BLKIOMIN/BLKIOOPT`; no `DKIOC*`
+- Apple xnu `bsd/sys/disk.h` (`DKIOCGETBLOCKSIZE _IOR('d',24,uint32_t)`, `DKIOCGETBLOCKCOUNT _IOR('d',25,uint64_t)`) — https://raw.githubusercontent.com/apple-oss-distributions/xnu/main/bsd/sys/disk.h
+- crates.io API: `thiserror` 2.0.21, `tempfile` 3.27.0 (others re-confirmed)
+
+Secondary / recalled (still tagged UNVERIFIED in text):
+
+- macOS `diskutil info -plist` key spellings — https://dev.to/kishanbsh/getting-hard-disk-info-in-mac-using-terminal-2fn5 (human-readable output only); `DeviceIdentifier`, `DeviceNode`, `WholeDisk`, `ParentWholeDisk`, `Content`, `MountPoint`, `FilesystemName`, `FilesystemType`, `DiskUUID`, `VolumeName`, `VolumeUUID` and the `diskutil list -plist` keys `AllDisks`, `WholeDisks`, `VolumesFromDisks`, `AllDisksAndPartitions` confirmed from a plist-tagged Go consumer (https://pkg.go.dev/github.com/brokeyourbike/mountefi/disk); the remaining keys are unconfirmed
+- Windows byte-swapped ATA serial un-swapping — a heuristic, not a documented behaviour
+- Which non-SCSI drivers return `ENODEV` from read()/ioctl on a hot-removed device

@@ -1,7 +1,8 @@
 # Video container formats: carving, validation and repair (moov rebuild)
 
-Status: research spec, written 2026-10-12. Lines tagged `UNVERIFIED` were not confirmed
-against a primary source and must be checked before an implementer relies on them.
+Status: research spec, written 2026-10-12; independent fact-check pass 2026-10-12 (sources in
+§7 "Fact-check sources"). Lines still tagged `UNVERIFIED` were not confirmed against a
+primary source and must be checked before an implementer relies on them.
 Everything else was checked against the cited specs/sources, or against bytes produced by
 the dev box's ffmpeg 8.0.1 (libx264 core 165, libx265, native aac) and parsed with an
 independent Python reference parser (see section 5.6).
@@ -60,7 +61,8 @@ Header length = 8, +8 if `size==1`, +16 if `type=='uuid'`. A **FullBox** adds
 `version` (u8) and `flags` (u24) immediately after the header; "payload offset" below is
 relative to the end of the FullBox header unless stated.
 
-Minimum valid `size` is 8 (16 for `uuid`); any smaller non-zero size is corruption.
+Minimum valid `size` is 8 (24 for `uuid`: 8-byte header + 16-byte usertype; 16 for a
+`size==1` box; 32 for `uuid` with `size==1`); any smaller non-zero size is corruption.
 
 ### 2.2 Top-level boxes and brands
 
@@ -124,7 +126,11 @@ moov
  │               └─ stsh, stdp                     (rare)
  ├─ mvex                        (fragmented only)
  ├─ udta, meta                  (optional)
- └─ (Canon) uuid 85c0b687-820f-11e0-8111-f4ce462b6a48 with CNTH/CNDA thumbnail JPEG    UNVERIFIED (uuid value)
+ └─ (Canon) uuid 85c0b687-820f-11e0-8111-f4ce462b6a48 with CNTH/CNDA thumbnail JPEG
+    (confirmed: ExifTool QuickTime.pm maps this uuid inside `moov` to its Canon::uuid table,
+    which holds CNTH → CNDA = the full THM JPEG, plus CNCV and, in CR3, CCTP/CTBO/CMT1-4/THMB;
+    some PowerShots put CNTH directly in `moov/udta` instead. The CR3 *file-level* uuid is a
+    different value, 210f1687-9149-11e4-8111-00242131fce4.)
 ```
 
 All multi-byte fields BE. "v" = `version` of the FullBox.
@@ -147,7 +153,7 @@ All multi-byte fields BE. "v" = `version` of the FullBox.
 
 Box size: v0 = 108, v1 = 120.
 
-#### tkhd (FullBox). flags: 0x1 enabled, 0x2 in_movie, 0x4 in_preview, 0x8 size_is_aspect_ratio
+#### tkhd (FullBox). flags: 0x1 enabled, 0x2 in_movie, 0x4 in_preview, 0x8 size_is_aspect_ratio (ISO) / in_poster (QuickTime meaning of the same bit; FFmpeg isom.h `MOV_TKHD_FLAG_IN_POSTER`)
 
 | v0 off | v0 | v1 | Field |
 |---|---|---|---|
@@ -257,9 +263,16 @@ bytes_per_packet u32, bytes_per_frame u32, bytes_per_sample u32; children start 
 QuickTime **version 2** adds at offset 28 (36 bytes): sizeOfStructOnly u32 (=72),
 audioSampleRate f64 BE, numAudioChannels u32, always7F000000 u32, constBitsPerChannel u32,
 formatSpecificFlags u32, constBytesPerAudioPacket u32, constLPCMFramesPerAudioPacket u32;
-children start at 64. UNVERIFIED (v2 field order taken from QuickTime File Format spec from memory)
-`formatSpecificFlags` (LPCM): 0x1 float, 0x2 big-endian, 0x4 signed int, 0x8 packed,
-0x10 aligned high, 0x20 non-interleaved. UNVERIFIED
+children start at 64. In a v2 entry the v0 fields at 16..28 hold fixed values: always3=3,
+always16=16, alwaysMinus2=0xFFFE, always0=0, always65536=0x00010000 (the real channel
+count, bit depth and rate are only in the v2 fields). Verified against Apple's QTFF
+"Sound sample description version 2" page and FFmpeg `mov.c` (reader, `mov_parse_stsd_audio`)
+/ `movenc.c` (writer, `mov_write_audio_tag`: writes 3, 16, 0xfffe, 0, 0x00010000, 72, f64,
+channels, 0x7F000000, bits, flags, bytes/packet, frames/packet).
+`formatSpecificFlags` (LPCM) = CoreAudio `kAudioFormatFlag*` bits: 0x1 float, 0x2 big-endian,
+0x4 signed int, 0x8 packed, 0x10 aligned high, 0x20 non-interleaved, 0x40 non-mixable
+(CoreAudioBaseTypes.h; FFmpeg `mov_get_lpcm_flags` writes 12 = signed|packed for s16le/s24le,
+14 for s16be, 9 = float|packed for f32le, 11 for f32be, 10 for u8).
 
 Observed ffmpeg MOV `sowt` entry (36 bytes + `chan`): channelcount 1, samplesize 16,
 samplerate 0xBB800000, then `chan` box (24 bytes: v/flags, layout tag u32, bitmap u32,
@@ -278,7 +291,7 @@ number of descriptions u32).
 | 6 | var | for each SPS: sequenceParameterSetLength u16, then the SPS NAL (starts with 0x67 / 0x27 etc.) |
 | | 1 | numOfPictureParameterSets |
 | | var | for each PPS: pictureParameterSetLength u16, PPS NAL (0x68) |
-| | | if profile ∈ {100,110,122,144}: `111111`+chroma_format(2), `11111`+bit_depth_luma_minus8(3), `11111`+bit_depth_chroma_minus8(3), numOfSequenceParameterSetExt u8, SPS-ext NALs |
+| | | if profile ∈ {100,110,122,144}: `111111`+chroma_format(2), `11111`+bit_depth_luma_minus8(3), `11111`+bit_depth_chroma_minus8(3), numOfSequenceParameterSetExt u8, SPS-ext NALs. The 14496-15 text really says 144 (old High 4:4:4), not 244; FFmpeg's writer (`libavformat/avc.c`) emits these bytes for {100,110,122,244,44,83,86,118,128,138,139,134} instead. **Parse them as optional**: stop at the box end, never require them, never fail if they are absent. |
 
 Observed: `01 4d 40 0d ff e1 00 18 67 4d 40 0d …` = v1, Main, compat 0x40, level 1.3,
 lengthSize 4, 1 SPS of 24 bytes. `avc3`/`hev1` mean parameter sets may also be in-band
@@ -426,7 +439,9 @@ NAL header (1 byte): `forbidden_zero_bit(1) nal_ref_idc(2) nal_unit_type(5)`.
 | 10, 11 | end of sequence / stream | |
 | 12 | filler data | may be inside AU |
 | 14, 15, 20 | SVC/MVC prefix, subset SPS, extension slice | treat as non-VCL prefix |
-| 0, 16–18, 21–31 | reserved/unspecified | implausible: reject |
+| 19 | auxiliary coded picture slice (alpha) | VCL, no own picture; keep inside the AU |
+| 21 | 3D-AVC depth/texture slice extension | treat like 20 |
+| 0, 16–18, 22–23 (reserved), 24–31 (unspecified) | reserved/unspecified | implausible: reject |
 
 A **picture's first slice** is recognised by `first_mb_in_slice == 0` (H.264 §7.4.1.2.4 also
 lists frame_num/pps_id/field/nal_ref_idc/POC/idr_pic_id differences; untrunc uses those
@@ -548,13 +563,23 @@ for each picture (decode order) with lsb:
 ```
 
 Type 2: output order == decode order (no B-frames) ⇒ ctts all zero. Type 1: compute via
-§8.2.1.2 or fall back to zero ctts (rare in camera files). UNVERIFIED (claim that type 1 is rare in consumer camera output)
+§8.2.1.2 or fall back to zero ctts (rare in camera files). UNVERIFIED (claim that type 1 is
+rare in consumer camera output: no camera corpus was surveyed. Supporting evidence only: x264
+`encoder/set.c` writes `poc_type = (bframes || interlaced || avcintra) ? 0 : 2`; openh264
+`au_set.cpp` defaults `uiPocType = 2`; untrunc (anthwlock `avc1/nal-slice.cpp`) parses the
+type-1 SPS fields but its `isInNewFrame` leaves the type-1 comparison as a TODO without
+reported breakage. Implement type 1 as "parse the SPS fields, treat ctts as zero, warn".)
 
 ### 2.6 HEVC / H.265 bitstream (ITU-T H.265 §7.3)
 
 NAL header (2 bytes): `forbidden_zero_bit(1) nal_unit_type(6) nuh_layer_id(6)
-nuh_temporal_id_plus1(3)`; `nuh_temporal_id_plus1 != 0` (except EOB 37 may be 0 — untrunc
-checks this), `nuh_layer_id` normally 0.
+nuh_temporal_id_plus1(3)`; H.265 §7.4.2.2: `nuh_temporal_id_plus1` **shall not be 0 for any
+NAL type**, and VPS/SPS/EOS/EOB must have TemporalId 0, i.e. `nuh_temporal_id_plus1 == 1`.
+`nuh_layer_id` normally 0. (Both untrunc code bases — ponchio `codec_hev1.cpp` and anthwlock
+`hvc1/nal.cpp` — contain the *inverted* check `EOB ⇒ tid_plus1 == 0, else tid_plus1 != 0`
+and reject the NAL otherwise; that rejects a standard-conforming EOB. Do not copy it: a
+`tid_plus1 == 0` byte is the corruption signal for every type, EOB included. anthwlock also
+mis-extracts `nuh_layer_id` as `(b0&1)<<6 | b1>>5`; the correct split is `(b0&1)<<5 | b1>>3`.)
 
 | Type | Name | Class |
 |---|---|---|
@@ -689,7 +714,11 @@ reserved 0, EIGHT_SHORT, max_sfb 14; frame 2 → ONLY_LONG, max_sfb 48. Frame 0 
 started with a FIL element (`de 02 …`): id 6, count 15 – encoders may emit FIL first.
 
 End-of-frame property: the block ends with END (`111`) followed by zero alignment bits
-(byte_alignment() pads with 0 bits UNVERIFIED), so the last byte `b` satisfies: for some
+(byte_alignment() pads with 0 bits UNVERIFIED against the 14496-3 text itself; confirmed for
+the encoders checked: FFmpeg native aac writes `TYPE_END` then `flush_put_bits()`, documented
+"pad the end of the output stream with zeros" (`libavcodec/put_bits.h`); FAAC's `PutBit`
+ORs into a zero-initialised buffer so its alignment bits are 0; fdk-aac and hardware
+encoders not checked — treat a non-zero pad as "low confidence", not as a reject), so the last byte `b` satisfies: for some
 k in 0..=5, `(b >> k) & 7 == 7 && b & ((1<<k)-1) == 0`, or `b == 0xC0`/`0x80` with the
 `111` straddling the previous byte. Observed last bytes: 0xA7, 0x38. This is a *filter*
 (≈ 30% false-accept on random bytes), not a proof.
@@ -832,8 +861,15 @@ PMT (table_id 0x02): same 8-byte prefix with program_number, then `r(3) PCR_PID(
 r(4) program_info_length(12) | descriptors | { stream_type u8 | r(3) elementary_PID(13) |
 r(4) ES_info_length(12) | descriptors }* | CRC32`. stream_type: 0x01/0x02 MPEG-1/2 video,
 0x03/0x04 MPEG audio, 0x0F AAC ADTS, 0x11 AAC LATM, 0x1B H.264, 0x24 HEVC, 0x06 private PES
-(AC-3/DVB subs), 0x81 AC-3 (ATSC), 0x82/0x86 DTS. AVCHD/Blu-ray use PMT PID 0x0100, video
-PID 0x1011, audio 0x1100+, PCR 0x1001. UNVERIFIED (HDMV PID conventions)
+(AC-3/DVB subs), 0x81 AC-3 (ATSC), 0x82/0x86 DTS. AVCHD/Blu-ray (HDMV) fixed PIDs: PAT 0x0000,
+PMT 0x0100, PCR 0x1001, primary video 0x1011 (MVC dependent view 0x1012, FFmpeg's
+`M2TS_VIDEO_EL_PID` 0x1015), primary audio 0x1100–0x111F, PG subtitles 0x1200–0x121F, IG
+0x1400–0x141F, TextST 0x1800, secondary audio 0x1A00–0x1A1F, secondary video 0x1B00–0x1B1F.
+(Confirmed against two independent implementations of the BD-ROM Part 3 conventions:
+FFmpeg `libavformat/mpegts.h` `M2TS_*_PID` defines and libbluray
+`src/libbluray/decoders/hdmv_pids.h`; the BD-ROM specification itself is not public.)
+Do not *require* these PIDs: non-Blu-ray M2TS writers (some camcorders, ffmpeg before 2020)
+use 0x100/0x101 style PIDs; always derive PIDs from the PMT.
 
 PES (inside payload after PUSI): `00 00 01 stream_id(E0–EF video, C0–DF audio, BD private 1,
 BF private 2) | PES_packet_length u16 (0 allowed for video in TS) | '10' scrambling(2)
@@ -881,8 +917,16 @@ walk(r, start, end) -> Vec<Box> (stops at first inconsistency, returns what it h
     return (boxes, Ok)
 ```
 
-Top-level sanity for ISO BMFF: the sequence must start with `ftyp` (or `wide`/`free`/`skip`
-then `ftyp` on some old QuickTime files UNVERIFIED), contain at most one `moov`
+Top-level sanity for ISO BMFF: the sequence must start with `ftyp`, **except** that
+QuickTime files may have no `ftyp` at all: Apple's QTFF spec says the file type atom "is
+optional, but strongly recommended. If present, it must be the first significant atom in the
+file, preceding the movie atom (and any free space atoms, preview atom, or movie data
+atoms)"; ISO 14496-12 §4.3 requires `ftyp` "as early as possible … after any obligatory
+signature". So nothing precedes a present `ftyp`; a *missing* `ftyp` (pre-QuickTime-6 MOV,
+some XDCAM/PVAuthor files) means the file starts with `moov`, `mdat`, `wide`, `free`,
+`skip`, `pnot`, `udta`, `junk`, `pict`, `prfl` or `uuid` — exactly the set FFmpeg's
+`mov_probe()` accepts as a first box. Carve such files as "ftyp-less MOV" at a lower
+confidence; the secondary magics in §2.2 cover them. The file must contain at most one `moov`
 and ≥ 1 `mdat` (or `moof`/`mdat` pairs), and every box type must be one of the known
 top-level types `{ftyp,free,skip,wide,mdat,moov,moof,mfra,meta,uuid,sidx,styp,pdin,udta,junk,PICT,prfl}`.
 An unknown 4CC at top level is treated as "end of file" for carving purposes.
@@ -1080,7 +1124,7 @@ match_hevc(buf, max, R):
         b0 = buf[pos+L]; b1 = buf[pos+L+1]
         if b0 & 0x80: break
         typ = (b0 >> 1) & 0x3F; layer = ((b0 & 1) << 5) | (b1 >> 3); tid1 = b1 & 7
-        if typ > 40: break;  if typ != 37 && tid1 == 0: break;  if typ == 37 && tid1 != 0: break
+        if typ > 40: break;  if tid1 == 0: break                 // H.265 §7.4.2.2: tid_plus1 is never 0 (EOB has tid_plus1 == 1); see §2.6 on untrunc's inverted check
         match typ:
             0..=9 | 16..=21:
                 first_slice = buf[pos+L+2] >> 7
@@ -1097,9 +1141,10 @@ match_hevc(buf, max, R):
         pos += L + n; …
 ```
 
-Keyframe for `stss`: IDR (19/20), BLA (16–18), CRA (21). Note the ponchio untrunc fork
-omits IDR_N_LP (20) from its slice list; x265's first frame *is* type 20 — do not copy that
-bug.
+Keyframe for `stss`: IDR (19/20), BLA (16–18), CRA (21). Note the *original* ponchio untrunc
+(`codec_hev1.cpp`) has IDR_N_LP (20) commented out of its slice list (the anthwlock fork's
+`hvc1/nal.cpp` `h265IsSlice` includes it, but neither recognises BLA 16–18 or TSA/STSA/RADL
+2–7 as slices); x265's first frame *is* type 20 — do not copy that bug.
 
 #### 3.6.3 POC → composition offsets (`ctts`)
 
@@ -1221,7 +1266,7 @@ write(out, R, tracks, mdat_src_ranges):
 ```
 mvhd: v0 (v1 if any duration > u32), timescale = R.mvhd.timescale (1000 typical), duration = max over tracks of track_duration_in_movie_ts, next_track_ID = max id + 1
 for each track (video first, then audio; ids 1, 2):
-    tkhd: copy R.tkhd_raw; set track_ID, duration (movie ts), flags 0x3 (enabled | in_movie) (0x7 for QT)
+    tkhd: copy R.tkhd_raw; set track_ID, duration (movie ts), flags 0x3 (enabled | in_movie) — FFmpeg writes 0x3 for both MP4 and MOV; Apple writers use 0xF (+in_preview +in_poster); keep R's value if it is one of these
     edts/elst: omit unless ctts shift > 0 or AAC priming known from R (copy R.elst with segment_duration = new track duration; keep media_time)
     mdia:
       mdhd: copy R (timescale, language); duration = Σ stts
@@ -1279,7 +1324,7 @@ alignment inside the last 64 MiB.
 
 | Vendor | Extra tracks / boxes | Rebuild action |
 |---|---|---|
-| GoPro (HERO) | `gpmd` (telemetry, handler `meta`), `tmcd` timecode, `fdsc` (firmware), text `GoPro…` tracks; `free` padding; brand `qt  `/`mp41` | drop all but `vide`+`soun`. gpmd samples are KLV: 4CC in `{DEVC, DVID, DVNM, STRM, STNM, RMRK, SCAL, SIUN, UNIT, TYPE, TSMP, TIMO, EMPT}` + `type u8 size u8 repeat u16` → sample length = 8 + size×repeat (untrunc: `(be32(b+4) & 0xffff) + 8` for the outer DEVC) — only needed to *skip* them in `mdat` |
+| GoPro (HERO) | `gpmd` (telemetry, handler `meta`), `tmcd` timecode, `fdsc` (firmware), text `GoPro…` tracks; `free` padding; brand `qt  `/`mp41` | drop all but `vide`+`soun`. gpmd samples are KLV: 4CC in `{DEVC, DVID, DVNM, STRM, STNM, RMRK, SCAL, SIUN, UNIT, TYPE, TSMP, TIMO, EMPT}` + `type u8 size u8 repeat u16` → sample length = 8 + size×repeat **rounded up to a multiple of 4** (GPMF payloads are 32-bit aligned, gopro/gpmf-parser README); untrunc uses `(be32(b+4) & 0xffff) + 8` for the outer DEVC, which works because DEVC is a nested type (type 0, size 1, repeat = payload bytes) — only needed to *skip* them in `mdat` |
 | Canon (EOS/PowerShot MOV) | `uuid` CNTH thumbnail in moov, `CNDA`, `tmcd` track, `free`/`skip` before `mdat` reserve; `moov` at end | drop tmcd; copy video `stsd` verbatim (contains `colr`, `pasp`, `fiel`) |
 | Sony (XAVC S MP4) | `rtmd` real-time metadata track (`meta`), `uuid` with XML (`PROF`), `free` | drop rtmd; untrunc handles "Sony XAVC" explicitly |
 | DJI (MP4/MOV) | `djmd` and `dbgi` meta tracks, `free` | drop |
@@ -1326,10 +1371,15 @@ boundaries: no bitstream parsing needed except for keyframe flags.
 
 ## 4 Edge cases and failure modes seen on real failing media
 
-1. **Zero-filled holes**: the imaging engine writes 0x00 for unreadable blocks (ddrescue
-   default); inside `mdat` a 4 KiB zero run produces NAL length 0 (AVC loop breaks) or
+1. **Zero-filled holes**: unreadable blocks end up as 0x00 in a ddrescue image *only
+   because the output is a freshly created regular file* (ddrescue "does not write zeros to
+   the output when it finds bad sectors"; on a pre-existing file or device the old bytes
+   stay — ddrescue manual, "Mapfile structure"/"Fill mode"). DiskRescue's own imager must
+   therefore zero-fill explicitly and must never trust the image bytes in a bad range.
+   Inside `mdat` a 4 KiB zero run produces NAL length 0 (AVC loop breaks) or
    corrupts a slice silently (length prefix intact, payload zeroed). Overlay the ddrescue
-   mapfile (`-` bad, `*` non-trimmed, `/` non-scraped) on the file's extent list and mark
+   mapfile (`?` non-tried, `*` non-trimmed, `/` non-scraped, `-` bad-sector, `+` finished;
+   treat everything except `+` as unreadable) on the file's extent list and mark
    samples overlapping bad ranges as damaged *before* scanning; never treat a hole as a
    sample boundary. In `moov`, a hole corrupts tables silently: validate every table (§3.3
    level 1) and prefer rebuild over trusting a holed `moov`.
@@ -1360,8 +1410,9 @@ boundaries: no bitstream parsing needed except for keyframe flags.
    via `pic_width_in_mbs_minus1`), and warn. If the damaged file's own `stsd` survived
    (case E), prefer it.
 8. **Variable frame rate** (phones): stts has many entries; the rebuild writes a constant
-   delta → audio drifts vs video. untrunc mitigates by stretching video to match audio
-   duration (`-sv`/`-sa`-like options). Implement: after rebuild, if |video_dur − audio_dur|
+   delta → audio drifts vs video. untrunc (anthwlock) mitigates by stretching video to match
+   audio duration (option `-sv`, "stretches video to match audio duration (beta)"; there is
+   no `-sa`). Implement: after rebuild, if |video_dur − audio_dur|
    > 0.5 s, set the video `stts` delta so that durations match (video_dur ≈ audio_dur).
 9. **H.264 with multiple slices per picture** (some Ambarella dashcams, 4 slices):
    `first_mb_in_slice` is 0 only for the first slice; rely on it rather than on the
@@ -1593,7 +1644,7 @@ Versions are from `cargo search` on 2026-10-12 (so they are current, not guesses
 | AVI | `riff` 2.0.0 | | generic RIFF chunk reader; strict on sizes. Hand-write the walker (RIFF is trivial), reuse nothing. |
 | MPEG-TS | `mpeg2ts-reader` 0.18.2 | | solid push parser (PAT/PMT/PES), pure Rust; usable for validation and PID discovery. Carving stride detection is hand-written. |
 | MPEG-PS | hand-written | — | no suitable crate. |
-| CRC-32 (MKV, PSI) | `crc` | 3.4.0 | MPEG-2 CRC = CRC-32/MPEG-2 (poly 0x04C11DB7, init 0xFFFFFFFF, no reflect, no xorout); Matroska CRC-32 = IEEE (reflected). |
+| CRC-32 (MKV, PSI) | `crc` | 3.4.0 | MPEG-2 CRC = CRC-32/MPEG-2 (poly 0x04C11DB7, init 0xFFFFFFFF, no reflect, no xorout); Matroska CRC-32 = IEEE/ISO 3309 (reflected, zlib `crc32`), stored **little-endian** in the 4-byte element, computed over the parent's payload *excluding* the CRC-32 element itself, which must be the parent's first child (RFC 8794 §11.3.1). |
 | Memory-mapped IO | `memmap2` | 0.9.11 | for scanning multi-GB images; fall back to buffered `pread` on Windows oddities. |
 
 Rule of thumb: **parsers in the repair path are hand-written, bounded, and return
@@ -1632,11 +1683,14 @@ Repair tools modelled
 - untrunc (Federico Ponchio): https://github.com/ponchio/untrunc — `codec_avc1.cpp`
   (slice header fields, §7.4.1.2.4 checks), `codec_hev1.cpp` (NAL header validation,
   `first_slice_segment_in_pic_flag`, keyframe types; note it omits IDR_N_LP from slices),
-  `codec_mp4a.cpp` (libavcodec decode → consumed bytes; chances 32000 for 6-byte silence,
-  50 for < 400 B, 100 otherwise; "horrible hack" byte pairs), `codec_pcm.cpp`
+  `codec_mp4a.cpp` (libavcodec decode → consumed bytes; chances 4 when consumed == maxlength,
+  32000 for 6-byte silence, 50 for < 400 B, 100 otherwise; "horrible hack" byte pairs
+  `ee 1b` / `3e 64` at bytes 4–5 ⇒ 32000), `codec_pcm.cpp`
   (`stats.fixed_size`, chances 2), `codec_gpmd.cpp` (GoPro KLV fourcc set, `(be32+4 & 0xffff)+8`).
 - untrunc (anthwlock fork, actively maintained): https://github.com/anthwlock/untrunc —
-  `src/mp4.cpp` (repair loop, `chkOffset`, `-s` skip-unknown, `-dyn` dynamic chunk stats,
+  `src/mp4.cpp` (repair loop, `chkOffset`, `-s` "step through unknown sequences" (+`-st`
+  step size, `-k` keep unknown sequences, `-sm` search mdat without mp4 structure,
+  `-noctts`, `-mp` max part size), `-dyn` dynamic chunk stats,
   `track_order_`, 64-bit `co64` when > 4 GiB, output order ftyp+moov+mdat, pruning of
   `cslg`/`stps`), `src/avc1/nal-slice.cpp` and `sps-info.cpp` (exact SPS fields parsed,
   `isInNewFrame` rules and which are strict-only), `src/avc1/avc1.cpp` (AU termination on
@@ -1651,6 +1705,44 @@ Repair tools modelled
   (`ff_aac_num_swb_1024/128/960`): https://github.com/FFmpeg/FFmpeg
 - h264-reader 0.9 `SliceHeader` API: https://docs.rs/h264-reader/latest/h264_reader/nal/slice/struct.SliceHeader.html
 - MPEG-4 Audio (AudioSpecificConfig, frequency index table): https://wiki.multimedia.cx/index.php/MPEG-4_Audio
+
+Fact-check sources (2026-10-12 pass; every "confirmed" note above cites one of these)
+- Apple QTFF, Sound sample description version 2 (field order, fixed values):
+  https://developer.apple.com/documentation/quicktime-file-format/sound_sample_description_version_2
+- Apple QTFF, File type compatibility atom (ftyp optional; if present first significant atom):
+  https://developer.apple.com/documentation/quicktime-file-format/file_type_compatibility_atom
+- CoreAudio `kAudioFormatFlag*` bit values (LPCM formatSpecificFlags): CoreAudioBaseTypes.h,
+  e.g. https://github.com/phracker/MacOSX-SDKs/blob/master/MacOSX11.3.sdk/System/Library/Frameworks/CoreAudioTypes.framework/Versions/A/Headers/CoreAudioBaseTypes.h
+- FFmpeg `libavformat/mov.c` (`mov_probe` first-box set, v1/v2 sound description reader,
+  `ff_mov_get_lpcm_codec_id`), `movenc.c` (`mov_write_audio_tag` v2 writer, `mov_get_lpcm_flags`,
+  language 32767, tkhd flags), `isom.h` (`MOV_TKHD_FLAG_*`), `isom.c` (0x7fff language),
+  `avc.c` (avcC ext-bytes profile list), `avidec.c` (`pos = rl32 + base - 8`, index checks),
+  `avienc.c`/`avi.h` (`AVI_MAX_RIFF_SIZE` 0x40000000, dmlh 248 bytes, idx1 offsets relative to
+  the `movi` tag, `indx` from JUNK), `mpegenc.c` (end code commented out), `mpegts.h`
+  (`M2TS_*_PID`), `libavcodec/aactab.c` (`ff_aac_num_swb_1024/960/128`), `put_bits.h`
+  (`flush_put_bits` zero padding), `aacenc.c` (`TYPE_END` + flush): https://github.com/FFmpeg/FFmpeg
+- libbluray `src/libbluray/decoders/hdmv_pids.h` (HDMV PID ranges):
+  https://code.videolan.org/videolan/libbluray/-/blob/master/src/libbluray/decoders/hdmv_pids.h
+- ExifTool `QuickTime.pm` (uuid 85c0b687… → Canon::uuid, CNTH in udta) and `Canon.pm`
+  (`%Canon::uuid`, `%Canon::CNTH` → CNDA): https://github.com/exiftool/exiftool
+- untrunc (ponchio) `codec_mp4a.cpp`, `codec_gpmd.cpp`, `codec_hev1.cpp`; untrunc (anthwlock)
+  `src/main.cpp` (option list), `src/hvc1/nal.cpp`, `src/avc1/sps-info.cpp`,
+  `src/avc1/nal-slice.cpp` (`isInNewFrame`), `src/codec.cpp` (`looksLikeTwosOrSowt`),
+  `src/mutual_pattern.cpp`.
+- x264 `encoder/set.c` (poc_type 0/2), openh264 `codec/encoder/core/src/au_set.cpp` (poc_type 2).
+- gopro/gpmf-parser README (32-bit aligned payload): https://github.com/gopro/gpmf-parser
+- Matroska element IDs: `ebml_matroska.xml` in https://github.com/ietf-wg-cellar/matroska-specification ;
+  RFC 8794 §11.3.1 CRC-32 Element: https://www.rfc-editor.org/rfc/rfc8794.txt
+- Microsoft AVIOLDINDEX (dwOffset relative to `movi` list, flags):
+  https://learn.microsoft.com/en-us/previous-versions/windows/desktop/api/aviriff/ns-aviriff-avioldindex
+- GNU ddrescue manual, "Mapfile structure" and fill mode (status characters, no zero-fill):
+  https://www.gnu.org/software/ddrescue/manual/ddrescue_manual.html
+- h264-reader 0.9.0 `SliceHeader` fields / `from_bits` signature:
+  https://docs.rs/h264-reader/latest/h264_reader/nal/slice/struct.SliceHeader.html
+- H.265 TemporalId constraints (VPS/SPS/EOS/EOB ⇒ TemporalId 0; `nuh_temporal_id_plus1 != 0`):
+  ITU-T H.265 §7.4.2.2 (as reflected in HM tickets https://hevc.hhi.fraunhofer.de/trac/hevc/ticket/756 ).
+- ISO/IEC 14496-12 §4.3 ftyp placement wording (composite): https://ftyps.com/composite.htm
+- 14496-15 avcC `profile_idc == 144` ext-bytes quirk: https://code.videolan.org/videolan/vlc/-/merge_requests/221
 
 Crate versions (cargo search, 2026-10-12): mp4 0.14.0, mp4parse 0.17.0, symphonia 0.6.1,
 bitreader 0.3.11, bitstream-io 4.10.0, h264-reader 0.9.0, matroska 0.30.1, matroska-demuxer

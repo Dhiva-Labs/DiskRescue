@@ -46,8 +46,10 @@ exFAT TexFAT, Btrfs/XFS/APFS/HFS+. The parser must *detect* and report these, ne
 
 1. **Never trust a single copy.** Every boot sector / superblock has a documented backup
    (section 2.x "backups"). Validation rules decide which copy wins.
-2. **Every read goes through the mapfile.** A metadata block that lies in a `-` (bad) or `?`
-   (untried) region is reported as `Unreadable` and the parser continues with what it has
+2. **Every read goes through the mapfile.** A metadata block that lies in any region whose
+   ddrescue status is not `+` (finished) - i.e. `?` non-tried, `*` failed/non-trimmed, `/`
+   failed/non-scraped or `-` bad sector (ddrescue manual, "Mapfile structure") - is reported
+   as `Unreadable` and the parser continues with what it has
    (e.g. lists a directory partially). Never abort a volume because one directory cluster is bad.
 3. **Bounds-check everything.** Cluster numbers, LCNs, block numbers, record offsets and
    lengths are checked against the volume geometry before use. A corrupt pointer yields a
@@ -159,9 +161,9 @@ GPT header (LBA 1; backup copy at the last LBA of the device):
 | 0x28 | 8 | FirstUsableLBA | |
 | 0x30 | 8 | LastUsableLBA | |
 | 0x38 | 16 | DiskGUID | |
-| 0x48 | 8 | PartitionEntryLBA | primary: usually 2; backup: usually last-33 |
-| 0x50 | 4 | NumberOfPartitionEntries | usually 128; cap at 1024 when scanning damaged media |
-| 0x54 | 4 | SizeOfPartitionEntry | usually 128; must be a multiple of 8, >= 128 |
+| 0x48 | 8 | PartitionEntryLBA | primary: usually 2; backup: usually last LBA - 32 (the 32-sector array for 128 x 128-byte entries on 512-byte sectors sits immediately before the backup header, i.e. at `total_sectors - 33`) |
+| 0x50 | 4 | NumberOfPartitionEntries | usually 128 (the array must be at least 16384 bytes); cap at 1024 when scanning damaged media |
+| 0x54 | 4 | SizeOfPartitionEntry | usually 128; UEFI 2.10 5.3.2 requires `128 * 2^n` (128, 256, 512, ...; confirmed via EDK2 UefiGpt.h / OSDev); accept any multiple of 8 >= 128 defensively (Wikipedia: "implementations must allow for other values") |
 | 0x58 | 4 | PartitionEntryArrayCRC32 | CRC-32 over Number*Size bytes of the array |
 
 Partition entry (SizeOfPartitionEntry bytes, first 128 defined):
@@ -172,7 +174,7 @@ Partition entry (SizeOfPartitionEntry bytes, first 128 defined):
 | 0x10 | 16 | UniquePartitionGUID |
 | 0x20 | 8 | StartingLBA |
 | 0x28 | 8 | EndingLBA (**inclusive**) |
-| 0x30 | 8 | Attributes: bit 0 platform required, bit 1 EFI firmware ignore, bit 2 legacy BIOS bootable, bits 48-63 type-specific (Microsoft basic data: bit 60 read-only, bit 62 hidden, bit 63 no automount) UNVERIFIED (Microsoft bit numbers from memory) |
+| 0x30 | 8 | Attributes: bit 0 platform required, bit 1 EFI firmware ignore (no block I/O protocol), bit 2 legacy BIOS bootable, bits 3-47 reserved, bits 48-63 type-specific (Microsoft basic data: bit 60 read-only, bit 61 shadow copy, bit 62 hidden, bit 63 no drive letter / no automount; verified against Wikipedia "GUID Partition Table", which mirrors UEFI 2.10 table 5-6 and Microsoft's documented attribute bits) |
 | 0x38 | 72 | PartitionName, UTF-16LE, zero padded, up to 36 code units |
 
 GUID byte order on disk: the first three fields are little-endian, the last two are
@@ -188,15 +190,19 @@ Type GUIDs (textual form):
 | EBD0A0A2-B9E5-4433-87C0-68B6B72699C7 | Microsoft basic data | probe NTFS/exFAT/FAT |
 | 0FC63DAF-8483-4772-8E79-3D69D8477DE4 | Linux filesystem data | probe ext4 (and others) |
 | 0657FD6D-A4AB-43C4-84E5-0933C84B4F4F | Linux swap | skip |
-| E3C9E316-0B5C-4DB8-817D-F92DF00215AE | Microsoft reserved | skip UNVERIFIED (GUID from memory) |
-| DE94BBA4-06D1-4D40-A16A-BFD50179D6AC | Windows recovery | probe NTFS UNVERIFIED (GUID from memory) |
-| 933AC7E1-2EB4-4F13-B844-0E14E2AEF915 | Linux /home | probe ext4 UNVERIFIED (GUID from memory) |
-| E6D6D379-F507-44C2-A23C-238F2A3DF928 | Linux LVM | report only UNVERIFIED (GUID from memory) |
-| 21686148-6449-6E6F-744E-656564454649 | BIOS boot | skip UNVERIFIED (GUID from memory) |
-| 48465300-0000-11AA-AA11-00306543ECAC | Apple HFS+ | report only UNVERIFIED (GUID from memory) |
-| 7C3457EF-0000-11AA-AA11-00306543ECAC | Apple APFS | report only UNVERIFIED (GUID from memory) |
+| E3C9E316-0B5C-4DB8-817D-F92DF00215AE | Microsoft reserved | skip |
+| DE94BBA4-06D1-4D40-A16A-BFD50179D6AC | Windows recovery | probe NTFS |
+| 933AC7E1-2EB4-4F13-B844-0E14E2AEF915 | Linux /home | probe ext4 |
+| 4F68BCE3-E8CD-4DB1-96E7-FBCAF984B709 | Linux root (x86-64, discoverable partitions spec) | probe ext4 (and others) |
+| E6D6D379-F507-44C2-A23C-238F2A3DF928 | Linux LVM | report only |
+| 21686148-6449-6E6F-744E-656564454649 | BIOS boot | skip |
+| 48465300-0000-11AA-AA11-00306543ECAC | Apple HFS+ | report only |
+| 7C3457EF-0000-11AA-AA11-00306543ECAC | Apple APFS | report only |
 
-As with MBR, the type GUID is a hint; signature-probe every partition start.
+All type GUIDs above were checked 2026-10-12 against Wikipedia "GUID Partition Table" (which
+mirrors the UEFI spec and the vendor lists) and, for the Linux ones, the UAPI Discoverable
+Partitions Specification (SD_GPT_HOME, SD_GPT_SWAP, SD_GPT_ROOT_X86_64, SD_GPT_LINUX_GENERIC,
+SD_GPT_ESP). As with MBR, the type GUID is a hint; signature-probe every partition start.
 
 Backup GPT: header at the last LBA of the device, its entry array immediately before it
 (PartitionEntryLBA of the backup header; typically last LBA - 32 for 128 entries of 128 bytes
@@ -431,8 +437,14 @@ What a delete does (Windows and Linux vfat): short entry byte 0 := 0xE5; each LF
 byte 0 := 0xE5; the FAT chain is zeroed (all clusters marked free). Nothing else in the
 32-byte entry is touched, so size, first cluster (low word), timestamps survive.
 **FAT32 on Windows additionally zeroes DIR_FstClusHI** (confirmed by forensic references,
-see Sources: forensicfocus thread, apriorit article). Linux keeps the high word
-UNVERIFIED (from reading fs/fat/dir.c memory; test on a real Linux-deleted image).
+see Sources: forensicfocus thread, apriorit article). **Linux keeps the high word** (verified in
+kernel source 2026-10-12): `vfat_unlink` (fs/fat/namei_vfat.c) calls `fat_remove_entries`
+(fs/fat/dir.c), which writes only `de->name[0] = DELETED_FLAG` (0xE5) for each of the
+`nr_slots` entries (LFN slots + short entry) and touches no other byte; it then `clear_nlink`s
+and `fat_detach`es the inode (`i_pos = 0`), and `__fat_write_inode` (fs/fat/inode.c) returns
+early when `i_pos == 0`, so the in-memory truncation done later by `fat_evict_inode` ->
+`fat_truncate_blocks` (which frees the FAT chain to 0 via `fat_free_clusters`) is never written
+back to the directory entry: size, FstClusHI/LO and timestamps all survive on Linux.
 
 Consequences for recovery:
 
@@ -546,7 +558,8 @@ FAT entry for cluster C: u32 at byte `FatOffset*bps + C*4`. Entry 0 = 0xFFFFFFF8
 entry 1 = 0xFFFFFFFF. Values: 2..0xFFFFFFF6 next cluster; 0xFFFFFFF7 bad cluster;
 0xFFFFFFFF end of chain; 0 = free *or* "not described by FAT" (NoFatChain files leave their
 FAT entries at 0 - the FAT is **not** authoritative for allocation; the bitmap is).
-Cluster C's bytes: `(ClusterHeapOffset + (C-2) << SectorsPerClusterShift) * bps`,
+Cluster C's bytes: `(ClusterHeapOffset + ((C-2) << SectorsPerClusterShift)) * bps` (note the
+parentheses: shift the cluster index first, then add the heap offset in sectors),
 cluster size `bps << SectorsPerClusterShift`.
 
 #### 2.3.3 Directory entries (32 bytes)
@@ -565,9 +578,16 @@ cleared); 0x80 invalid; 0x81-0xFF in use. Primary entries at offset 20 (4) First
 | 0x85 | 0x05 | File (primary): see below |
 | 0xC0 | 0x40 | Stream Extension (secondary, critical): see below |
 | 0xC1 | 0x41 | File Name (secondary, critical): 0x01 GeneralSecondaryFlags (0), 0x02 FileName 15 UTF-16LE units |
-| 0xA0 | 0x20 | Volume GUID (benign primary) - ignore |
+| 0xA0 | 0x20 | Volume GUID (benign primary) - ignore. mkfs.exfat 1.3.2 writes this entry in the root with InUse already clear (0x20 observed right after the 0x83 label on the dev-box image), so a 0x20 entry in the root is normal, not evidence of deletion |
 | 0xA1 | 0x21 | TexFAT Padding - ignore |
-| 0xE2 | 0x62 | Vendor extension / 0xE0 Vendor allocation - ignore |
+| 0xA2 | 0x22 | Windows CE Access Control Table (benign primary) - ignore |
+| 0xE0 | 0x60 | Vendor Extension (benign secondary, TypeCode 0) - ignore |
+| 0xE1 | 0x61 | Vendor Allocation (benign secondary, TypeCode 1; has FirstCluster/DataLength at 20/24) - ignore |
+| 0xC2 | 0x42 | Windows CE Access Control List (critical secondary) - ignore |
+
+(Type codes verified against Linux `fs/exfat/exfat_raw.h`: EXFAT_GUID 0xA0, EXFAT_PADDING 0xA1,
+EXFAT_ACLTAB 0xA2, EXFAT_STREAM 0xC0, EXFAT_NAME 0xC1, EXFAT_ACL 0xC2, EXFAT_VENDOR_EXT 0xE0,
+EXFAT_VENDOR_ALLOC 0xE1; `EXFAT_DELETE = ~0x80`, `IS_EXFAT_DELETED(x) = x < 0x80`.)
 
 File directory entry (0x85):
 
@@ -637,9 +657,16 @@ u16 is the up-case of the next code point in sequence. Validated by the fixture 
 (fsck.exfat verifies NameHash).
 
 Deleted entries: the driver clears bit 7 of every entry in the set: 0x85 -> 0x05, 0xC0 -> 0x40,
-0xC1 -> 0x41, and clears the file's bits in the allocation bitmap (and, for chained files,
-zeroes the FAT entries UNVERIFIED for Windows; Linux exfat driver `exfat_free_cluster` zeroes
-the chain only when the file was FAT-chained). **All other bytes are retained**: full name,
+0xC1 -> 0x41 (Linux: `exfat_remove_entries` applies `EXFAT_DELETE = ~0x80`), and clears the
+file's bits in the allocation bitmap. **The Linux exfat driver does not touch the FAT on
+delete** (verified 2026-10-12 in `fs/exfat/fatent.c` `exfat_free_cluster`: both the
+NoFatChain branch and the FAT-chain branch only call `exfat_clear_bitmap` per cluster, never
+`exfat_ent_set`), so on a Linux-deleted FAT-chained file the chain is still walkable. The
+Microsoft spec (section 4.1) does not require FAT entries of freed clusters to be zeroed
+either (it only defines the valid values for allocated clusters), so whether Windows zeroes the
+chain of a FAT-chained file on delete remains UNVERIFIED for Windows: treat a non-zero FAT
+entry at FirstCluster as a usable chain and a zero entry as "chain gone, assume contiguous".
+**All other bytes are retained**: full name,
 size, ValidDataLength, FirstCluster, NoFatChain flag, timestamps and the checksum (which still
 verifies if you re-set bit 7 on each entry when computing it - a strong validation for
 deleted sets). A deleted set is 0x05 followed by SecondaryCount entries 0x40, 0x41...; the
@@ -658,8 +685,11 @@ are 0. The bitmap itself is cluster-allocated (it occupies its own clusters, bit
 
 Directory data: a directory is a file whose DataLength is a multiple of the cluster size;
 its stream has AllocationPossible = 1 and may be NoFatChain. The root directory has no 0x85
-entry: it is FirstClusterOfRootDirectory with a FAT chain (NoFatChain does not apply to root:
-walk the FAT; a fresh root is one cluster). Directories have no `.`/`..` entries. Parent
+entry: it is FirstClusterOfRootDirectory with a FAT chain (spec 3.1.13: "The root directory
+shall always be described with a cluster chain in the active FAT, as if ... NoFatChain ...
+equal to zero"; a fresh root is one cluster). Likewise the Allocation Bitmap (spec 7.1.3) and
+Up-case Table (7.2.3) chains are "as the FAT describes" - walk the FAT for all three, never
+assume NoFatChain for them. Directories have no `.`/`..` entries. Parent
 links do not exist on exFAT: an orphan directory cluster cannot be re-attached by metadata,
 only by the fact that something references its first cluster.
 
@@ -680,7 +710,7 @@ the linux-ntfs documentation (flatcap.github.io). Observed values from mkntfs 20
 | 0x00 | 3 | jump | `EB 52 90` |
 | 0x03 | 8 | OEM ID | "NTFS    " |
 | 0x0B | 2 | bytes per sector | 512..4096 |
-| 0x0D | 1 | sectors per cluster | power of two <= 128 as u8; values 0xF1..0xFF are **negative-encoded** (Windows 10 1709+ for clusters > 64 KiB): sectors per cluster = 1 << (-(s8)value) UNVERIFIED (from memory of ntfs-3g/ntfs3 handling; mkntfs on this box wrote plain 8) |
+| 0x0D | 1 | sectors per cluster | power of two <= 128 as u8 (1,2,4,...,128); values > 128 are **negative-encoded** (Windows 10 1709+ for clusters > 64 KiB, up to 2 MiB): sectors per cluster = `1 << (256 - value)` = `1 << (-(s8)value)`, e.g. 0xF8 = -8 -> 256 sectors (128 KiB), 0xF4 = -12 -> 4096 sectors (2 MiB). Verified 2026-10-12: ntfs-3g `libntfs-3g/bootsect.c` accepts the plain powers of two plus raw values 240..253 (0xF0..0xFD) and decodes `1 << (256 - sectors_per_cluster)`; Linux `fs/ntfs3/super.c` `true_sectors_per_clst` accepts `<= 0x80` as-is and `>= 0xF4` as `1U << (-(s8)v)` and rejects 0x81..0xF3. Accept the union (0xF0..0xFD) and require the decoded value to be a power of two with cluster bytes <= 2 MiB. mkntfs on this box wrote plain 8 |
 | 0x0E | 2 | reserved sectors | 0 |
 | 0x10 | 3 | zero | must be 0 |
 | 0x13 | 2 | unused | 0 |
@@ -708,7 +738,10 @@ Validation: OEM ID; bytes per sector in {512,1024,2048,4096}; sectors per cluste
 sector (allow slack); MFT LCN and MFTMirr LCN < total clusters; record size in {1024..4096}
 (mkntfs/Windows use 1024; 4096 is possible on 4Kn drives); index record size 4096 typical;
 55 AA. Backup: read the partition's last sector (LBA_end) and apply the same tests; it is a
-byte-identical copy. NTFS 1.x placed the backup in the middle of the volume UNVERIFIED.
+byte-identical copy. Windows NT 3.51 (NTFS 1.x) placed the backup in the logical middle of
+the volume; NT 4 and later put it at the end (flatcap linux-ntfs, files/boot.html). The
+lost-partition scan (3.1.1) should therefore also test `volume_start + (total_sectors/2)*bps`
+for pre-NT4 volumes, which are practically extinct on recoverable media.
 
 #### 2.4.2 Fixups (update sequence array) - MUST be applied to FILE and INDX records
 
@@ -743,8 +776,8 @@ Never apply fixups twice; never forget them (a run list whose last 2 bytes sit a
 | 0x04 | 2 | usa_ofs | 0x30 on NTFS 3.1 (48 = sizeof header) |
 | 0x06 | 2 | usa_count | 3 for 1 KiB records |
 | 0x08 | 8 | lsn | $LogFile sequence number |
-| 0x10 | 2 | sequence_number | incremented each time the record is **freed** (ntfs-3g: `ntfs_mft_record_free`: if 0xFFFF -> 1, else if != 0 -> +1). Windows timing (on free vs on reuse) UNVERIFIED; the effect is the same: a reference whose sequence != the record's sequence is stale |
-| 0x12 | 2 | link_count | hard links (number of $FILE_NAME attributes, counting Win32+DOS as one) |
+| 0x10 | 2 | sequence_number | ntfs-3g increments it when the record is **freed** (`ntfs_mft_record_free`: if 0xFFFF -> 1, else if != 0 -> +1); Linux ntfs3 increments it when the record is **reused** (`fs/ntfs3/record.c` `mi_format_new`: "Record is reused. Update its sequence number": seq = old + 1, 0 -> 1, verified 2026-10-12); forensic literature (Carrier, FSFA ch. 11) says Windows increments on deallocation. Windows timing UNVERIFIED against a primary source; the effect is the same either way: a reference whose sequence != the record's sequence is stale, and a freed record's own sequence is either old+1 (ntfs-3g/Windows) or still old (ntfs3) - so when matching a deleted record against a stale $FILE_NAME.parent or $I30 reference accept seq == ref_seq **or** seq == ref_seq + 1 |
+| 0x12 | 2 | link_count | hard links = number of directory entries referencing the record. ntfs-3g (`libntfs-3g/dir.c` `ntfs_link_i`) increments it for every $FILE_NAME it adds, including the DOS 8.3 name added by `set_dos_name`, so a file with separate Win32 and DOS names has link_count 2; a single WIN32_AND_DOS name counts 1. Use it only as a plausibility hint, never as a loop bound |
 | 0x14 | 2 | attrs_offset | first attribute; 8-byte aligned (0x38 on 3.1) |
 | 0x16 | 2 | flags | 0x0001 MFT_RECORD_IN_USE, 0x0002 MFT_RECORD_IS_DIRECTORY, 0x0004 IN_EXTEND ($Extend member), 0x0008 IS_VIEW_INDEX |
 | 0x18 | 4 | bytes_in_use | <= bytes_allocated |
@@ -1095,7 +1128,7 @@ block sizes >= 2 KiB, block 2 for 1 KiB blocks (block `first_data_block + 1` in 
 | 0x18 | 2 | bg_block_bitmap_csum_lo |
 | 0x1A | 2 | bg_inode_bitmap_csum_lo |
 | 0x1C | 2 | bg_itable_unused_lo (inodes at the end of the table never used) |
-| 0x1E | 2 | bg_checksum: GDT_CSUM: crc16(~0, uuid, group# le32, descriptor[0..0x1E]) (and bytes 0x20..desc_size for 64-byte descriptors); METADATA_CSUM: crc32c(seed, group# le32, descriptor with this field zeroed) & 0xFFFF UNVERIFIED (algorithm details from memory; validate against dumpe2fs "csum 0x...") |
+| 0x1E | 2 | bg_checksum: GDT_CSUM: crc16(~0, uuid, group# le32, descriptor[0..0x1E]) (and bytes 0x20..desc_size when INCOMPAT_64BIT and desc_size > 0x20); METADATA_CSUM: crc32c(seed, group# le32, descriptor with this field zeroed) & 0xFFFF. Verified 2026-10-12 against `fs/ext4/super.c` `ext4_group_desc_csum` and by recomputing dumpe2fs's "csum 0x..." in Python on two dev-box images (gdt_csum image: 0x9285; metadata_csum image: 0xe10d) - see 3.5.1 |
 | 0x20 | 4 | bg_block_bitmap_hi (64-byte descriptors only) |
 | 0x24 | 4 | bg_inode_bitmap_hi |
 | 0x28 | 4 | bg_inode_table_hi |
@@ -1171,8 +1204,12 @@ ext4_extent_header: 0x00 eh_magic u16 = **0xF30A** (bytes `0A F3`), 0x02 eh_entr
 0x04 eh_max, 0x06 eh_depth (0 = leaf; max 5), 0x08 eh_generation u32.
 ext4_extent_idx (depth > 0): 0x00 ei_block u32 (first logical block covered), 0x04
 ei_leaf_lo u32, 0x08 ei_leaf_hi u16, 0x0A unused. Child node = one fs block at that number,
-same header layout, eh_max = (block_size - 12) / 12 (minus 1 when METADATA_CSUM: a 4-byte
-ext4_extent_tail crc32c follows the entries area).
+same header layout, eh_max = (block_size - 12) / 12 for every block size, **with or without
+METADATA_CSUM** (kernel `ext4_ext_space_block`: `(blocksize - sizeof(header)) / sizeof(extent)`,
+no adjustment for the tail; because every power-of-two block size leaves `block_size mod 12`
+= 4 or 8 bytes of slack, the 4-byte ext4_extent_tail crc32c always fits at
+`12 + 12*eh_max`). Readers must take eh_max from the header anyway and only check
+`eh_max <= (block_size - 12) / 12`.
 ext4_extent (depth == 0): 0x00 ee_block u32 (logical), 0x04 ee_len u16 (**> 32768 means
 uninitialised/preallocated: real length = ee_len - 32768, contents must be treated as zeros,
 but on a failing device after a crash they may contain the real data - offer both**),
@@ -1211,8 +1248,14 @@ of entries that never cross block boundaries.
 
 ext4_dir_entry_2 (when INCOMPAT_FILETYPE, i.e. practically always):
 0x00 inode u32 (0 = unused entry), 0x04 rec_len u16 (distance to the next entry; multiple of
-4; the last entry's rec_len reaches the end of the block; special encoding for 64 KiB blocks:
-rec_len 0 or 65535 means 65536 UNVERIFIED exact rule), 0x06 name_len u8, 0x07 file_type u8
+4; the last entry's rec_len reaches the end of the block). Decoding (kernel `ext4.h`
+`ext4_rec_len_from_disk`, verified 2026-10-12): `if raw == 65535 or raw == 0: len =
+block_size; else len = (raw & 65532) | ((raw & 3) << 16)` - i.e. for block sizes < 64 KiB the
+raw value is the length (its low 2 bits are always 0), and a whole-block entry on a 64 KiB
+block is stored as 65535 (65536 on larger-than-64 KiB "blocks" stores 0; the low two bits
+carry bits 16-17 of the length). The encoder (`ext4_rec_len_to_disk`) never emits raw values
+with the low bits set for block sizes <= 64 KiB, so treat `raw & 3 != 0` as corruption there.
+0x06 name_len u8, 0x07 file_type u8
 (0 unknown, 1 regular, 2 dir, 3 chr, 4 blk, 5 fifo, 6 sock, 7 symlink, 0xDE = checksum tail),
 0x08 name (name_len bytes, not terminated).
 Old ext4_dir_entry (no FILETYPE): name_len is a u16 at 0x06.
@@ -1245,9 +1288,17 @@ bitmap. The kernel's `ext4_evict_inode` (fs/ext4/inode.c) sets i_size = 0, calls
 then memmove/memset the tail) and `ext4_ext_remove_space` leaves the root header with
 eh_entries = 0, eh_depth = 0. Index blocks are freed, not zeroed (their contents survive in
 free space - a carver for ext4_extent_header magic 0xF30A in unallocated blocks can
-reconstruct old leaf nodes, future work). Block-mapped (ext2/ext3) files: ext3 zeroes the
-block pointers on truncate as well (ext2 does not: ext2 undelete via block map works on
-pure ext2) UNVERIFIED for ext2 specifics.
+reconstruct old leaf nodes, future work). Block-mapped files: the ext4 driver (which also
+serves ext3, and ext2 when CONFIG_EXT4_USE_FOR_EXT2 is set - the default on most distros)
+zeroes the block pointers on truncate and writes the zeroed inode. The **native ext2 driver
+keeps them on disk** (verified 2026-10-12 in `fs/ext2/inode.c` `ext2_evict_inode`): it sets
+`i_dtime`, calls `mark_inode_dirty` + `sync_inode_metadata` (writing the inode with dtime set
+and i_size/i_block **intact**), and only then does `i_size = 0; ext2_truncate_blocks(inode,
+0)`, which zeroes `i_block` in memory (`ext2_free_data`/`ext2_free_branches` do `*p = 0`) but
+is never written back because the inode is I_FREEING; `ext2_free_inode` only clears the bitmap
+bit. So on a volume last written by the native ext2 driver (embedded devices, old kernels)
+a deleted inode has dtime != 0, links 0 and a complete block map - recover it. Indirect
+blocks are freed but not zeroed in either driver.
 
 Therefore on ext4: deleted inode = name + size (i_size is 0 after kernel delete! only
 timestamps survive; the block count is 0) and **no block list**. Report `Deleted` entries
@@ -1596,12 +1647,30 @@ seed = CSUM_SEED ? s_checksum_seed : crc32c_raw(~0, uuid)        # crc32c_raw = 
 sb_csum  = crc32c_raw(~0, sb[0..0x3FC])                          # superblock: seed is ~0, not the uuid seed
 inode    = crc32c_raw(seed, le32(inum)) -> crc32c_raw(., le32(gen)) -> crc32c_raw(., inode bytes with csum fields 0)
 dirblock = crc32c_raw(seed, le32(inum)) -> (., le32(gen)) -> (., block bytes up to the tail entry)
-gdt_csum (METADATA_CSUM) = crc32c_raw(seed, le32(group)) -> (., desc with bg_checksum = 0) & 0xFFFF
-gdt_csum (GDT_CSUM only) = crc16(0xFFFF init, reflected poly 0x8005 = CRC-16/MODBUS style) over uuid, le32(group), desc bytes 0..0x1E (+0x20..desc_size)   UNVERIFIED exact variant
+gdt_csum (METADATA_CSUM) = crc32c_raw(seed, le32(group)) -> (., desc[0..0x1E]) -> (., 00 00) -> (., desc[0x20..desc_size]) & 0xFFFF
+gdt_csum (GDT_CSUM only) = crc16(0xFFFF init, reflected poly 0x8005 (table built from 0xA001), no final xor = CRC-16/MODBUS) over uuid, le32(group), desc bytes 0..0x1E, then 0x20..desc_size when 64BIT
 ```
-Rust `crc32c` crate note: `crc32c::crc32c_append(crc, data)` expects/returns *finalised*
-values; the kernel's raw form is `!crc32c_append(!raw_in, data)` UNVERIFIED - confirm by
-reproducing debugfs's "Inode checksum" on the fixture (5.5) in a unit test before use.
+All five formulas were verified 2026-10-12 against kernel source (`fs/ext4/super.c`
+`ext4_group_desc_csum` / `ext4_superblock_csum`, `lib/crc/crc16.c`: "The poly is 0x8005", table
+0x0000, 0xC0C1, 0xC181, 0x0140, ..., `crc = (crc >> 8) ^ crc16_table[(crc & 0xff) ^ *p++]`) and
+**by recomputation on dev-box images** with a 30-line Python implementation (reflected crc32c
+table from 0x82F63B78, `c = T[(c ^ b) & 0xFF] ^ (c >> 8)`, init = given seed, no final xor):
+mke2fs 1.47.2 `-O ^metadata_csum,uninit_bg` -> group 0 crc16 0x9285 == dumpe2fs; default
+ext4 -> superblock 0x38e644fd == dumpe2fs "Checksum", seed field 0x82ced6f9 == crc32c_raw(~0,
+uuid), group 0 0xe10d == dumpe2fs, inodes 2/7/8 == debugfs "Inode checksum"; `-O
+^metadata_csum_seed` -> seed = crc32c_raw(~0, uuid) = 0x03bc5831 reproduces group and inode
+checksums. The script is reproduced in 5.5 (`ext4csum.py`); use it as the oracle for the
+Rust `csum` module.
+
+Rust `crc32c` crate note: `crc32c::crc32c_append(crc, data)` takes and returns the
+*finalised* (xor 0xFFFFFFFF) value (the crate's `crc32c(data) == crc32c_append(0, data)` and
+its check value for "123456789" is 0xE3069283, the standard CRC-32C); the kernel's raw form
+is therefore `raw_out = !crc32c_append(!raw_in, data)`. Verified 2026-10-12 by running
+`crc32c` 0.6 and `crc` 3.4.0 on the dev box against the images above:
+`!crc32c_append(!0xFFFFFFFF, sb[..0x3FC])` = 0x38e644fd = dumpe2fs "Checksum", and
+`Crc::<u16>::new(&CRC_16_MODBUS)` over uuid + le32(0) + desc = 0x9285 = dumpe2fs "csum".
+Still pin both with unit tests that reproduce the debugfs "Inode checksum" of the fixture
+(5.5) - the Python oracle makes the expected values available without a mounted filesystem.
 
 #### 3.5.2 Opening
 
@@ -1768,8 +1837,10 @@ Each item: what it looks like, what the parser must do.
 * **4 KiB MFT records** (4Kn drives, `clusters_per_mft_record` = -12): usa_count = 9; never
   hard-code 1024.
 * **Cluster size > 64 KiB** (Windows 10 1709+, up to 2 MiB; sectors_per_cluster encoded as
-  a negative power) UNVERIFIED encoding - handle the s8 case defensively: if the u8 at 0x0D
-  is > 128 and the s8 value is negative, use `1 << -value`.
+  a negative power, verified against ntfs-3g bootsect.c and ntfs3 super.c, see 2.4.1): if the
+  u8 at 0x0D is > 128 use `1 << (256 - value)` and require the result to be a power of two
+  with cluster bytes <= 2 MiB; record size 1 KiB with 2 MiB clusters still means
+  `clusters_per_mft_record` is negative (-10), never a cluster count.
 * **$Bitmap says free but record says in use**: chkdsk interrupted; prefer the record.
 * **BAAD records**: chkdsk replaced the magic after detecting a bad multi-sector transfer;
   the attributes may still be intact: parse as FILE with confidence Low.
@@ -2342,6 +2413,76 @@ Damaged variants: zero bytes 1024..2048 (primary superblock) -> backup at group 
 sparse image for the backup test, `truncate -s 256M`, mke2fs output stays small on disk);
 zero the GDT block; zero one inode table block.
 
+Checksum oracle `ext4csum.py` (pure stdlib; run as `python3 ext4csum.py IMG...`; verified on
+2026-10-12 to reproduce dumpe2fs/debugfs values on gdt_csum, metadata_csum and
+metadata_csum-without-seed images, see 3.5.1). Its two CRC routines are the reference for
+the Rust `csum` module:
+```python
+#!/usr/bin/env python3
+"""ext4csum.py IMG... - recompute ext4 superblock, group-descriptor and inode checksums and
+compare with what is on disk and what debugfs prints (crc16 for GDT_CSUM, raw crc32c for
+METADATA_CSUM)."""
+import struct, sys, subprocess, re
+
+def mk_table(poly):
+    t = []
+    for i in range(256):
+        c = i
+        for _ in range(8): c = (c >> 1) ^ (poly if c & 1 else 0)
+        t.append(c)
+    return t
+T32 = mk_table(0x82F63B78)          # CRC-32C (Castagnoli), reflected
+T16 = mk_table(0xA001)              # CRC-16 poly 0x8005, reflected (kernel lib/crc/crc16.c)
+
+def crc32c_raw(init, data):         # kernel crc32c(): init as given, NO final xor
+    c = init & 0xFFFFFFFF
+    for b in data: c = T32[(c ^ b) & 0xFF] ^ (c >> 8)
+    return c
+
+def crc16(init, data):              # kernel crc16(): init as given, NO final xor
+    c = init & 0xFFFF
+    for b in data: c = (c >> 8) ^ T16[(c ^ b) & 0xFF]
+    return c
+
+def check(img):
+    f = open(img, 'rb'); f.seek(1024); sb = f.read(1024)
+    uuid = sb[0x68:0x78]
+    incompat, rocompat = struct.unpack_from('<II', sb, 0x60)
+    desc_size = struct.unpack_from('<H', sb, 0xFE)[0] if incompat & 0x80 else 32
+    bs = 1024 << struct.unpack_from('<I', sb, 0x18)[0]
+    fdb = struct.unpack_from('<I', sb, 0x14)[0]
+    mcs, gdt, cseed = bool(rocompat & 0x400), bool(rocompat & 0x10), bool(incompat & 0x2000)
+    print(img, 'bs', bs, 'desc', desc_size, 'metadata_csum', mcs, 'gdt_csum', gdt, 'csum_seed', cseed)
+    seed = None
+    if mcs:
+        print(' sb csum computed %08x stored %08x' % (crc32c_raw(0xFFFFFFFF, sb[:0x3FC]), struct.unpack_from('<I', sb, 0x3FC)[0]))
+        seed = struct.unpack_from('<I', sb, 0x270)[0] if cseed else crc32c_raw(0xFFFFFFFF, uuid)
+    f.seek((fdb + 1) * bs); d = f.read(desc_size)
+    stored = struct.unpack_from('<H', d, 0x1E)[0]
+    if mcs:
+        c = crc32c_raw(seed, struct.pack('<I', 0)); c = crc32c_raw(c, d[:0x1E])
+        c = crc32c_raw(c, b'\0\0'); c = crc32c_raw(c, d[0x20:desc_size])
+        print(' gdt csum computed %04x stored %04x' % (c & 0xFFFF, stored))
+    elif gdt:
+        c = crc16(0xFFFF, uuid); c = crc16(c, struct.pack('<I', 0)); c = crc16(c, d[:0x1E])
+        if incompat & 0x80: c = crc16(c, d[0x20:desc_size])
+        print(' gdt crc16 computed %04x stored %04x' % (c, stored))
+    if mcs:
+        isz = struct.unpack_from('<H', sb, 0x58)[0]
+        itab = struct.unpack_from('<I', d, 8)[0] | ((struct.unpack_from('<I', d, 0x28)[0] << 32) if desc_size >= 64 else 0)
+        for ino in (2, 7, 8):
+            f.seek(itab * bs + (ino - 1) * isz); raw = bytearray(f.read(isz))
+            gen = struct.unpack_from('<I', raw, 0x64)[0]; extra = struct.unpack_from('<H', raw, 0x80)[0]
+            raw[0x7C:0x7E] = b'\0\0'
+            if extra >= 4: raw[0x82:0x84] = b'\0\0'
+            c = crc32c_raw(seed, struct.pack('<I', ino)); c = crc32c_raw(c, struct.pack('<I', gen)); c = crc32c_raw(c, bytes(raw))
+            out = subprocess.run(['debugfs', '-R', 'stat <%d>' % ino, img], capture_output=True, text=True).stdout
+            m = re.search(r'Inode checksum: (0x[0-9a-f]+)', out)
+            print(' inode %d csum computed %08x debugfs %s' % (ino, c, m.group(1) if m else '?'))
+
+for img in sys.argv[1:]: check(img)
+```
+
 ### 5.6 Partitioned disk images (`mkdisk.py`, pure Python)
 
 Wrap the filesystem images into MBR and GPT disks so the partition parser is tested end to
@@ -2419,7 +2560,7 @@ checksums, and as *test oracles*.
 | Declarative binary parsing where layouts are variable (data runs, dir entries) | `binrw` | 0.15.2 | optional; zerocopy + hand parsing is enough |
 | CRC-32 (GPT) | `crc32fast` | 1.5.2 | zlib-compatible; SIMD |
 | CRC-32C (ext4 metadata_csum) | `crc32c` | 0.6.8 | hardware accelerated; see 3.5.1 note on raw vs finalised values |
-| CRC-16 (ext4 gdt_csum) and generic CRC algorithms | `crc` | 3.4.0 | configure poly 0x8005 reflected, init 0xFFFF UNVERIFIED variant |
+| CRC-16 (ext4 gdt_csum) and generic CRC algorithms | `crc` | 3.4.0 | use `crc::CRC_16_MODBUS` (poly 0x8005, init 0xFFFF, refin/refout, xorout 0) - matches the kernel's `crc16(~0, ...)` exactly (verified against dumpe2fs, 3.5.1); a 30-line table implementation is also fine |
 | GUIDs (GPT types, mixed-endian) | `uuid` | 1.28.0 | `Uuid::from_bytes_le` for on-disk order |
 | UTF-16 names (FAT LFN, exFAT, NTFS) | `widestring` | 1.2.1 | lossy decoding of unpaired surrogates |
 | OEM code pages for FAT short names (CP437/850/932) | `encoding_rs` | 0.8.42 | covers Shift-JIS (932); CP437 is not in encoding_rs - embed a 256-entry table |
@@ -2443,11 +2584,21 @@ boot checksum from sector 11 of a mkfs.exfat image, exFAT set checksum from a li
 Primary specifications and source code consulted (fetched 2026-10-12 unless noted):
 
 * Microsoft exFAT file system specification - https://learn.microsoft.com/en-us/windows/win32/fileio/exfat-specification (boot sector, checksums, directory entry types, NameHash, flags, timestamps)
-* Microsoft FAT32 File System Specification (fatgen103) - https://download.microsoft.com/download/1/6/1/161ba512-40e2-4cc9-843a-923143f3456c/fatgen103.doc (not fetchable as text; the cluster-count rule and BPB layout were cross-checked via the next item)
+* Microsoft FAT32 File System Specification (fatgen103) - https://download.microsoft.com/download/1/6/1/161ba512-40e2-4cc9-843a-923143f3456c/fatgen103.doc ; PDF mirror read in full via pdftotext on 2026-10-12: https://academy.cba.mit.edu/classes/networking_communications/SD/FAT.pdf (BPB_ExtFlags bits, 3.6 "Backup BPB Structure": sector 6 holds a copy of all three boot sectors incl. FSInfo, 4.2 FAT[0]/FAT[1] and ClnShutBitMask/HrdErrBitMask 0x8000/0x4000 and 0x08000000/0x04000000, EOC/bad values, 4085/65525 thresholds, FSInfo offsets 0/484/488/492/508, DIR_CrtTimeTenth 0..199, DIR_FstClusHI "must be set to 0 on volumes formatted FAT12/FAT16", LAST_LONG_ENTRY 0x40, ChkSum loop)
 * Wikipedia, "Design of the FAT file system" - https://en.wikipedia.org/wiki/Design_of_the_FAT_file_system (BPB/EBPB, FSInfo, FAT entry values, directory and LFN entries, checksum, time/date)
 * Wikipedia, "Master boot record" - https://en.wikipedia.org/wiki/Master_boot_record
 * Wikipedia, "GUID Partition Table" - https://en.wikipedia.org/wiki/GUID_Partition_Table (header/entry layout, EFI/MS basic data/Linux fs/swap GUIDs)
-* UEFI Specification 2.10, section 5 "GUID Partition Table (GPT) Disk Layout" - https://uefi.org/specs/UEFI/2.10/05_GUID_Partition_Table_Format.html (HTTP 403 at fetch time; layout taken from Wikipedia which mirrors it)
+* UEFI Specification 2.10, section 5 "GUID Partition Table (GPT) Disk Layout" - https://uefi.org/specs/UEFI/2.10/05_GUID_Partition_Table_Format.html (HTTP 403 at fetch time on 2026-10-12, twice; layout, attribute bits and all type GUIDs taken from Wikipedia which mirrors it; the `128 * 2^n` SizeOfPartitionEntry rule confirmed from the spec text as reproduced in EDK2 `MdePkg/Include/Uefi/UefiGpt.h` and the OSDev GPT page: "shall be set to a value of 128 x 2^n where n is an integer greater than or equal to zero")
+* UAPI Group, "Discoverable Partitions Specification" - https://uapi-group.org/specifications/specs/discoverable_partitions_specification/ (Linux /home, swap, root x86-64, generic data and ESP GUIDs)
+* GNU ddrescue manual, "Mapfile structure" - https://www.gnu.org/software/ddrescue/manual/ddrescue_manual.html (block statuses `?` `*` `/` `-` `+`, status line `pos status pass`, `#` comments)
+* ntfs-3g `libntfs-3g/bootsect.c` - https://raw.githubusercontent.com/tuxera/ntfs-3g/edge/libntfs-3g/bootsect.c (sectors_per_cluster: powers of two or 240..253 decoded as `1 << (256 - v)`; clusters_per_mft_record negative = `1 << -c`)
+* ntfs-3g `libntfs-3g/dir.c` - https://raw.githubusercontent.com/tuxera/ntfs-3g/edge/libntfs-3g/dir.c (`ntfs_link_i` increments link_count per $FILE_NAME incl. DOS names)
+* Linux `fs/ntfs3/super.c` and `fs/ntfs3/record.c` - https://raw.githubusercontent.com/torvalds/linux/master/fs/ntfs3/super.c , .../record.c (`true_sectors_per_clst`: <= 0x80 plain, >= 0xF4 negative; record/index size negative encoding; `mi_format_new` bumps the sequence number on reuse)
+* Linux `fs/fat/dir.c`, `fs/fat/inode.c`, `fs/fat/namei_vfat.c` - https://raw.githubusercontent.com/torvalds/linux/master/fs/fat/dir.c , .../inode.c , .../namei_vfat.c (`fat_remove_entries` writes only name[0] = 0xE5; `fat_detach` sets i_pos = 0 so the truncated inode is never written back: FstClusHI survives on Linux)
+* Linux `fs/exfat/exfat_raw.h` and `fs/exfat/fatent.c` - https://raw.githubusercontent.com/torvalds/linux/master/fs/exfat/exfat_raw.h , .../fatent.c (entry type codes incl. vendor 0xE0/0xE1; `exfat_free_cluster` clears bitmap bits only, never FAT entries)
+* Linux `fs/ext4/ext4.h`, `fs/ext4/super.c`, `lib/crc/crc16.c` - https://raw.githubusercontent.com/torvalds/linux/master/fs/ext4/ext4.h , .../fs/ext4/super.c , .../lib/crc/crc16.c (`ext4_rec_len_from_disk`, bg_flags, inode flags; `ext4_group_desc_csum`, `ext4_superblock_csum`; CRC-16 poly 0x8005 reflected table)
+* Linux `fs/ext2/inode.c` - https://raw.githubusercontent.com/torvalds/linux/master/fs/ext2/inode.c (`ext2_evict_inode`: dtime + sync_inode_metadata before truncation; `ext2_free_data`/`ext2_free_branches` zero pointers only in memory)
+* Empirical checksum verification 2026-10-12 (Python, dev box): ext4 gdt_csum/crc16, superblock/descriptor/inode crc32c with both seed forms, exFAT boot-region checksum (sector 11 == sector 23 region, value repeated bps/4 times) and up-case table checksum 0xE619D30D (5836-byte table) all reproduced bit-exactly from mke2fs 1.47.2 / mkfs.exfat 1.3.2 images.
 * ntfs-3g `include/ntfs-3g/layout.h` - https://raw.githubusercontent.com/tuxera/ntfs-3g/edge/include/ntfs-3g/layout.h (boot sector, MFT_RECORD, flags, attribute types, STANDARD_INFORMATION, FILE_NAME namespaces, index flags, MREF/MSEQNO, system files)
 * ntfs-3g `libntfs-3g/mft.c` - https://raw.githubusercontent.com/tuxera/ntfs-3g/edge/libntfs-3g/mft.c (`ntfs_mft_record_free`: in-use flag, sequence number wrap, $MFT bitmap; `ntfs_mft_record_layout`: usa_ofs/usa_count/attrs_offset)
 * linux-ntfs documentation (flatcap) - https://flatcap.github.io/linux-ntfs/ntfs/concepts/file_record.html , .../concepts/attribute_header.html , .../concepts/data_runs.html , .../concepts/file_reference.html , .../concepts/index_record.html , .../concepts/compression.html , .../attributes/standard_information.html , .../attributes/file_name.html , .../attributes/index_root.html , .../attributes/attribute_list.html , .../files/boot.html , .../files/index.html
@@ -2459,5 +2610,9 @@ Primary specifications and source code consulted (fetched 2026-10-12 unless note
 * Empirical observations: images produced on the dev box with mkfs.fat 4.2, exfatprogs 1.3.2, ntfs-3g 2022.10.3, e2fsprogs 1.47.2 (section 5), 2026-10-12.
 
 Not consulted (unavailable or not fetched): Brian Carrier, "File System Forensic Analysis"
-(the NTFS index-slack and sequence-number timing statements tagged UNVERIFIED come from
-general forensic knowledge usually attributed to it); the osdev.org FAT page (HTTP 403).
+(the NTFS index-slack statement and the Windows sequence-number timing, both still tagged
+UNVERIFIED, come from general forensic knowledge usually attributed to it; secondary web
+sources agree that Windows bumps the sequence number on deallocation); the osdev.org FAT page
+and uefi.org (HTTP 403). Windows' exFAT FAT-chain behaviour on delete (2.3.3) is the only
+other remaining UNVERIFIED item; the Linux side of every "driver behaviour" claim has been
+checked against kernel source.

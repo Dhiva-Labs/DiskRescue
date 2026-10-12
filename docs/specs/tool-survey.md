@@ -2,7 +2,11 @@
 
 Status: research spec for DiskRescue. Lines tagged `UNVERIFIED` could not be confirmed
 against a primary source during research and must be fact-checked before they are
-used in README text or in code comments.
+used in README text or in code comments. Fact-check pass 2026-10-12: every tagged line
+and the on-disk/wire numbers were checked against primary sources (ddrescue 1.30 manual,
+Linux kernel source, OpenSuperClone/PhotoRec/zune-jpeg/dd_rescue source, Garfinkel 2007
+PDF, man pages, Debian copyright files, crates.io); corrections are applied in place and
+the sources are listed in section 7. Tags that remain are listed in 1.7.
 
 Scope of this document: (a) what each existing tool does, how it does it, its licence
 and where it stops; (b) a feature matrix for photo/video recovery; (c) field practice
@@ -57,8 +61,8 @@ Licence abbreviations: GPL2+ = GNU GPL v2 or later; prop. = proprietary/closed s
 - Does: GUI viewer for ddrescue mapfiles: colour block grid, zoom to sector level,
   block inspector, auto re-read while the rescue runs, domain-mapfile overlay, decimal
   and binary units.
-- Licence: GPL-3.0. Object Pascal / Lazarus. Version 0.4.5 (February 2022), Windows,
-  Linux, macOS, BSD.
+- Licence: GPL-3.0. Object Pascal / Lazarus. Version 0.4.5 (25 February 2022, "restores
+  compatibility with ddrescue 1.24 and later"); Windows, GNU/Linux, macOS.
 - Relevance: defines the visual vocabulary users expect (green finished, red bad, etc.).
   DiskRescue's HTML/terminal map should follow the same colour semantics so screenshots
   are mutually readable.
@@ -78,17 +82,27 @@ Licence abbreviations: GPL2+ = GNU GPL v2 or later; prop. = proprietary/closed s
   Virtual driver modes 1-5 (1 = all phases starting at phase 4; 2 = phase 4 only;
   3 = like 2 but grows read size up to cluster size on sequential reads; 4 = read only
   from destination; 5 = return zeros).
-- Hardware: USB relay control for automatic power-cycling; v2.6.0 added "Asclepius
-  relay and current sensing board". v2.5.0 raised max retry runs from 8 to 1000.
+- Hardware: USB relay control for automatic power-cycling; v2.6.0 (listed as
+  work-in-progress in the README as of 2026-10) adds "Asclepius relay and current
+  sensing board". v2.5.0 raised max retry runs from 8 to 1000.
 - Licence: GPLv2 (HDDSuperClone source released by its author; OpenSuperClone GPLv2).
 - Strengths: the only open tool with controller-level timeouts and power-cycle
   recovery; targeted (file-driven) imaging. HDDSuperClone's skip-threshold note: a
   drive with slow-response firmware glitches "will trigger runaway skipping", mitigated
-  by setting the threshold to 60000 ms. UNVERIFIED: default skip threshold and default
-  read timeout values of OpenSuperClone (wiki pages for settings were not reachable).
+  by setting the threshold to 60000 ms. OpenSuperClone defaults (verified in
+  `src/opensuperclone/opensuperclone.h` and `common.h`, 2026-10-12): skip threshold
+  1000 ms (`DEFAULT_SKIP_TIMEOUT`, GUI label "Skip Threshold (ms) phase-1-2"); rate skip
+  50 kB/s for phase 3 (`DEFAULT_RATE_SKIP` 50000 B/s); skip size 0x1000 LBAs = 2 MiB at
+  512 B (`DEFAULT_SKIP_SIZE`), max skip 0x4000000 LBAs = 32 GiB; cluster 128 sectors
+  (64 KiB, `DEFAULT_CLUSTER_SIZE`); the per-read "soft reset" timeout is 8 s
+  (`SOFT_RESET_TIMER`), busy-wait 20 s (`BUSY_WAIT_TIMER`), and the optional per-phase
+  timers are 0.25 s (phases 1-2), 0.35 s (phase 3), 0.5 s (phase 4), 0.8 s
+  (trim/divide/scrape) and 8 s (retry); retry runs up to 1000 since 2.5.0.
 - Limitations: Linux only, needs root and (for direct modes) drives hidden from the
-  kernel; own log format, not the ddrescue mapfile (UNVERIFIED whether it can
-  import/export ddrescue maps); no file carving or repair.
+  kernel; own log format, not the ddrescue mapfile (see 2.3), but it can import and
+  export ddrescue mapfiles ("File->Import ddrescue Log (Map) File" / "Export" in the
+  wiki page Basics of Operation; `read_ddrescue_log_ccc` / `write_ddrescue_logfile_ccc`
+  in `src/opensuperclone/opensuperclone.c`); no file carving or repair.
 
 #### dd_rescue (Kurt Garloff)
 - Does: dd-like copier that "does not abort on errors"; two block sizes (large "soft"
@@ -96,8 +110,13 @@ Licence abbreviations: GPL2+ = GNU GPL v2 or later; prop. = proprietary/closed s
   clean period); reverse copying from the end; sparse output; `O_DIRECT` to expose
   medium errors immediately; plugins (hash, lzo, crypt).
 - Licence: GNU GPL. Name clash is why Debian's GNU ddrescue package is `gddrescue`.
+- Options (from the `getopt` table in `dd_rescue.c`): `-b softbs` / `-B hardbs` (defaults
+  16 KiB / 4 KiB buffered, 1 MiB / 512 B with `-d`), `-d` / `-D` `O_DIRECT` on input /
+  output, `-r` reverse, `-l logfile` (errors and summary), `-o bbfile` (one bad-block
+  number per line, in units of `hardbs`, consumable by `mke2fs -l`), `-e maxerr`,
+  `-s ipos` / `-S opos`, `-A` always write (zero-fill on error), `-a` sparse.
 - Limitations: no multi-phase algorithm, no mapfile-driven resume comparable to GNU
-  ddrescue (it keeps a bad-block list file; UNVERIFIED exact option letter), so it
+  ddrescue (only the `-o bbfile` bad-block list), so it
   "spends more time at error areas" in the sense criticised by the ddrescue manual.
 
 #### safecopy
@@ -106,8 +125,12 @@ Licence abbreviations: GPL2+ = GNU GPL v2 or later; prop. = proprietary/closed s
   recognisable string (`-M`) so files containing holes can be found later; include (`-I`)
   and exclude (`-X`) block lists compatible with e2fsck badblocks lists; `-Z` forces
   head repositioning before retries.
-- Presets: `--stage1` (fast, minimal strain: `-f 10% -R 1 -Z 0`), `--stage2` (precise
-  bad-area boundaries: `-f 128* -r 1*`), `--stage3` (maximum effort: `-f 1* -R 4 -Z 1`).
+- Presets (man page, verbatim): `--stage1` = `-f 10% -r 10% -R 1 -Z 0 -L 2 -M BaDbLoCk
+  -o stage1.badblocks` (fast, no retries, avoid bad areas); `--stage2` = `-f 128* -r 1*
+  -R 1 -Z 0 -L 2 -I stage1.badblocks -o stage2.badblocks` (find exact ends of bad
+  areas); `--stage3` = `-f 1* -r 1* -R 4 -Z 1 -L 2 -I stage2.badblocks -o
+  stage3.badblocks` (maximum retries, head realignment, low-level access). `-R`
+  defaults to 3; `-o file` writes the badblocks list.
 - Licence: GPLv2 or higher. Last release 1.7 (March 2012): effectively unmaintained.
 - Relevance: the "mark the hole with a string" idea is useful for DiskRescue's
   validation stage (a JPEG whose bytes contain the hole marker is known-damaged, not
@@ -135,9 +158,11 @@ Licence abbreviations: GPL2+ = GNU GPL v2 or later; prop. = proprietary/closed s
 - Limitations: output names are sequence numbers (`f1234567.jpg`), no original names
   or dates (TestDisk's undelete gives names but only for simple cases); no imaging of
   failing media (users are told to image with ddrescue first); fragmented video is
-  essentially unsupported; JPEG repair absent; HEIC support UNVERIFIED (forum thread on
-  7.2-WIP shows users unable to find a HEIC option although the wiki lists it); Canon CR2
-  is recovered under the TIFF family, which confuses users.
+  essentially unsupported; JPEG repair absent; HEIC is recovered (`src/file_mov.c`
+  matches `ftyp` brand `heic` and sets extension `.heic`; listed on the "File Formats
+  Recovered By PhotoRec" wiki page) but it lives inside the `mov` family of the
+  file-type list, so there is no separate HEIC toggle, which is what the 7.2-WIP forum
+  thread was about; Canon CR2 is recovered under the TIFF family, which confuses users.
 
 #### Foremost
 - Does: header/footer (and header/max-size) carving from a config file of signatures.
@@ -147,19 +172,24 @@ Licence abbreviations: GPL2+ = GNU GPL v2 or later; prop. = proprietary/closed s
 
 #### Scalpel
 - Does: "complete rewrite of the Foremost 0.69 file carver" with large performance
-  gains; v2 added multithreading and GPU header/footer matching. Scalpel3 (arXiv
+  gains; v2 added multithreading; GPU header/footer matching was offered in 2.0 but the
+  2.02 README says it is "deprecated and removed". Scalpel3 (arXiv
   2608.20363, 2026) adds a "massively threaded architecture for contiguous and fragmented
   recovery" with pluggable per-format validators/reassembly strategies and ONNX models.
-- Licence: GPL-2+ (1.60 and 2.02 on GitHub `nolaforensix`). Scalpel3 availability
-  UNVERIFIED.
+- Licence: GPL (2.02 README: "released under the GPL"; 1.60 and 2.02 on GitHub
+  `nolaforensix`). Scalpel3 availability UNVERIFIED: the arXiv abstract (submitted
+  2026-06-17, revised 2026-08-24) names no repository or release.
 - Limitations: as Foremost until Scalpel3; Scalpel3 is a research platform not a
   consumer tool.
 
 #### bulk_extractor (Simson Garfinkel et al.)
 - Does: "find evidence button": scans bulk data for features (emails, URLs, card
   numbers) and also carves JPEG etc.; multithreaded; recursive decompression.
-- Licence: MIT plus bundled components under other licences (CPL 1.0, GPL-3.0-only,
-  LGPL 2.1/3.0, OpenSSL).
+- Licence (LICENSE.md in `simsong/bulk_extractor`): original NPS-era code is US
+  Government work not subject to copyright (17 U.S.C. 105); post-2015 project code is
+  GPL-3.0-or-later ("supersedes the prior statement that post-NPS modifications were
+  under the MIT License"); bundled components under CPL 1.0 (SleuthKit headers), MIT
+  (base64, utfcpp) and others. Not MIT, not public domain as a whole.
 - Relevance: its EXIF/JPEG scanner and scalable scanning architecture; not a recovery
   tool for end users.
 
@@ -210,8 +240,9 @@ Licence abbreviations: GPL2+ = GNU GPL v2 or later; prop. = proprietary/closed s
   signatures, RAID reconstruction, disk imaging with "multi-pass imaging" and "runtime
   imaging" (clones sectors as they are read during analysis), file previewer, DeepSpar
   hardware integration.
-- Licence: proprietary; Windows, macOS, Linux; consumer editions from USD 49.99,
-  Technician editions higher.
+- Licence: proprietary; Windows, macOS, Linux; consumer editions from USD 49.99 (FAT
+  edition; NTFS 59.99, full 79.99), Technician edition USD 899 (review/price listings
+  2026).
 - Limitations: closed; generic signature carving with no media repair; imaging via OS
   block layer unless DeepSpar hardware present.
 
@@ -229,17 +260,20 @@ Licence abbreviations: GPL2+ = GNU GPL v2 or later; prop. = proprietary/closed s
 - Does: Standard/Professional Recovery: broad FS support including RAW-state volumes
   and lost partitions, RAID, virtual disks. UFS Explorer Video Recovery: frame-level
   reconstruction of interrupted recordings from RIFF/AVI and QuickTime structures plus
-  around 130 proprietary CCTV/dashcam stream formats (Hikvision WFS, Dahua DHFS, ...),
+  over 130 proprietary CCTV/dashcam stream formats (Hikvision WFS, Dahua DHFS, ...),
   exporting original codec data (MJPEG, H.264, H.265, MPEG variants) by transmuxing to
   AVI without re-encoding.
-- Licence: proprietary; Video Recovery licensed to organisations only (base rate about
-  EUR 8,000/year); Windows x86-64 only for Video Recovery.
+- Licence: proprietary; Video Recovery licensed to organisations only ("Personal use
+  licenses are not provided"; commercial base rate EUR 8,000/year, 1-5 year terms);
+  Windows 7+ x86-64 only for Video Recovery.
 - Relevance: the benchmark for fragmented video reassembly; shows the market gap for an
   open equivalent.
 
 #### Recuva (Piriform/CCleaner)
 - Does: Windows-only consumer undelete (NTFS/FAT/exFAT) with a slower "deep scan"
-  signature mode. UNVERIFIED: closed-source freeware with a paid Professional tier.
+  signature mode (deep scan is in the free tier too).
+- Licence: proprietary freeware with a paid Professional tier (USD 19.95-29.95 per
+  2026 review listings; the official page refused automated fetches).
 - Limitations: no imaging, no repair, deep scan weaker than PhotoRec, Windows only.
 
 #### Disk Drill (CleverFiles)
@@ -280,8 +314,9 @@ Licence abbreviations: GPL2+ = GNU GPL v2 or later; prop. = proprietary/closed s
   that inode" and matching names through deleted directory entries; options
   `--restore-all`, `--restore-file`, `--restore-files`, `--restore-directory`, `--after`,
   `--before`, `--inode`. Requires unmounted (or read-only mounted) FS and e2fsprogs
-  1.41+. Does not restore hard/soft links or xattrs. Last release 0.2.4 (January 2013).
-  Licence: UNVERIFIED (believed GPLv2).
+  1.39+ (1.41+ for ext4). Does not restore hard/soft links or xattrs. Last release 0.2.4
+  (January 2013). Licence: GPL-2 (Debian copyright file for 0.2.4-3: upstream files
+  2009-2012 Nic Case, `License: GPL-2`).
 
 #### ext4magic
 - Does: same journal-based approach, "much more effective" than extundelete in Debian's
@@ -289,8 +324,9 @@ Licence abbreviations: GPL2+ = GNU GPL v2 or later; prop. = proprietary/closed s
   whose data blocks are all unallocated; `-R` recover all matched inodes incl. partially
   overwritten and directory structure; `-m` partially deleted FS; `-M` whole-FS
   recovery after `rm -rf`; `-j` external journal copy; `-a`/`-b` epoch-second window
-  (default: last 24 h); `-l` list; `-f` filename filter; `-d` destination. Needs the
-  journal: "no journal means forget it". Licence: UNVERIFIED (believed GPLv2).
+  (default: last 24 h); `-l` list; `-f` filename filter; `-d` destination (default
+  `RECOVERDIR`). Needs the journal: man page, without a usable journal "it will not be
+  possible to recover any file at any time". Licence: GPL-2+ (Debian copyright file).
 
 #### ntfsundelete (ntfs-3g / ntfsprogs)
 - Does: scan/undelete/copy modes over an NTFS volume; prints inode, name, size and
@@ -459,6 +495,23 @@ backticks is the literal string. `{dev}`, `{mnt}`, `{out}` are substituted.
 - Read-only destination too small:
   `ERROR: destination has {free} free but the image needs {need} (source size plus 5% for the mapfile and report). Free space or choose another destination.`
 
+### 1.7 Fact-check status (2026-10-12)
+
+Resolved from primary sources (tags removed, text corrected where needed): OpenSuperClone
+defaults, log layout and ddrescue import/export; dd_rescue `-o bbfile`; safecopy preset
+strings and marker default; PhotoRec HEIC, `b` prefix, 500 files per directory and the
+sector-number file names; Scalpel GPU status; bulk_extractor licence; Recuva tiering;
+extundelete and ext4magic licences; ATA IDENTIFY words 169/69; NVMe DLFEAT byte 33;
+`eh_timeout`; `O_DIRECT` vs read-ahead; sysfs location of `max_retries`; NVMe metadata
+format without root; Garfinkel 2007 per-type table (AVI is 20 %, not 22 %) and gap
+tables; zune-jpeg partial decode; h264-reader currency; ntfscp destination rules;
+`mkntfs -C`; all crate versions.
+
+Still UNVERIFIED (no primary source found): the exact set of USB bridges/OS versions
+that pass UNMAP (1.4); the 8 MB / 30.6 MB dead-controller capacities (forum reports only,
+2.6); the benefit of the HDD cool-down pause (3.2); a fragmentation-rate study for
+consumer camera cards (4.2); Scalpel3 code availability (1.2).
+
 ---
 
 ## 2 Exact on-disk / wire details
@@ -525,7 +578,7 @@ zeros if the output is a regular file created by ddrescue.
 
 | Option | Default |
 |---|---|
-| `-b, --sector-size` | 512 (2048 for CD-ROM) |
+| `-b, --sector-size` | 512 (not auto-detected; manual: "usually 512 for hard discs and 3.5" floppies, 1024 for 5.25" floppies, and 2048 for cdroms", so pass `-b 2048` for CD-ROM) |
 | `-c, --cluster-size` | 64 KiB / sector_size (= 128 sectors at 512 B) |
 | `-K, --skip-size=[initial][,max]` | initial = infile_size / 32768, minimum 64 KiB; max = 1 % of infile size; doubled on each error/slow read, reset to initial on good data; valid 64 KiB - 1 EiB; `0` disables skipping |
 | `-r, --retry-passes` | 0 (`-1` = infinite; direction reversed each pass) |
@@ -557,8 +610,10 @@ rest of the block after finding the first error in the block"), trimming (forwar
 sector from the leading edge until bad, backward from trailing edge until bad; rest
 becomes non-scraped), sweeping (copy non-tried blocks skipped due to errors, skipping
 disabled), scraping (one sector forward through non-scraped), retrying (bad sectors,
-each once per pass, direction alternates). "Each sector is tried at most two times"
-before the retry phase.
+each once per pass, direction alternates). "Each sector is tried at most two times:
+the first in the copying or sweeping phases as part of a large block read, the second
+during trimming, scraping, or retrying as a single sector read" (with `-r 0`; each retry
+pass adds one more single-sector attempt).
 
 ### 2.3 OpenSuperClone / HDDSuperClone (for interoperability notes)
 
@@ -566,8 +621,22 @@ before the retry phase.
   skip on read rate; 4 forward copy, no skipping; Trimming; Dividing (only when trimming
   disabled); Scraping; Retrying. Mapping to ddrescue marks: phases 1-4 = copying
   passes; trimming = trimming; scraping = scraping; retrying = retrying.
-- Progress log: own text format ("logs each step"), UNVERIFIED layout; DiskRescue will
-  not parse it in v1.
+- Progress log (`write_logfile_ccc` in `src/opensuperclone/opensuperclone.c`): text,
+  `#` comment lines. Header `# Disk progress log file created by OpenSuperClone version
+  X`, `# <date>`, `# command= ...`; a settings block between `# startconfig` and
+  `# endconfig` (lines `# key \tvalue`: `softtimer`, `busytimer`, `skiptimer`,
+  `rateskip`, `clustersize`, `blocksize`, `sectorsize`, `retries`, `size`, `minskip`,
+  `maxskip`, `reverse`, `model`, `serial`, ...); optional analyze / SMART / identify
+  blocks; then `# current position \t \tstatus` followed by one line
+  `0x%06llx \t \t0x%llx`, and `# position \tsize \tstatus \tinfo \terr/status/time`
+  followed by one line per block `0x%06llx \t0x%06llx \t0x%llx \t0x%llx \t0x%llx`.
+  Position and size are in LBAs (sectors), not bytes. Status codes
+  (`opensuperclone.h`): `NONTRIED 0x00`, `NONTRIMMED 0x10`, `NONDIVIDED 0x20`,
+  `NONSCRAPED 0x30`, `BAD 0x40`, `FINISHED 0x7f`, plus the `BAD_HEAD 0x80` bit. Its
+  ddrescue export (`write_ddrescue_logfile_ccc`) writes byte positions and a
+  two-field status line (`# current_pos  current_status`, no `current_pass`), so
+  DiskRescue's mapfile parser must accept a missing pass number (treat as 1), as it must
+  for pre-1.20 logfiles. DiskRescue will not parse the native log in v1.
 - Direct modes require the drive hidden from the kernel (e.g. unbinding the AHCI port)
   and the controller in AHCI mode.
 
@@ -575,10 +644,19 @@ before the retry phase.
 
 From `drivers/scsi/sd.h` (mainline, 2026): `SD_TIMEOUT (30 * HZ)` = 30 s per command,
 "user modifiable via sysfs but initially set to SD_TIMEOUT"
-(`/sys/block/sdX/device/timeout`); `SD_MAX_RETRIES 5` (`/sys/block/sdX/device/max_retries`,
-range -1..5). A single unreadable 64 KiB cluster can therefore cost up to
-(1 + 5) x 30 s = 180 s before `read(2)` returns `EIO`, and libata error handling adds
-its own resets (`eh_timeout`, default 10 s UNVERIFIED) and link resets. USB mass storage
+(`/sys/block/sdX/device/timeout`); `SD_MAX_RETRIES 5`. The `max_retries` attribute is
+on the scsi_disk class device, not the scsi_device: `/sys/class/scsi_disk/<H:C:T:L>/max_retries`
+= `/sys/block/sdX/device/scsi_disk/<H:C:T:L>/max_retries` (`sd.c` `max_retries_store`
+accepts -1 = `SCSI_CMD_RETRIES_NO_LIMIT` (unlimited) up to 5). A single unreadable
+64 KiB cluster can therefore cost up to (1 + 5) x 30 s = 180 s before `read(2)` returns
+`EIO` when the command hangs; a drive that reports MEDIUM ERROR with valid sense data is
+failed immediately without mid-layer retries (`scsi_io_completion_action` falls to its
+`default: action = ACTION_FAIL` branch; libata `ata_eh_worth_retry` returns 0 for
+`AC_ERR_MEDIA`), so its cost is the drive's own internal recovery time. On top of the
+command timeout, the SCSI error handler issues its own recovery commands (TEST UNIT
+READY / REQUEST SENSE) bounded by `/sys/block/sdX/device/eh_timeout`
+(`SCSI_DEFAULT_EH_TIMEOUT` = 10 s, `include/scsi/scsi.h`) and libata adds device and
+link resets. USB mass storage
 sits on top of the same SCSI path, and the bridge chip may reset the device on timeout
 (re-enumeration, device node may change: ddrescue's advice to use `--ask` and check
 model/serial applies).
@@ -590,11 +668,15 @@ that happens"). TLER is set with `smartctl -l scterc,70,70` (not available on th
 box) or ATA `SCT ERROR RECOVERY CONTROL`; consumer drives often ignore it.
 
 Practical consequences for DiskRescue's defaults (profile table in 3.2):
-- Lower `/sys/block/sdX/device/timeout` to 7-10 s and `max_retries` to 0 when root
-  (restore on exit); print the command when not root.
+- Lower `/sys/block/sdX/device/timeout` to 7-10 s and
+  `/sys/class/scsi_disk/<H:C:T:L>/max_retries` to 0 when root (restore on exit); print
+  the commands when not root.
 - Use `O_DIRECT` and never `readahead`; set `/sys/block/sdX/queue/read_ahead_kb` to 0
-  when root (restore on exit). UNVERIFIED that read-ahead is fully bypassed by
-  `O_DIRECT` on every kernel; setting it to 0 is cheap insurance.
+  when root (restore on exit). Read-ahead exists only in the buffered read path
+  (`filemap_read` -> `page_cache_sync_ra`, `mm/filemap.c` / `mm/readahead.c`); an
+  `O_DIRECT` read of a block device goes through `blkdev_direct_IO` (`block/fops.c`) and
+  never triggers it. Setting `read_ahead_kb` to 0 is still cheap insurance against
+  other processes (udev probes, desktop indexers) touching the device via the page cache.
 - Treat any read slower than the profile's `slow_read_ms` as a "slow read" and skip,
   exactly like ddrescue's `--min-read-rate` and OpenSuperClone phase 3.
 
@@ -604,10 +686,19 @@ From ATA/ACS: word 169 bit 0 = DATA SET MANAGEMENT (TRIM) supported; word 69 bit
 "Deterministic read after TRIM supported" (DRAT); word 69 bit 5 = "read zeroes after
 TRIM supported" (RZAT/DZAT). `hdparm -I` prints `Data Set Management TRIM supported`,
 `Deterministic read data after TRIM`, `Deterministic read ZEROs after TRIM`.
-UNVERIFIED: word/bit numbers quoted from memory of ACS-2; confirm against the ACS
-spec before coding the IDENTIFY parser (needs `SG_IO`/`HDIO_DRIVE_CMD`, root). NVMe:
-Identify Namespace DLFEAT (byte 33) bits 2:0 = read behaviour of deallocated blocks
-(0 = not reported, 1 = all zeros, 2 = all ones). UNVERIFIED byte offset. Without root,
+Confirmed against the Linux kernel `include/linux/ata.h`: `ATA_ID_DATA_SET_MGMT = 169`
+(bit 0, tested by `ata_id_has_trim`, which additionally requires ATA major version >= 7)
+and `ATA_ID_ADDITIONAL_SUPP = 69` with mask `0x4020` (bit 14 DRAT + bit 5 RZAT) tested by
+`ata_id_has_zero_after_trim`; hdparm `identify.c` labels word 69 bit 14 "Deterministic
+read data after TRIM" and bit 5 "Deterministic read ZEROs after TRIM", and prints "Data
+Set Management TRIM supported" only when word 169 bit 0 is set and word 169 != 0xFFFF
+(treat 0xFFFF as invalid). Reading IDENTIFY needs `SG_IO`/`HDIO_DRIVE_CMD` (root). NVMe:
+Identify Namespace DLFEAT is byte 33 (`struct nvme_id_ns`, `include/linux/nvme.h`:
+nsze/ncap/nuse bytes 0-23, nsfeat 24, nlbaf 25, flbas 26, mc 27, dpc 28, dps 29, nmic 30,
+rescap 31, fpi 32, dlfeat 33); bits 2:0 = read behaviour of deallocated blocks (0 = not
+reported, 1 = all bytes 0x00, 2 = all bytes 0xFF), bit 3 = Write Zeroes may deallocate,
+bit 4 = guard field CRC for deallocated blocks (libnvme `enum nvme_id_ns_dlfeat`).
+Without root,
 DiskRescue falls back to `/sys/block/<dev>/queue/rotational` (0 = SSD) and
 `/sys/block/<dev>/queue/discard_granularity` (> 0 = discard supported) to decide
 whether to print the TRIM note.
@@ -634,18 +725,27 @@ are the commonly reported values.
 
 ### 2.7 PhotoRec output conventions (for migration/compat)
 
-Output directories `recup_dir.1`, `recup_dir.2`, ... each holding up to 500 files;
-filenames `f<sector>.<ext>` where `<sector>` is the start sector (or `t`-prefixed for
-thumbnails extracted from EXIF, `b`-prefixed for brute-forced); `report.xml` (DFXML)
-lists each carved file with byte runs. UNVERIFIED: 500-per-directory and `b` prefix.
+Output directories `recup_dir.1`, `recup_dir.2`, ... each holding up to 500 files
+(`MAX_FILES_PER_DIR 500`, `DEFAULT_RECUP_DIR "recup_dir"` in `src/photorec.h`);
+filenames are `%c%07lu.<ext>` (`set_filename` in `src/photorec.c`): prefix `f`, then
+the start sector relative to the partition start,
+`(location.start - part_offset) / sector_size`, zero-padded to 7 digits (e.g.
+`f0012345.jpg`); `t` prefix for EXIF thumbnails extracted from JPEGs (`file_jpg.c`);
+`b` prefix is used for files written while "Keep corrupted files" is on (`broken` =
+`STATUS_EXT2_ON/OFF_SAVE_EVERYTHING`), not for brute-forced files; `report.xml` (DFXML)
+lists each carved file with byte runs and is written only when built with DFXML enabled
+(configure default is enabled; `--disable-dfxml` turns it off).
 DiskRescue should offer `--photorec-names` for users with existing scripts.
 
 ### 2.8 safecopy badblocks list format
 
 Plain text, one block number per line, in units of the `-b` block size; compatible
-with `e2fsck -l`/`badblocks` output; `-I file` includes only listed blocks, `-X file`
-excludes them. Marker string default inserted for unreadable data: UNVERIFIED default
-text (`-M` sets it).
+with `e2fsck -l`/`badblocks` output; `-o file` writes it; `-I file` = incremental mode
+("assume the target file already exists and has holes specified in the badblockfile",
+i.e. only listed blocks are re-read), `-X file` excludes listed blocks (overrides `-I`).
+No marker string by default (unreadable data is left as a hole); `-M string` enables
+marking, and `--stage1` passes `-M BaDbLoCk`, so `BaDbLoCk` is the marker to look for
+in stage-1 outputs.
 
 ---
 
@@ -765,8 +865,11 @@ fn bifragment_carve(image, header_pos, footer_pos, validate):
     return None
 ```
 "Most bifragmented files were split by 1, 2, 4, 8 512-byte sectors", "believed to be
-caused by a single-cluster file within the fragmented file", so search small gaps first
-and stop early. Validators must be *fast*: JPEG = Huffman decode of the scan with
+caused by a single-cluster file within the fragmented file" (Pal & Memon slides); the
+paper's own Tables 4/5/8 show the common gaps as 4096, 8192, 16,384 and 32,768 bytes,
+i.e. 1-8 file-system clusters (8 blocks by far the most common), plus a cluster of tiny
+(2-59 byte) gaps that are carver artefacts. So iterate `gap_len` over cluster-size
+multiples (1, 2, 4, 8 clusters) first, then sector multiples, and stop early. Validators must be *fast*: JPEG = Huffman decode of the scan with
 restart-marker checks; MP4 = chunk-offset table consistency (`stco`/`co64` entries land
 on sample boundaries) or, for moov-less files, NAL/ADTS frame continuity.
 
@@ -824,10 +927,15 @@ two-fragment, with NTFS showing a much longer tail (590 NTFS files with >1000 fr
 vs 2 on FAT). "Most interesting file types (.doc, .jpg, .pst) files are fragmented
 18-57% of the time while 'boring' (.bmp, .ini, .chm) files are commonly fragmented
 < 10%"; "Temporary files were fragmented 66% of the time"; "Most bifragmented files were
-split by 1, 2, 4, 8 512-byte sectors". Per-type figures reported for the same study by
-secondary sources: JPEG 16 %, AVI 22 %, DOC 17 %, PST 58 % (Wikipedia "File carving" and
-DFRWS summaries). UNVERIFIED: the primary PDF could not be fetched to confirm the exact
-per-type table.
+split by 1, 2, 4, 8 512-byte sectors". Per-type figures from the primary paper (Table 3
+"Percent frag.", verified against the PDF at simson.net): JPEG 16 % (108,539 files on
+129 drives), AVI 20 % (998 files on 94 drives; Wikipedia's "22 %" is wrong), DOC 17 %,
+PST 58 %, MPEG 17 %, MDB 27 %, LOG 31 %, PNF 41 %, TMP 66 %, GIF 8 %, PNG 5 %, BMP 8 %,
+INI 10 %. Corpus: "over 300" used drives, 324 file systems with more than five files
+(FAT 219, NTFS 51, UFS 5). Gap sizes for all bifragmented files (Table 4): 4096 B /
+8 sectors (4272 files), 8192 B (1535), 16,384 B (1344), 2 B (921), 32,768 B (817),
+12,288 B (441); for JPEG (Table 5): 2 B (99), 4096 B (88), 16,384 B (40), 8192 B (38),
+651,264 B (38), 59 B (23), 32,768 B (16).
 
 Caveats for DiskRescue's domain: that corpus is pre-2007 system disks, not camera cards.
 On camera media fragmentation arises from (a) deleting some clips then recording into the
@@ -844,15 +952,17 @@ test suite in section 5 therefore generates its own fragmented fixtures at 0 %, 
 |---|---|---|
 | Linux SCSI disk command timeout | 30 s (`SD_TIMEOUT`), sysfs tunable | kernel `drivers/scsi/sd.h` |
 | Linux SCSI disk retries | 5 (`SD_MAX_RETRIES`), sysfs `max_retries` -1..5 | kernel `drivers/scsi/sd.h`, `sd.c` |
-| Worst case per failed cluster via kernel | about 6 x 30 s = 180 s plus EH resets | derived |
+| Worst case per failed cluster via kernel | about 6 x 30 s = 180 s plus EH resets (hanging commands only; MEDIUM ERROR with sense is not retried by the mid-layer) | derived from `sd.h`, `scsi_lib.c`, `libata-eh.c` |
 | Enterprise HDD TLER/ERC default | 7 s read / 7 s write | WD/kernel list discussion |
 | Windows storage stack command timeout | 7 s (reason drives target < 7 s) | LKML TLER thread |
 | ddrescue own timeout | none (`--timeout` default infinity) | ddrescue manual |
 | ddrescue cluster | 64 KiB | ddrescue manual |
 | ddrescue initial skip | max(64 KiB, size/32768); max 1 % of size | ddrescue manual |
 | HDDSuperClone skip-threshold "disable" value | 60000 ms | HDDSuperClone notes |
+| OpenSuperClone defaults | skip threshold 1000 ms (phases 1-2), rate skip 50 kB/s (phase 3), skip size 2 MiB, soft-reset (read) timer 8 s, busy-wait 20 s | `src/opensuperclone/opensuperclone.h`, `common.h` |
+| SCSI error-handler command timeout | 10 s (`eh_timeout`, `SCSI_DEFAULT_EH_TIMEOUT`) | kernel `include/scsi/scsi.h` |
 | Disk Drill multipass block sizes | 64 KB halving to 512 B; 5-8 attempts | CleverFiles docs |
-| safecopy stage1/2/3 | `-f 10% -R 1 -Z 0` / `-f 128* -r 1*` / `-f 1* -R 4 -Z 1` | safecopy site |
+| safecopy stage1/2/3 | `-f 10% -r 10% -R 1 -Z 0 -L 2 -M BaDbLoCk` / `-f 128* -r 1* -R 1 -Z 0 -L 2` / `-f 1* -r 1* -R 4 -Z 1 -L 2` (each with `-o stageN.badblocks`, stages 2-3 with `-I` of the previous list) | safecopy man page |
 | ddrescue mapfile save interval | 30 s - 5 min by size | ddrescue manual |
 | Destination headroom | 5-10 % above source size | CleverFiles docs; DiskRescue uses 5 % |
 
@@ -873,8 +983,10 @@ test suite in section 5 therefore generates its own fragmented fixtures at 0 %, 
 - 4Kn or 512e: logical 512 with physical 4096 means an unreadable physical sector shows
   as 8 consecutive 512 B failures; scrape at physical size to save time.
 - NVMe namespaces with metadata/PI formats: reads of unformatted LBAs return errors
-  that look like media errors; detect `nvme` + `LBA format` with metadata (UNVERIFIED
-  how to read without root: `/sys/block/nvme0n1/queue/logical_block_size` only).
+  that look like media errors; detect `nvme` + an LBA format with metadata without
+  root via `/sys/block/nvme0n1/metadata_bytes` (per-LBA metadata size,
+  `drivers/nvme/host/sysfs.c`; 0 = no metadata) and `/sys/block/nvme0n1/integrity/format`
+  (`none` or e.g. `T10-DIF-TYPE1-CRC`), next to `queue/logical_block_size`.
 
 ### 4.5 Media-level corruption classes (what repair modules will meet)
 
@@ -954,7 +1066,7 @@ ffmpeg -y -i fx/ref.mp4 -c copy -movflags frag_keyframe+empty_moov fx/frag.mp4
 | ext4 | `mkfs.ext4 -q -F -d fx/tree -b 4096 img/ext4.img 64M` | `debugfs -w -R "rm /photos/camA_03.jpg" img/ext4.img`; also `debugfs -w -R "write fx/x.jpg /photos/new.jpg"` to overwrite freed blocks | `debugfs -w` sequences: write A (large), write B, `rm` B, write C larger than B's hole, `rm` A, write D > hole: D becomes bifragmented. Verify with `debugfs -R "stat /photos/D"` extents |
 | FAT12/16/32 | `mkfs.vfat -F 32 -S 512 -s 8 -C img/fat32.img 65536` creates an empty image; populate with `tests/fatput.py` (test-only writer: allocate contiguous clusters, append 8.3 + LFN root entries, update both FATs and FSInfo) | set first byte of the directory entry to `0xE5`; optionally zero the FAT chain (what a real delete does on FAT32: chain cleared, first cluster high word kept in entry on some drivers) | `fatput.py --fragment` allocates every other cluster run to a dummy file first, then the test file, so the chain alternates |
 | exFAT | `mkfs.exfat -c 32K img/exfat.img` (file size preset via `truncate -s 64M`); populate with `tests/exfatput.py` (writes File + Stream Extension + File Name entry set with correct `SetChecksum`, sets bitmap bits, `NoFatChain` flag for contiguous files) | clear bit 7 (InUse) of the entry type bytes (0x85 -> 0x05, 0xC0 -> 0x40, 0xC1 -> 0x41); clear bitmap bits | write with `NoFatChain=0` and a real FAT chain alternating clusters |
-| NTFS | `mkntfs -F -q -C -s 512 -c 4096 img/ntfs.img` (needs a size: `truncate -s 64M` first), then `ntfscp img/ntfs.img fx/camA_00.jpg /camA_00.jpg` per file (ntfscp creates files in the root; subdirectories UNVERIFIED) | clear bit 0 of the flags word at offset 0x16 of the file's `FILE` record (found by scanning `$MFT` for the `FILE` signature and the `$FILE_NAME` attribute), and clear the bit in `$Bitmap`; the test also writes a second file to reuse clusters | fill the volume with alternating small files via `ntfscp`, then copy a large file: NTFS allocates the gaps, giving many data runs (verify by parsing the `$DATA` run list) |
+| NTFS | `mkntfs -F -Q -q -s 512 -c 4096 img/ntfs.img` (`-F` because the target is not a block device; the size comes from the file (`truncate -s 64M` first) or from the optional `number-of-sectors` last argument; `-Q` quick format; do not pass `-C`, which is `--enable-compression` and would make `ntfscp` write compressed `$DATA` runs), then `ntfscp img/ntfs.img fx/camA_00.jpg /camA_00.jpg` per file (`ntfscp(8)`: destination is a file name or an existing directory; ntfsprogs has no mkdir for an unmounted image, so without a FUSE mount (`ntfs-3g img/ntfs.img mnt` works unprivileged where `fusermount3` is installed) fixtures are root-directory only) | clear bit 0 of the flags word at offset 0x16 of the file's `FILE` record (found by scanning `$MFT` for the `FILE` signature and the `$FILE_NAME` attribute), and clear the bit in `$Bitmap`; the test also writes a second file to reuse clusters | fill the volume with alternating small files via `ntfscp`, then copy a large file: NTFS allocates the gaps, giving many data runs (verify by parsing the `$DATA` run list) |
 | Partition table | Python writes MBR (type 0x0C/0x07/0x83 entries) and GPT (header CRC32, entry array CRC32, backup header at last LBA) around the FS images; variants: GPT primary header zeroed (backup must be used), MBR with 0x55AA missing, protective MBR only | | |
 
 Where the dev box lacks a writer (FAT, exFAT), the test-only Python writers are
@@ -1035,7 +1147,7 @@ contiguous files must come out byte-identical; fragmented ones must be flagged
 | ISOBMFF boxes | `mp4-atom` | 0.16.2 | active (2026-10), encoder+decoder: useful for writing the rebuilt `moov` |
 | MP4 alt | `mp4` | 0.14.0 | 2023, reader/writer |
 | MP4 parse (Mozilla) | `mp4parse` | 0.17.0 | strict, rejects broken files: good as a validator |
-| JPEG decode (validation) | `zune-jpeg` | 0.5.15 | fast, safe; need lenient mode for partial decode: UNVERIFIED whether it exposes decoded-rows-before-error |
+| JPEG decode (validation) | `zune-jpeg` | 0.5.15 | fast, safe; in default (non-strict) mode 0.5.15 decodes a truncated baseline scan without error and fills the missing rows with grey (128); it exposes no decoded-row count (docs.rs 0.5.15 has no such method), so count rows by scanning the output for the first all-128 row, or use `DecoderOptions::set_strict_mode(true)` to get an error instead. Git main (0.5.16-rc2, 2026-10-11) adds `set_incremental_mode`, `decoded_scanlines()`, `decode_next_imcu_row()` and `DecodeErrors::ExhaustedData` (`is_recoverable_eof()`) for scan EOF: switch when released |
 | JPEG decode alt | `jpeg-decoder` | 0.3.2 | pure Rust, used by `image` |
 | Image umbrella | `image` | 0.25.10 | PNG/TIFF/BMP decoders for validation |
 | PNG | `png` | 0.18.1 | chunk-level API for repair |
@@ -1048,7 +1160,9 @@ contiguous files must come out byte-identical; fragmented ones must be flagged
 
 Not pure Rust and therefore avoided in v1: `ffmpeg-next` (libav bindings) and any
 libjpeg binding. H.264 SPS/PPS parsing for moov rebuild is small enough to hand-write
-(Exp-Golomb reader); UNVERIFIED whether `h264-reader` (crate) is current enough to reuse.
+(Exp-Golomb reader); `h264-reader` 0.9.0 (released 2026-09-14, MIT/Apache-2.0, dholroyd,
+>2.2 M downloads) is actively maintained and parses NAL units, SPS and PPS: reuse it
+rather than hand-writing.
 
 ---
 
@@ -1070,7 +1184,7 @@ PhotoRec CR2: https://forum.cgsecurity.org/phpBB3/viewtopic.php?p=4271
 Foremost licence: https://packages.altlinux.org/en/sisyphus/srpms/foremost/
 Scalpel 1.60 / 2.02: https://github.com/nolaforensix/scalpel-1.60 ; https://github.com/nolaforensix/scalpel-2.02
 Scalpel3 paper: https://arxiv.org/abs/2608.20363
-bulk_extractor: https://forensics.wiki/bulk_extractor/ ; https://github.com/jonstewart/bulk_extractor ; https://packagehub.suse.com/packages/bulk_extractor/
+bulk_extractor: https://forensics.wiki/bulk_extractor/ ; licence: https://github.com/simsong/bulk_extractor/blob/main/LICENSE.md
 untrunc: https://vcg.isti.cnr.it/~ponchio/untrunc.php ; Gentoo ebuild (GPL-2): https://ftp.fau.de/gentoo-portage/media-video/untrunc/untrunc-0_pre20260820.ebuild
 recover_mp4: https://slydiman.me/eng/mmedia/recover_mp4.htm ; https://www.videohelp.com/software/recover-mp4-to-h264
 JPEG-Repair Toolkit: https://www.disktuna.com/jpeg-repair-toolkit/ ; RAW partition article: https://www.disktuna.com/raw-partition-ntfs-fat/
@@ -1087,12 +1201,25 @@ extundelete: https://extundelete.sourceforge.net/
 ext4magic man page: https://manpages.org/ext4magic/8 ; Debian description: https://mynixos.com/nixpkgs/package/ext4magic
 ntfsundelete man page: https://man.archlinux.org/man/extra/ntfsprogs/ntfsundelete.8.en ; name-recovery patch: https://ognproject.evlt.uma.es/gitea/opengnsys/ntfs-3g/commit/6e52a39608857d9bb3c7402b30c21a1ba948ee71
 fatcat: https://github.com/Gregwar/fatcat
-Garfinkel 2007 "Carving contiguous and fragmented files with fast object validation" (DFRWS 2007); summarised in Pal & Memon slides: https://engineering.purdue.edu/dcsl/reading/2010/jevin-carving.pdf ; per-type figures via https://en.wikipedia.org/wiki/File_carving
+Garfinkel 2007 "Carving contiguous and fragmented files with fast object validation", Digital Investigation 4S (2007) S2-S12, primary PDF: https://simson.net/clips/academic/2007.DFRWS.pdf (Tables 2-8); summarised in Pal & Memon slides: https://engineering.purdue.edu/dcsl/reading/2010/jevin-carving.pdf ; https://en.wikipedia.org/wiki/File_carving (its AVI figure, 22 %, disagrees with the paper's Table 3, 20 %)
 Sequential hypothesis testing carving (Pal, Sencar, Memon 2008): https://dfrws.org/sites/default/files/session-files/2008_USA_paper-detecting_file_fragmentation_point_using_sequential_hypothesis_testing.pdf
 TRIM/DRAT/DZAT: https://blog.elcomsoft.com/2025/06/what-trim-drat-and-dzat-really-mean-for-ssd-forensics/ ; https://rossmanngroup.com/services/ssd-data-recovery/trim-dzat-physics
 Flash controller failure and chip-off: https://www.gillware.com/flash-drive-data-recovery/chip-off-recovery/ ; https://recoveryforce.com/articles/lexar-camera-card-and-thumb-drive-recovery ; https://www.rossmanngroup.com/services/flash-data-recovery/monolithic-microsd-extraction
 SD card 30 MB controller fault (HDDGURU): https://forum.hddguru.com/viewtopic.php?p=201203
 RAW filesystem causes and "do not format": https://www.gillware.com/hard-drive-data-recovery/raw-drive-data-recovery/ ; https://www.reclaime.com/raw-filesystem-faq/how-to-fix-raw-filesystem-issue-in-place.aspx
-Linux SCSI timeouts: kernel source https://raw.githubusercontent.com/torvalds/linux/master/drivers/scsi/sd.h ; storvsc timeout discussion https://lkml.iu.edu/hypermail/linux/kernel/1306.0/01118.html
+Linux SCSI timeouts: kernel source https://raw.githubusercontent.com/torvalds/linux/master/drivers/scsi/sd.h ; `max_retries` sysfs attribute and class: https://raw.githubusercontent.com/torvalds/linux/master/drivers/scsi/sd.c ; `SCSI_DEFAULT_EH_TIMEOUT`: https://raw.githubusercontent.com/torvalds/linux/master/include/scsi/scsi.h ; sense-key retry policy: https://raw.githubusercontent.com/torvalds/linux/master/drivers/scsi/scsi_lib.c ; libata `ata_eh_worth_retry`: https://raw.githubusercontent.com/torvalds/linux/master/drivers/ata/libata-eh.c ; storvsc timeout discussion https://lkml.iu.edu/hypermail/linux/kernel/1306.0/01118.html
+ATA IDENTIFY TRIM/DRAT/RZAT bits: https://raw.githubusercontent.com/torvalds/linux/master/include/linux/ata.h (`ata_id_has_trim`, `ata_id_has_zero_after_trim`) ; hdparm identify.c (word 69 bit 14 / bit 5 labels): https://sourceforge.net/projects/hdparm/
+NVMe Identify Namespace layout (DLFEAT byte 33): https://raw.githubusercontent.com/torvalds/linux/master/include/linux/nvme.h ; libnvme `enum nvme_id_ns_dlfeat`: https://raw.githubusercontent.com/linux-nvme/libnvme/master/src/nvme/types.h ; NVMe `metadata_bytes` sysfs attribute: https://raw.githubusercontent.com/torvalds/linux/master/drivers/nvme/host/sysfs.c
+OpenSuperClone source (defaults, log writer, ddrescue export): https://github.com/ISpillMyDrink/OpenSuperClone/blob/main/src/opensuperclone/opensuperclone.h ; https://github.com/ISpillMyDrink/OpenSuperClone/blob/main/src/opensuperclone/common.h ; https://github.com/ISpillMyDrink/OpenSuperClone/blob/main/src/opensuperclone/opensuperclone.c ; wiki Basics of Operation (ddrescue import/export menu): https://github.com/ISpillMyDrink/OpenSuperClone/wiki/Basics-of-Operation
+dd_rescue option table: https://raw.githubusercontent.com/vaab/dd_rescue/master/dd_rescue.c (`getopt` string and `printhelp`)
+safecopy man page (stage presets, -M, -I/-X, -R default): https://manpages.debian.org/testing/safecopy/safecopy.1.en.html
+PhotoRec source (naming, 500 files/dir, HEIC brand, DFXML): https://raw.githubusercontent.com/cgsecurity/testdisk/master/src/photorec.h ; https://raw.githubusercontent.com/cgsecurity/testdisk/master/src/photorec.c ; https://raw.githubusercontent.com/cgsecurity/testdisk/master/src/file_mov.c ; formats list: https://www.cgsecurity.org/wiki/File_Formats_Recovered_By_PhotoRec
+Scalpel 2.02 README (GPL, GPU removed): https://github.com/nolaforensix/scalpel-2.02
+extundelete licence: https://sources.debian.org/src/extundelete/0.2.4-3/debian/copyright/ ; ext4magic licence: https://metadata.ftp-master.debian.org/changelogs/main/e/ext4magic/unstable_copyright
+ntfscp / mkntfs man pages (ntfs-3g, local): `man ntfscp`, `man mkntfs`; mkfs.fat `-C`/BLOCK-COUNT and mke2fs `-d`: local man pages
+zune-jpeg 0.5.15 API: https://docs.rs/zune-jpeg/0.5.15/zune_jpeg/struct.JpegDecoder.html ; git main: https://github.com/etemesi254/zune-image (crates/zune-jpeg/src/mcu.rs, decoder.rs)
+h264-reader: https://crates.io/api/v1/crates/h264-reader
+R-Studio prices: https://www.techradar.com/reviews/r-studio ; https://www.capterra.com/p/33908/R-Studio/pricing/
+Recuva tiering (official site blocks fetches): https://www.techjockey.com/detail/recuva ; https://softwarehow.com/?p=30895
 TLER / 7 s: https://lkml.indiana.edu/0411.0/1802.html ; https://lore.kernel.org/all/4BA93C3F.2070208@gmail.com/T/
 Crate versions: crates.io API (`https://crates.io/api/v1/crates/<name>`), queried 2026-10-12.

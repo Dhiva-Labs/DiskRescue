@@ -51,10 +51,15 @@ Block size: "During pass 0, PhotoRec searches the first 10 files to determine th
 algorithm (`find_blocksize` in `photorec.c`) starts at `128*512` = 64 KiB and halves while any
 *validated* file start (`file_stat != NULL`) has a different `start % blocksize` than the first
 one, with a floor at the sector size; `update_blocksize` then re-aligns the search-space ranges to
-that block size and offset. Thumbnails: `header_check_jpg` rejects a standalone JPEG as a likely
-thumbnail when `file_size <= 16384 && buffer[3]==0xe0 && width<200 && height<200`; and for a real
-JPEG, `jpg_check_app1` extracts the EXIF thumbnail offset so the embedded SOI inside APP1 is not
-treated as a new file. Search scope: "whole partition (useful if the filesystem is corrupted) or
+that block size and offset. Thumbnails: `header_check_jpg` is a *nesting* rule, not a standalone
+size rule — when a JPEG is already being recovered (`file_recovery->file_stat->file_hint ==
+&file_hint_jpg`) a new SOI is ignored (`header_ignored_adv`) if the file written so far is
+`file_size <= 16384 && buffer[3]==0xe0 && width>0 && width<200 && height>0 && height<200`
+(the APP0 thumbnail inside the first 16 KiB of the parent), or `file_size <= 1024 && buffer[3]==0xec`
+(APP12), or the new header is a second XMP APP1 (`http://ns.adobe.com/xap/`), or the parent's
+`file_check` is `file_check_mpo`; and `jpg_check_app1` extracts the EXIF thumbnail offset
+(`TIFFTAG_JPEGIFOFFSET`/`JPEGIFBYTECOUNT`) so the embedded SOI inside APP1 is not treated as a new
+file (github.com/cgsecurity/testdisk `src/file_jpg.c`). Search scope: "whole partition (useful if the filesystem is corrupted) or
 unallocated space only (available for ext2/ext3/ext4, FAT12/FAT16/FAT32 and NTFS)". Expert mode
 lets the user "force the file system block size and the offset"; other options: Paranoid
 (`yes` = verify and reject invalid, `no`, `bruteforce` = "recover more fragmented JPEG files,
@@ -72,7 +77,7 @@ the first of overlapping headers; `-b` (Foremost compatibility) truncates at max
 footer is found. **False positives**: on an 8 GB drive all of Scalpel, Foremost and WinHex carved
 exactly 4,817 "GIF" files of which "approximately 400 … could not be viewed and were likely not
 actually GIF files (e.g., they were binary garbage with appropriate 'GIF' headers and footers)";
-FTK 1.50b carved 2,442 "GIF" files of exactly 783 bytes, none viewable. Header/footer carving has
+FTK 1.50b carved 3,463 "GIF" files of which 2,442 were exactly 783 bytes, none viewable. Header/footer carving has
 no notion of structure, so (a) any footer belonging to a *later* file is paired with an earlier
 header, (b) files without footers are carved to max size, (c) garbage between header and footer is
 never noticed.
@@ -131,8 +136,11 @@ the block transition). Thresholds `τ+ = (1 − P_fe) / P_fa` and `τ− = P_fe 
 (fragmentation point found) when `Λ > τ+`, `H0` (keep merging) when `Λ < τ−`, otherwise read
 another block. Detected fragmentation points then constrain the greedy Parallel Unique Path (PUP)
 reassembler. Reported result: on the DFRWS 2006 and 2007 challenge images SmartCarving "was able
-to recover all but one fragmented JPEG file" (forensics.wiki summary). The exact per-image counts
-and the match-metric distributions used in the paper could not be retrieved (PDF 403). UNVERIFIED
+to recover all but one fragmented JPEG file" (forensics.wiki summary). The hypothesis definitions,
+`Λ`, `τ+ = (1 − P_fe)/P_fa`, `τ− = P_fe/(1 − P_fa)` and the decision rule above are confirmed verbatim
+from US 2010/0257146 A1 (patents.google.com). The exact per-image counts and the match-metric
+distributions (p0/p1) used in the paper could not be retrieved (dfrws.org, ScienceDirect and
+Justia all return 403; the USPTO PDF is image-only). UNVERIFIED
 
 ### 1.3 Throughput expectations
 
@@ -141,12 +149,12 @@ and the match-metric distributions used in the paper could not be retrieved (PDF
 | Sequential read, SATA SSD image | ~500 MB/s → 1 TB in 2,000 s ≈ **33 min** | arithmetic |
 | Sequential read, 7200 rpm HDD image | ~150 MB/s → 1 TB in ≈ 1 h 51 min | arithmetic |
 | Sequential read, NVMe image | ~3 GB/s → 1 TB in ≈ 5.5 min (CPU-bound instead) | arithmetic |
-| `memchr`/`memchr2`/`memchr3` (AVX2) | third-party benchmark reports 5.9 GB/s (ASCII) – 8.7 GB/s (UTF-8) on Intel and 6.4 – 13.2 GB/s on ARM for large haystacks; in-cache figures are higher | memchr_vs_stringzilla repo |
-| `memchr::memmem::Finder` (single needle, rare-byte prefilter) | same order as memchr on data where the chosen rare byte is actually rare; degrades toward ~1 GB/s on data where it is common | UNVERIFIED |
-| `aho-corasick` with Teddy packed prefilter (≤ ~100 short patterns, x86_64/aarch64) | "quite a bit faster than Aho-Corasick (sometimes by an order of magnitude)"; expect multiple GB/s | docs.rs/aho-corasick packed module; absolute figure UNVERIFIED |
+| `memchr`/`memchr2`/`memchr3` (AVX2) | third-party benchmark reports 5.9 GB/s (ASCII) – 8.7 GB/s (UTF-8) on Intel and 6.4 – 13.2 GB/s on ARM for large haystacks; in-cache figures are higher — these per-platform numbers are from an older README revision; the current README (repo renamed StringWars) only lists `memmem::Finder` ≈ 10.99 GB/s on Intel Sapphire Rapids, long-line substring search. UNVERIFIED | github.com/ashvardanian/memchr_vs_stringzilla README (2026-10-12) |
+| `memchr::memmem::Finder` (single needle, packed-pair prefilter) | same order as memchr on data where the chosen rare bytes are actually rare. Mechanism (verified): the prefilter picks the two needle bytes with the *lowest* rank in `src/arch/all/packedpair/default_rank.rs` ("a lower rank means the byte is believed to occur less frequently"; `0x01` = 52, `0x00` = 55, `0x47` = 161, `0xB3`/`0xBA`/`0xFF` = 255), and `Prefilter::Auto` "will be used to dynamically disable the prefilter if it is believed to not be carrying its weight", falling back to the Two-Way core. The fallback figure (~1 GB/s) is not measured. UNVERIFIED |
+| `aho-corasick` with Teddy packed prefilter (x86_64 SSSE3/AVX2, aarch64 NEON only) | "quite a bit faster than Aho-Corasick (sometimes by an order of magnitude)" (quote verified in `src/packed/mod.rs`); expect multiple GB/s. Pattern limits: docs say "on the order of 100 or so", but `src/packed/teddy/builder.rs` returns `None` above **64 patterns** (16 when the shortest pattern is 1 byte; on aarch64 32/48 when it is 2/3 bytes) unless `heuristic_pattern_limits(false)`; the `AhoCorasick` prefilter is only attempted below ~100 patterns | docs.rs/aho-corasick packed module + github.com/BurntSushi/aho-corasick src/packed; absolute throughput UNVERIFIED |
 | `aho-corasick` DFA fallback (no prefilter) | ~0.5–1.5 GB/s per core | UNVERIFIED |
 | Baseline JPEG Huffman decode (validation) | ~100–300 MB/s per core | UNVERIFIED |
-| BLAKE3 (AVX2, multithreaded for large inputs) | several GB/s per core | UNVERIFIED |
+| BLAKE3 (single thread; `update_rayon` for large inputs) | 6,866 MiB/s single-threaded on 16 KiB inputs, AWS c5.metal / Cascade Lake-SP 8275CL with AVX-512 (vs SHA-256 484 MiB/s); AVX2-only parts are lower but still > 2 GB/s per core | github.com/BLAKE3-team/BLAKE3-specs `benchmarks/bar_chart.py` |
 
 Conclusion: the signature scan is I/O-bound on every realistic source. CPU cost is dominated by
 validators (JPEG decode, MP4 box walking across large mdat skips, TS packet runs), which is why
@@ -176,7 +184,7 @@ section 2.2.
 | 8 | Nikon NEF | nef | `4D 4D 00 2A 00 00 00 08` (also `49 49 2A 00`) + Make `NIKON` | 0 | 64 KiB | 4 GiB | IFD walk incl. SubIFDs | 70 |
 | 9 | Sony ARW/SR2 | arw | `49 49 2A 00 08 00 00 00` + Make `SONY` | 0 | 64 KiB | 4 GiB | IFD walk incl. SubIFDs | 70 |
 | 10 | Adobe DNG | dng | TIFF magic + tag `0xC612` DNGVersion present in IFD0 | 0 | 8 KiB | 4 GiB | IFD walk incl. SubIFDs | 72 |
-| 11 | Pentax PEF | pef | `4D 4D 00 2A` + Make `PENTAX` (or `RICOH IMAGING`) UNVERIFIED | 0 | 64 KiB | 4 GiB | IFD walk | 70 |
+| 11 | Pentax PEF | pef | `4D 4D 00 2A` + Make ∈ {`PENTAX Corporation`, `PENTAX`, `PENTAX RICOH IMAGING`, `RICOH IMAGING COMPANY, LTD.`} (rawspeed cameras.xml; PhotoRec matches the 20-byte padded `PENTAX Corporation ` / `PENTAX             ` and the MakerNote signature `AOC\0`) | 0 | 64 KiB | 4 GiB | IFD walk | 70 |
 | 12 | Olympus ORF | orf | `49 49 52 4F 08 00 00 00` / `49 49 52 53 08 00 00 00` / `4D 4D 4F 52 00 00 00 08` | 0 | 64 KiB | 4 GiB | IFD walk (TIFF LE/BE with swapped magic) | 70 |
 | 13 | Panasonic RW2 | rw2 | `49 49 55 00 18 00 00 00` | 0 | 64 KiB | 4 GiB | IFD walk; raw strip has no byte count → cap/next-header | 70 |
 | 14 | Fuji RAF | raf | `46 55 4A 49 46 49 4C 4D 43 43 44 2D 52 41 57 20` ("FUJIFILMCCD-RAW ") | 0 | 108 B | 4 GiB | header offsets: max(jpg, cfa_header, cfa end) | 70 |
@@ -250,8 +258,10 @@ Validation levels: (1) marker walk succeeded, SOF seen before SOS, dimensions sa
 baseline/progressive Huffman decode with **own** decoder that reports the byte offset of the
 first invalid code / unexpected marker (`offset_error`) and the MCU row at which it occurred; (3)
 boundary discontinuity test on decoded MCU rows at cluster boundaries (section 3.9). Reject a
-standalone candidate as "probably a thumbnail" (PhotoRec rule) when `len ≤ 16 KiB`, first marker is
-APP0, and `X < 200 && Y < 200` — unless `--keep-thumbnails`.
+standalone candidate as "probably a thumbnail" when `len ≤ 16 KiB`, first marker is APP0, and
+`X < 200 && Y < 200` — unless `--keep-thumbnails`. (This is our rule, stricter than PhotoRec's: PhotoRec
+applies the same `≤ 16384 / 0xE0 / < 200×200` test only to an SOI found *inside* a JPEG it is already
+writing, which rule R2 covers here; a standalone small JPEG is kept by PhotoRec.)
 
 Nested objects recorded by the JPEG validator: EXIF thumbnail (IFD1 0x0201/0x0202), MPO
 secondary images, embedded ICC/XMP (not files), motion-photo MP4 trailer.
@@ -310,12 +320,13 @@ GPS `0x8825`, Interop `0xA005`, CR2 IFD3 at header offset 12, Panasonic/Olympus 
 | `0x0201` + `0x0202` | JPEGInterchangeFormat + Length | off + len (nested JPEG) |
 | `0xC612` | DNGVersion | presence ⇒ format = dng |
 | `0x010F` | Make | ASCII; selects nef/arw/pef/orf/cr2 |
-| `0x0118` (Panasonic IFD) | RawDataOffset UNVERIFIED | start of RW2 raw; no byte count → unknown length |
+| `0x0118` (Panasonic IFD0) | RawDataOffset (ExifTool PanasonicRaw table) | start of RW2 raw; no byte count → runs to end of file ⇒ `unknown_length`. Older Panasonic `.raw` use `0x0111`/`0x0117` instead. `0x002E` JpgFromRaw (type UNDEFINED) holds the full embedded JPEG (nested), `0x0127` JpgFromRaw2 a second one. |
 
 Format decision (first match): bytes 8..11 == `43 52 02 00` ("CR", major 2) ⇒ `cr2` (raw IFD3
 offset at bytes 12..15); `0xC612` present ⇒ `dng`; magic `IIRO`/`IIRS`/`MMOR` ⇒ `orf`;
 magic `IIU\0` ⇒ `rw2`; Make starts with `NIKON` ⇒ `nef`; Make starts with `SONY` ⇒ `arw`;
-Make starts with `PENTAX` or `RICOH` ⇒ `pef`; else `tif`. RW2/ORF validators are the TIFF walker
+Make starts with `PENTAX` or `RICOH` (incl. `RICOH IMAGING COMPANY, LTD.`; Ricoh GR DNGs are caught by the
+earlier DNGVersion test), or MakerNote begins `AOC\0` ⇒ `pef`; else `tif`. RW2/ORF validators are the TIFF walker
 with the 4 magic bytes swapped and (ORF) IFD offset at 4 as usual.
 
 Nested: the IFD0 JPEG preview in CR2 (full-size JPEG in StripOffsets of IFD0), IFD1 thumbnail,
@@ -339,10 +350,18 @@ on `--extract-nested` or when the parent is damaged (section 3.3 rule R5).
 | 100 | 4 | CFA (raw) offset (BE) |
 | 104 | 4 | CFA (raw) length (BE) |
 
+All fields big-endian (libopenraw RAF notes; PhotoRec `file_raf.c` uses this exact 108-byte
+`struct header_raf` and rejects any offset `< sizeof(struct header_raf)`).
 len = max(jpg_off + jpg_len, cfa_hdr_off + cfa_hdr_len, cfa_off + cfa_len); every offset must be
-≥ 108 and every (off + len) ≤ cap. Nested: the embedded JPEG at `jpg_off`. Newer RAF files may
-carry a second (RAF container) section after the CFA with sizes in the CFA header; treated as
-covered by `cfa_off + cfa_len`. UNVERIFIED
+≥ 108 and every (off + len) ≤ cap. Nested: the embedded JPEG at `jpg_off`. Section contents: the
+"CFA header" at 92 is a record table (u32 BE record count, then records of u16 tag, u16 size, data);
+the "CFA" at 100 is a TIFF container followed by the raw data (optionally compressed on X-Pro2/X-T3
+and later). Bytes 108–119 are unknown; the u32 at **120** is a second CFA-header offset for dual-shot
+models (dcraw: `fseek(ifp,120); is_raw += (i=get4()) && 1; ... parse_fuji(i)`) and the second CFA
+offset sits at **128** (`fseek(ifp, 100+28*(shot_select>0))`), i.e. a second (hdr_off, hdr_len,
+cfa_off, cfa_len) quadruple 28 bytes after the first. Validator: if `jpg_off > 120` and the u32 at 120
+is non-zero, read the second quadruple at 120/124/128/132 and include it in the max; otherwise the
+108-byte header is complete.
 
 #### 2.2.7 ISOBMFF box grammar (ISO/IEC 14496-12) — MP4, MOV, 3GP, M4A, HEIF, AVIF, CR3
 
@@ -391,13 +410,19 @@ HEIF specifics: `meta` is a FullBox (4-byte version/flags after the header), con
 an extent beyond the end ⇒ `truncated`. Nested: `Exif` item (ID with `infe` item_type `Exif`)
 gives the capture date; a JPEG-coded thumbnail item is possible (item_type `jpeg`).
 
-CR3 specifics: `ftyp` major `crx ` minor 1; `moov` contains a `uuid` box with extended type
-`85c0b687-820f-11e0-8111-f4ce462b6a48` holding `CNCV` (compressor version string), `CCTP`,
-`CTBO` (table of offset/size pairs for the main regions, used as a cross-check of the computed
-length — record layout UNVERIFIED), `CMT1`..`CMT4` (TIFF-structured EXIF/makernote blocks → date),
-`THMB` (160×120 JPEG thumbnail). A second top-level `uuid` box `eaf42b5e-1c98-4b88-b9fb-b7dc406e4d16`
-holds `PRVW` (≈1620×1080 JPEG preview). `mdat` holds track 1 = full-size JPEG, track 2 = small
-CRX raw, track 3 = full CRX raw, track 4 = CTMD timed metadata. Nested: THMB, PRVW, track-1 JPEG.
+CR3 specifics (github.com/lclevy/canon_cr3): `ftyp` size 0x18, major `crx `, minor 1, compatible
+`crx `,`isom`; `moov` contains a `uuid` box with extended type `85c0b687-820f-11e0-8111-f4ce462b6a48`
+holding `CNCV` (box size 0x26: 30-char compressor version string, e.g. `CanonCR3_001/00.09.00/00.00.00`),
+`CCTP`, `CTBO` (**u32 BE record count, then 20-byte records: u32 index, u64 offset, u64 size** — indexes
+1..4 give the absolute offset/size of the xpacket/uuid-PRVW/mdat regions; use `max(offset+size)` as a
+cross-check of the computed length), `CMT1` (IFD0), `CMT2` (ExifIFD → `0x9003` date), `CMT3` (Canon
+makernote), `CMT4` (GPS IFD) — each a complete little-endian TIFF — and `THMB` (FullBox: version u8 +
+flags 3 B, width u16 (160), height u16 (120), jpeg_size u32, then 2+2 unknown bytes in version 0 only,
+then the JPEG). A second top-level `uuid` box `eaf42b5e-1c98-4b88-b9fb-b7dc406e4d16` holds `PRVW`
+(4 unknown, u16 = 1, width u16 (1620), height u16 (1080), u16 = 1, jpeg_size u32, JPEG). `mdat` holds
+track 1 = full-size JPEG, track 2 = small CRX raw (≈1624×1080), track 3 = full CRX raw, track 4 = CTMD
+timed metadata, optional track 5 = dual-pixel delta (CRX_DUAL). Nested: THMB, PRVW, track-1 JPEG.
+No official spec exists; all of this is reverse-engineered.
 
 #### 2.2.8 RIFF (AVI, WAV, WebP)
 
@@ -454,8 +479,8 @@ a 4-byte TP_extra_header (2-bit copy permission + 30-bit arrival timestamp), so 
 with PID ∉ {0x1FFF} and AFC ≠ 0. Measure: count packets while sync holds; also track CC
 continuity per PID (CC gaps > 2 within the run ⇒ confidence penalty but not a stop, since
 recorders drop packets). END when sync fails; `len = packets × stride`. Extension: `.m2ts`/`.mts`
-when stride = 192 (PhotoRec additionally looks for `HDMV`/`HDPR` descriptor at 0xD7 or `TSHV` at
-0x18B to label camcorder streams), else `.ts`. A sync-run has no footer, so this is the weakest
+when stride = 192 (PhotoRec `file_m2ts.c` additionally registers `HDMV`/`HDPR`/`SDVS` at 0xD7
+(192-byte streams) and `TSHV` at 0x18B (188-byte) to label camcorder streams), else `.ts`. A sync-run has no footer, so this is the weakest
 end-detection method; status is never better than `structurally_valid`.
 
 #### 2.2.11 MPEG-PS / VOB / MPEG video ES
@@ -588,13 +613,17 @@ fn scan(src: &Source, ranges: &RangeSet /* whole image or unallocated */) {
 
 1. **Fixed-magic set** (all signatures with ≥ 4 literal leading bytes and no leading `0x00`):
    one `aho_corasick::AhoCorasick` built with `MatchKind::Standard`, `find_overlapping_iter` so a
-   TIFF magic and the longer CR2 magic both report (the probe collapses them). ~30 patterns ⇒ the
-   Teddy packed prefilter applies on x86_64/aarch64. Patterns: `FF D8 FF`, PNG 8 bytes, `GIF87a`,
+   TIFF magic and the longer CR2 magic both report (the probe collapses them). ~30 patterns with a
+   shortest pattern of 3 bytes (`FF D8 FF`, `ID3`) ⇒ Teddy mask length 3, inside the builder's
+   heuristic cap (64 patterns on x86_64, 48 on aarch64 for 3-byte minimum) ⇒ the packed prefilter
+   applies on x86_64/aarch64; never add a 1-byte pattern to this set (cap drops to 16). Patterns: `FF D8 FF`, PNG 8 bytes, `GIF87a`,
    `GIF89a`, `RIFF`, `II*\0`, `MM\0*`, `IIRO`, `IIRS`, `MMOR`, `IIU\0`, `FUJIFILMCCD-RAW `,
    `8BPS`, `ftyp` (hit offset − 4), `moov`/`mdat`/`wide`/`free`/`skip` (hit − 4),
    `1A 45 DF A3`, `ID3`, `fLaC`.
-2. **MPEG start codes**: `memchr::memmem::Finder::new(b"\x00\x00\x01")` (its rare-byte
-   heuristic picks `0x01`), then test byte +3 ∈ {BA, B3}. Searching `0x00` with `memchr` would
+2. **MPEG start codes**: `memchr::memmem::Finder::new(b"\x00\x00\x01")` (its packed-pair
+   heuristic picks the two lowest-rank bytes: `0x01` rank 52 and `0x00` rank 55 — nearly equal, so
+   on `0x01`-dense data `Prefilter::Auto` will disable the prefilter and run plain Two-Way), then
+   test byte +3 ∈ {BA, B3}. Searching `0x00` with `memchr` would
    stall on zero-filled regions; `memmem` does not.
 3. **TS sync**: `memchr(0x47)` restricted to offsets `≡ 0 (mod 512)` is wasteful; instead test
    `buf[k*512]` and `buf[k*512 + 4]` directly for each sector (2 loads per sector) and run the
@@ -720,7 +749,11 @@ free**, merges adjacent clusters, and (option) drops runs shorter than `min_run 
 
 - `--unallocated=strict` (default): each free run is scanned independently; an object may not
   cross into an allocated cluster (`measure` sees the run end as EOF ⇒ `Truncated`).
-- `--unallocated=skip` (PhotoRec-like, PhotoRec's exact behaviour here is UNVERIFIED): the free
+- `--unallocated=skip` (PhotoRec's behaviour, verified in `src/pnext.h` / `src/psearchn.c`: the
+  search space is the list of free runs; after every block `get_next_sector()` advances inside the
+  current run and, at its end, calls `get_next_header()`, which moves `offset` to the *start of the
+  next run* while the file being written stays open — so PhotoRec silently skips allocated clusters
+  and continues the same file in the next free run; it never truncates at the boundary): the free
   runs are presented to `measure` as one logical stream (`Source` adapter that maps logical
   offsets to physical runs). This reassembles deleted files whose clusters were interleaved with
   files written later. The report lists every physical fragment. Deleted-but-still-chained
@@ -1026,12 +1059,12 @@ for i,(w,h) in enumerate([(640,480),(3000,2000),(6000,4000)]):
     im = Image.effect_noise((w,h),64).convert("RGB")          # high-entropy ⇒ realistic size
     im.save(f"target/fixtures/media/photo{i}.jpg","JPEG",quality=90,exif=thumb_exif())
     im.save(f"target/fixtures/media/photo{i}_prog.jpg","JPEG",quality=85,progressive=True)
-    im.save(f"target/fixtures/media/photo{i}_rst.jpg","JPEG",quality=85,restart_marker_blocks=1)  # Pillow ≥ 10.2? UNVERIFIED
+    im.save(f"target/fixtures/media/photo{i}_rst.jpg","JPEG",quality=85,restart_marker_blocks=1)  # restart_marker_blocks/_rows added in Pillow 10.2.0 (docs); dev box has 12.1.1
     im.save(f"target/fixtures/media/photo{i}.png","PNG")
     im.convert("P").save(f"target/fixtures/media/photo{i}.gif","GIF")
     im.save(f"target/fixtures/media/photo{i}.bmp","BMP")
     im.save(f"target/fixtures/media/photo{i}.tif","TIFF")
-    try: im.save(f"target/fixtures/media/photo{i}.webp","WEBP")   # needs Pillow built with libwebp; skip if not UNVERIFIED
+    try: im.save(f"target/fixtures/media/photo{i}.webp","WEBP")   # needs Pillow built with libwebp ≥ 0.5 (PIL.features.check("webp") is True on the dev box); skip if not
     except Exception: pass
 Image.new("RGB",(100,100)).save("target/fixtures/media/tiny_thumb.jpg","JPEG")   # must be rejected as thumbnail
 EOF
@@ -1047,16 +1080,16 @@ ffmpeg -y $S -vn -c:a aac -f ipod audio.m4a                                     
 ffmpeg -y $S -c:v libx265 -c:a aac -tag:v hvc1 video_hevc.mp4
 ffmpeg -y $S -c:v libx264 -c:a aac -movflags frag_keyframe+empty_moov video_fragmented.mp4
 ffmpeg -y $S -c:v libx264 -c:a aac -f matroska video.mkv
-ffmpeg -y $S -c:v libvpx-vp9 -c:a libopus video.webm   # only if libvpx/libopus present UNVERIFIED; else -c:v libx264 -f webm fails
+ffmpeg -y $S -c:v libvpx-vp9 -c:a libopus video.webm   # libvpx-vp9 + libopus present in dev-box ffmpeg 8.0.1 (verified); -c:v libx264 -f webm is refused ("Only VP8 or VP9 or AV1 video and Vorbis or Opus audio")
 ffmpeg -y $S -c:v mjpeg -q:v 3 -c:a pcm_s16le video_mjpeg.avi                    # JPEG-in-AVI nesting
 ffmpeg -y $S -c:v libx264 -c:a aac -f mpegts video.ts                            # 188-byte
-ffmpeg -y $S -c:v libx264 -c:a aac -f mpegts -mpegts_m2ts_mode 1 video.m2ts     # 192-byte UNVERIFIED flag name
+ffmpeg -y $S -c:v libx264 -c:a aac -f mpegts -mpegts_m2ts_mode 1 video.m2ts     # 192-byte; option verified (`-mpegts_m2ts_mode <boolean>`, default auto = on for a .m2ts/.mts name); sync bytes at 4/196/388 confirmed
 ffmpeg -y $S -c:v mpeg2video -c:a ac3 -f vob video.vob                           # 2048-byte packs
 ffmpeg -y $S -c:v mpeg2video -c:a mp2 -f mpeg video.mpg
 ffmpeg -y $S -vn -c:a pcm_s16le audio.wav
 ffmpeg -y $S -vn -c:a flac audio.flac
-ffmpeg -y $S -vn -c:a libmp3lame -id3v2_version 3 audio.mp3   # libmp3lame presence UNVERIFIED; fallback: skip MP3 fixture
-ffmpeg -y $S -vn -c:a libmp3lame -write_id3v2 0 -write_xing 1 audio_bare.mp3
+ffmpeg -y $S -vn -c:a libmp3lame -id3v2_version 3 audio.mp3   # libmp3lame present in dev-box ffmpeg 8.0.1 (verified); fallback: skip MP3 fixture
+ffmpeg -y $S -vn -c:a libmp3lame -id3v2_version 0 -write_xing 1 audio_bare.mp3   # mp3 muxer has only id3v2_version / write_id3v1 / write_xing; "-write_id3v2 0" is silently accepted (it belongs to another muxer) and still writes an ID3v2.4 header — verified
 # Large AVI > 1 GiB to exercise OpenDML AVIX chaining (only in the "slow" test tier):
 ffmpeg -y -f lavfi -i testsrc2=size=1920x1080:rate=30:duration=600 -c:v mjpeg -q:v 2 big_opendml.avi
 ```
@@ -1143,21 +1176,21 @@ image, `--fragmented=jpeg` reproduces the original JPEG bit-exactly (BLAKE3 equa
 | Crate | Version | Use | Notes |
 |---|---|---|---|
 | `memchr` | 2.8.3 | memchr/memchr2/memchr3, `memmem::Finder` for `00 00 01` | SIMD on x86_64 (SSE2/AVX2 runtime detect), aarch64, wasm32 |
-| `aho-corasick` | 1.1.5 | fixed-magic multi-pattern search, `find_overlapping_iter`; Teddy prefilter auto | keep pattern count < ~100 for Teddy |
+| `aho-corasick` | 1.1.5 | fixed-magic multi-pattern search, `find_overlapping_iter`; Teddy prefilter auto | keep pattern count ≤ 64 and shortest pattern ≥ 3 bytes for Teddy (builder heuristic) |
 | `rayon` | 1.12.0 | measurement pool, bifragment trials, BLAKE3 `update_rayon` | |
 | `crossbeam-channel` | 0.5.17 | bounded scanner→pool channel, results channel | |
 | `blake3` | 1.8.7 | content hashes for dedup and report | `rayon` feature |
 | `memmap2` | 0.9.11 | optional mmap `Source` for image files on healthy storage | off by default (SIGBUS on I/O error) |
-| `zune-jpeg` | 0.5.16-rc2 (pin a stable 0.4.x if rc is unacceptable) | fast decode for `decode` validation level *only when* the own Huffman walker says the stream is complete; it does not expose the byte offset of a decode error, hence the in-house decoder for `err_offset` | own baseline+progressive Huffman scanner is required for 3.9 regardless |
-| `png` | 0.17.x UNVERIFIED | optional inflate/adler check | CRC done with `crc32fast` |
-| `crc32fast` | 1.4.x UNVERIFIED | PNG chunk CRC | |
+| `zune-jpeg` | 0.5.15 stable (0.5.16-rc2 is the newest pre-release; crates.io 2026-10-12) | fast decode for `decode` validation level *only when* the own Huffman walker says the stream is complete; it does not expose the byte offset of a decode error, hence the in-house decoder for `err_offset` | own baseline+progressive Huffman scanner is required for 3.9 regardless |
+| `png` | 0.18.1 | optional inflate/adler check | CRC done with `crc32fast` |
+| `crc32fast` | 1.5.2 | PNG chunk CRC | |
 | `kamadak-exif` | 0.6.1 | EXIF parse for capture date/make/model from JPEG/TIFF/HEIF Exif items | pure Rust |
-| `symphonia` | 0.5.x UNVERIFIED | optional MP3/FLAC frame decode for `decode` level | feature-gated |
-| `serde` / `serde_json` | 1.0.x UNVERIFIED | report | |
-| `jiff` | 0.2.x UNVERIFIED | date math for 1904/2001 epochs and YYYY/MM folders | or `time` 0.3.x |
-| `rangemap` | 1.5.x UNVERIFIED | `RangeSet<u64>` for allocation, attribution, dedup | small; could be in-house BTreeMap |
-| `tempfile` | 3.x UNVERIFIED | `.part` outputs, spill file | |
-| `rand_xoshiro` | 0.7.x UNVERIFIED | deterministic fixture noise in tests | dev-dependency |
+| `symphonia` | 0.6.1 | optional MP3/FLAC frame decode for `decode` level | feature-gated |
+| `serde` / `serde_json` | 1.0.229 / 1.0.154 | report | |
+| `jiff` | 0.2.38 | date math for 1904/2001 epochs and YYYY/MM folders | or `time` 0.3.55 |
+| `rangemap` | 1.8.0 | `RangeSet<u64>` for allocation, attribution, dedup | small; could be in-house BTreeMap |
+| `tempfile` | 3.27.0 | `.part` outputs, spill file | |
+| `rand_xoshiro` | 0.8.1 | deterministic fixture noise in tests | dev-dependency; pick the release matching the `rand_core` major in use |
 
 No crate is used for ISOBMFF/EBML/RIFF/TIFF/TS/PS walking: the walkers are a few hundred lines
 each, must be streaming and lenient, and must expose `err_offset` — existing parsers are strict and
@@ -1206,7 +1239,26 @@ in-memory. `mp4parse`/`matroska` crates are explicitly not used for the same rea
 - `memchr` crate: https://docs.rs/memchr (2.8.3; SIMD backends); third-party throughput figures:
   https://github.com/ashvardanian/memchr_vs_stringzilla .
 - `aho-corasick` crate packed/Teddy docs: https://docs.rs/aho-corasick/latest/aho_corasick/packed/index.html (1.1.5).
-- crates.io API for versions: blake3 1.8.7, rayon 1.12.0, crossbeam-channel 0.5.17, memmap2 0.9.11,
-  zune-jpeg 0.5.16-rc2, kamadak-exif 0.6.1 (all checked 2026-10-12).
+- crates.io API for versions: memchr 2.8.3, aho-corasick 1.1.5, blake3 1.8.7, rayon 1.12.0,
+  crossbeam-channel 0.5.17, memmap2 0.9.11, zune-jpeg 0.5.15 (0.5.16-rc2 pre-release), kamadak-exif
+  0.6.1, png 0.18.1, crc32fast 1.5.2, symphonia 0.6.1, serde 1.0.229, serde_json 1.0.154, jiff 0.2.38,
+  rangemap 1.8.0, tempfile 3.27.0, rand_xoshiro 0.8.1, time 0.3.55 (all re-checked 2026-10-12 via
+  https://crates.io/api/v1/crates/<name>).
+- Fact-check pass 2026-10-12, additional primary sources: testdisk `src/file_jpg.c` (thumbnail
+  nesting rule, `jpg_check_app1`), `src/pnext.h` + `src/psearchn.c` (`get_next_sector`/`get_next_header`
+  free-run continuation), `src/file_m2ts.c` (HDMV/HDPR/SDVS @0xD7, TSHV @0x18B), `src/file_flac.c`
+  (1500 MiB), `src/file_bmp.c` (min 65, DIB sizes), `src/filegen.h`, `src/photorec.c`
+  (`find_blocksize`), `src/file_raf.c`, `src/file_rw2.c`, `src/file_orf.c`, `src/file_tiff_be.c`
+  (PENTAX make strings, `AOC\0`); rawspeed `data/cameras.xml`
+  (https://github.com/darktable-org/rawspeed — Pentax/Ricoh Make strings); dcraw.c
+  (https://www.dechifro.org/dcraw/dcraw.c — RAF offsets 84/92/100/120/128); libopenraw RAF notes
+  (https://libopenraw.freedesktop.org/formats/raf/); ExifTool PanasonicRaw tags
+  (https://exiftool.org/TagNames/PanasonicRaw.html — 0x0118 RawDataOffset, 0x002E JpgFromRaw);
+  BLAKE3-specs `benchmarks/bar_chart.py` (6,866 MiB/s); aho-corasick `src/packed/mod.rs` and
+  `src/packed/teddy/builder.rs` (64-pattern heuristic cap); memchr `src/arch/all/packedpair/default_rank.rs`
+  and `memmem::Prefilter` docs; Pillow image-file-formats handbook (restart_marker_blocks "Added in
+  version 10.2.0"); Garfinkel 2007 and Scalpel 2005 PDFs re-read via pdftotext (all quoted figures
+  match); ffmpeg 8.0.1 / Pillow 12.1.1 on the dev box (`ffmpeg -h muxer=mp3|mpegts`, `-encoders`,
+  generated fixtures inspected with xxd).
 - forensics.wiki "File carving": https://forensics.wiki/file_carving/ (Garfinkel percentages
   restated: 58% PST, 17% JPEG, 16% Word).

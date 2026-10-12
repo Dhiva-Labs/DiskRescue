@@ -1,10 +1,14 @@
 # DiskRescue Imaging Engine Specification
 
 Status: draft for implementation. Facts tagged `UNVERIFIED` could not be confirmed
-against a primary source during research and must be checked before relying on them.
+against a primary source and must be checked before relying on them.
 Everything else was read from the sources listed in section 7 (ddrescue 1.28 source
 and manual, Linux kernel source/docs, local kernel headers, smartmontools source,
 libnvme headers, OpenSuperClone manual, udev rules, man-pages 6.17).
+Fact-check pass 2026-10-12: every `UNVERIFIED` tag was re-checked against primary
+sources (ddrescue 1.28 tarball unpacked locally, Linux master tree, libnvme,
+smartmontools, T10 SBC text, Microsoft Learn, DMDE manual); corrections are marked
+`[fact-check]` inline and the remaining tags are the ones that could not be settled.
 
 ---
 
@@ -75,18 +79,23 @@ Exact parser behaviour (`mapfile.cc`):
 
 - Lines are read by `my_fgets`: leading whitespace is skipped; a `#` at the start of a
   line **or after whitespace** starts a comment to end of line; blank lines are skipped.
-  Lines longer than 127 bytes are truncated to 127 (parse what fits).
+  The line buffer holds 127 bytes (`maxlen = 127`, newline included); longer lines are
+  silently truncated to what fits and the rest of the line is consumed.
 - The **first non-comment line** is the status line, parsed with
   `sscanf(line, "%lli %c %d")`. Accepted if 2 or 3 fields matched, `current_pos >= 0`,
   status char valid, and `current_pass >= 1`. If the pass is absent it defaults to 1.
   Otherwise: "Bad or missing status line", exit status 2.
 - Every following non-comment line is a block line parsed with
   `sscanf(line, "%lli %lli %c")`. Accepted if 3 fields, `pos >= 0`, status valid, and
-  `size > 0` (or `size == 0 && pos == 0`, the empty-mapfile case).
+  `size > 0` (or `size == 0 && pos == 0`, the empty-mapfile case). Otherwise
+  "Bad block line in list.", exit 2.
 - **Contiguity rule**: each block must start exactly at `prev.end()` (`pos == prev.pos + prev.size`).
-  Otherwise "Blocks are not contiguous", exit 2 — unless loose mode (`-L`) is on, in which
+  Otherwise "Blocks are not contiguous.", exit 2 — unless loose mode (`-L`) is on, in which
   case blocks may be unordered and may overlap *only if all overlapping blocks have the
-  same status*; gaps are filled with the default status (non-tried for domain/test mapfiles).
+  same status* (`insert_sblock_sorted`; otherwise "Blocks of different status overlap.",
+  exit 2); gaps are filled with the default status (`fill_gaps_in_sblock_vector`;
+  non-tried for domain/test mapfiles). A read error / trailing garbage gives
+  "Read error.", exit 1.
 - Positions and sizes are **bytes**, not sectors.
 - `%lli` means a value `> 2^63-1` is rejected; a block size is clamped so that
   `pos + size <= LLONG_MAX` (`Block::fix_size`).
@@ -320,17 +329,20 @@ All under `/sys/block/sdX/device/` (symlink to `/sys/bus/scsi/devices/H:C:T:L/`)
 |-----------|------|--------------------------------|-----------|
 | `timeout` | `0644` | seconds; `rq_timeout / HZ`; store rejects `<= 0`. Default `SD_TIMEOUT = 30 s` (sd.h). Per-request timeout before `scsi_timeout()` fires. | lower to 5–10 s on failing HDD/USB so a hung read returns `EIO` sooner (3.5); requires root |
 | `eh_timeout` | `0644`, store needs `CAP_SYS_ADMIN` | seconds used by the error handler for its own recovery commands (TUR/START UNIT). | lower to 2–5 s |
-| `state` | rw | one of `created running cancel deleted quiesce offline transport-offline blocked`. Writing `offline` then `running` is a userspace "soft reset" of the sdev; EH itself sets `offline` when all resets fail (`scsi_eh_offline_sdevs`). | detect `offline`/`transport-offline` ⇒ device unusable; attempt `running`; else re-attach |
+| `state` | `0644` | one of `created running cancel deleted quiesce offline transport-offline blocked created-blocked` (`sdev_states[]`). `store_state_field` only accepts transitions between `running` and `offline`; writing `running` also runs the hw queues and calls `scsi_rescan_device()` automatically. Writing `offline` then `running` is therefore a userspace "soft reset" of the sdev; EH itself sets `offline` when all resets fail (`scsi_eh_offline_sdevs`). [fact-check: added `created-blocked`, transition rule and implicit rescan from `scsi_sysfs.c`] | detect `offline`/`transport-offline` ⇒ device unusable; attempt `running`; else re-attach |
 | `delete` | w | write `1` → `scsi_remove_device` | last resort before host rescan |
 | `rescan` | w | `scsi_rescan_device` (re-reads capacity/INQUIRY) | after `running` |
 | `/sys/class/scsi_host/hostN/scan` | w | write `"- - -"` to re-probe | after `delete` to get the device back |
-| `/sys/class/scsi_disk/H:C:T:L/max_retries` | rw | `-1` (no limit) .. `SD_MAX_RETRIES = 5`; default 5 | set to `0` or `1` on failing media so the kernel does not retry a bad sector 5× (each retry is another head hit) |
+| `/sys/class/scsi_disk/H:C:T:L/max_retries` | rw | `-1` (`SCSI_CMD_RETRIES_NO_LIMIT`) or `0..SD_MAX_RETRIES (5)`; store rejects anything else; `sd_probe` sets 5. `sd.h` also has `SD_PASSTHROUGH_RETRIES = 1` (SG_IO commands) and `SD_MAX_MEDIUM_TIMEOUTS = 2` (`max_medium_access_timeouts`: after 2 medium-access timeouts the disk is offlined). | set to `0` or `1` on failing media so the kernel does not retry a bad sector 5× (each retry is another head hit) |
 | `queue/max_sectors_kb` | rw | cap on one request; passthrough buffer limit | choose `cluster <= max_sectors_kb` |
 
-Kernel timeout → EH flow (Documentation/scsi/scsi_eh.rst): `scsi_timeout()` →
+Kernel timeout → EH flow (Documentation/scsi/scsi_eh.rst, `scsi_error.c`): `scsi_timeout()` →
 optional LLDD `eh_timed_out()` → `scsi_abort_command()` (async abort, may retry
-`scmd->allowed + 1` times) → EH thread: TUR check → START UNIT → device reset →
-bus reset → host reset → offline the sdev. On libata (SATA) the device/host reset is a
+`scmd->allowed + 1` times) → EH thread (`scsi_eh_ready_devs`): TUR check
+(`scsi_eh_test_devices`) → START UNIT (`scsi_eh_stu`) → device reset
+(`scsi_eh_bus_device_reset`) → target reset (`scsi_eh_target_reset`) → bus reset →
+host reset → offline the sdev. [fact-check: target reset step added from
+`scsi_eh_ready_devs()`] On libata (SATA) the device/host reset is a
 SATA link soft/hard reset (COMRESET). Each step can take tens of seconds; a single
 hung read can therefore block for `timeout × (retries+1) + EH time` ≈ minutes with
 defaults. This is the "bad drive can block ddrescue for a long time until the kernel
@@ -338,8 +350,14 @@ gives up" sentence from the ddrescue manual and the reason R4 exists.
 
 #### 2.2.5 SG_IO pass-through (`/usr/include/scsi/sg.h`, `scsi/scsi.h`)
 
-`ioctl(fd, SG_IO = 0x2285, struct sg_io_hdr*)` on `/dev/sdX` (needs `CAP_SYS_RAWIO`
-or root for READ commands on a block device). Key fields:
+`ioctl(fd, SG_IO = 0x2285, struct sg_io_hdr*)` on `/dev/sdX`. Permissions
+(`drivers/scsi/scsi_ioctl.c::scsi_cmd_allowed`): **READ(6/10/12/16), INQUIRY, REQUEST
+SENSE, TEST UNIT READY, READ CAPACITY, LOG SENSE, MODE SENSE, VERIFY and other
+read-safe opcodes are allowed for anybody who can open the device node**; write-class
+opcodes need the fd opened for writing; everything else — including ATA PASS-THROUGH
+(0x85/0xA1), i.e. the SMART path in 2.2.6 — needs `CAP_SYS_RAWIO`. [fact-check:
+replaces "needs CAP_SYS_RAWIO or root for READ commands"; the node itself is normally
+`root:disk 0660`, so in practice membership of `disk` is the real gate.] Key fields:
 
 | Field | Type | Value for a read |
 |-------|------|------------------|
@@ -354,26 +372,39 @@ or root for READ commands on a block device). Key fields:
 | `timeout` | uint | **milliseconds**; `MAX_UINT` = no timeout |
 | out: `status`, `masked_status`, `host_status`, `driver_status`, `sb_len_wr`, `resid`, `info` | | `info & SG_INFO_CHECK (0x1)` ⇒ something abnormal |
 
-CDBs (SBC; `scsi.h` defines `READ_10 = 0x28`; READ(16) = `0x88` UNVERIFIED against
-local header, taken from SBC-3):
+CDBs (SBC; local `scsi/scsi.h` defines `READ_6 = 0x08`, `READ_10 = 0x28`,
+`READ_12 = 0xA8`; kernel `include/scsi/scsi_proto.h` adds `READ_16 = 0x88`,
+`ATA_16 = 0x85`, `ATA_12 = 0xA1` — verified):
 
 ```
 READ(10): [0]=0x28 [1]=0 [2..5]=LBA (BE32) [6]=0 [7..8]=transfer length in blocks (BE16) [9]=0
 READ(16): [0]=0x88 [1]=0 [2..9]=LBA (BE64)        [10..13]=transfer length (BE32)   [14]=0 [15]=0
 ```
 
-Sense decoding (SPC): fixed format `sbp[0] & 0x7F ∈ {0x70,0x71}` → key = `sbp[2] & 0x0F`,
-ASC = `sbp[12]`, ASCQ = `sbp[13]`, and if `sbp[0] & 0x80` (VALID) the Information
-field `sbp[3..6]` (BE32) holds the LBA of the first unrecovered block for a READ
-(UNVERIFIED: SBC wording of the Information field for MEDIUM ERROR). Descriptor
-format `{0x72,0x73}` → key = `sbp[1] & 0x0F`, ASC = `sbp[2]`, ASCQ = `sbp[3]`.
+Sense decoding (SPC; kernel `scsi_normalize_sense` / `scsi_get_sense_info_fld`):
+fixed format `sbp[0] & 0x7F ∈ {0x70,0x71}` → key = `sbp[2] & 0x0F`, ASC = `sbp[12]`,
+ASCQ = `sbp[13]`, and if `sbp[0] & 0x80` (VALID) the Information field `sbp[3..6]`
+(BE32) holds the LBA. SBC wording (SBC-2 4.x "Error reporting", quoted in T10
+03-348r2): "When an unrecovered read error is reported, the INFORMATION field of the
+sense data shall contain the LBA of the unrecovered logical block"; for a recovered
+error it holds the LBA of the *last* recovered error; and "if the short fixed sense
+data format is requested but the sense data contains an INFORMATION field value ...
+too large for the short fixed sense data format (e.g., an 8-byte LBA), the VALID bit
+shall be set to zero" — so for LBAs ≥ 2^32 use descriptor format. Descriptor format
+`{0x72,0x73}` → key = `sbp[1] & 0x0F`, ASC = `sbp[2]`, ASCQ = `sbp[3]`; the LBA is in
+the Information descriptor (descriptor type `0x00`, length byte `0x0A`, BE64 at
+descriptor offset 4). The kernel itself relies on this: `sd_completed_bytes()` turns
+the sense LBA into the number of good bytes before the bad sector, provided the LBA
+lies inside the request. [fact-check: verified; tag removed]
 
 Sense keys (`scsi.h`): `NO_SENSE 0x0`, `RECOVERED_ERROR 0x1`, `NOT_READY 0x2`,
 `MEDIUM_ERROR 0x3`, `HARDWARE_ERROR 0x4`, `ILLEGAL_REQUEST 0x5`, `UNIT_ATTENTION 0x6`,
-`ABORTED_COMMAND 0xB`. Common ASC/ASCQ: `0x11/0x00` unrecovered read error,
-`0x04/0x00..0x03` not ready/becoming ready, `0x29/0x00` power-on/reset occurred
-(UNIT ATTENTION after a bridge reset), `0x3A/0x00` medium not present (UNVERIFIED:
-ASC list from SPC tables, not re-read during research).
+`DATA_PROTECT 0x7`, `ABORTED_COMMAND 0xB`. Common ASC/ASCQ (kernel
+`drivers/scsi/sense_codes.h`, verified): `0x11/0x00` "Unrecovered read error",
+`0x04/0x00` "Logical unit not ready, cause not reportable", `0x04/0x01` "... in process
+of becoming ready", `0x04/0x02` "... initializing command required", `0x04/0x03` "...
+manual intervention required", `0x29/0x00` "Power on, reset, or bus device reset
+occurred" (UNIT ATTENTION after a bridge reset), `0x3A/0x00` "Medium not present".
 
 Why SG_IO matters: the **timeout is per command in milliseconds** and the result
 carries the sense data, so the engine learns *which* LBA failed and *why* (medium vs
@@ -394,7 +425,7 @@ ATA PASS-THROUGH(16) CDB (opcode `0x85`; (12) is `0xA1`):
 
 ```
 [0]=0x85
-[1]=(protocol<<1)|extend         protocol 4 = PIO Data-In (UNVERIFIED: SAT numeric value)
+[1]=(protocol<<1)|extend         protocol 4 = PIO Data-In (SAT; smartmontools lib/scsiata.cpp: 3 = non-data, 4 = PIO data-in, 5 = PIO data-out — verified)
 [2]=(ck_cond<<5)|(t_dir<<3)|(byte_block<<2)|t_length   t_dir=1 from device, byte_block=1, t_length=2 (sector count)
 [3]=features(15:8) [4]=features(7:0)      -> 0x00, 0xD0
 [5]=count(15:8)    [6]=count(7:0)         -> 0x00, 0x01
@@ -416,7 +447,9 @@ Returned 512-byte `ata_smart_values`: `u16 revnumber` @0, then 30 ×
 | 5 | 6 | `raw` (vendor-defined; usually LE48 count) |
 | 11 | 1 | reserved |
 
-Byte 511 of the page is a checksum (sum of all 512 bytes == 0 mod 256; UNVERIFIED).
+Byte 511 of the page is the checksum (`ata_smart_values::chksum`): smartmontools
+`ata_checksum()` (lib/atacmds.cpp) sums all 512 bytes as `uint8_t` and the result must
+be 0 — verified.
 
 Attributes the engine reads (Wikipedia S.M.A.R.T. table; semantics are conventions,
 "vendors are in no way required to adhere"):
@@ -438,8 +471,15 @@ issued through the same timeout-guarded worker as data reads.
 
 - Admin passthrough: `ioctl(ctrl_or_ns_fd, NVME_IOCTL_ADMIN_CMD = _IOWR('N', 0x41, struct nvme_admin_cmd), &cmd)`;
   struct has `timeout_ms` field. Get Log Page: `opcode = 0x02`, `nsid = 0xFFFFFFFF`,
-  `addr = buf`, `data_len = 512`, `cdw10 = (((512/4) - 1) << 16) | 0x02` (NUMDL, LID)
-  (UNVERIFIED: cdw10 bit layout from NVMe base spec memory).
+  `addr = buf`, `data_len = 512`, `cdw10 = (((512/4) - 1) << 16) | 0x02` = `0x007F0002`
+  (NUMDL, LID). Verified against libnvme `ioctl.h`/`ioctl.c` and kernel
+  `nvme_get_log_lsi()`: `cdw10 = LID[7:0] | LSP[14:8] | RAE[15] | NUMDL[31:16]`,
+  `cdw11 = NUMDU[15:0] | LSI[31:16]`, `cdw12/13 = LPOL/LPOU` (byte offset), `cdw14 =
+  UUID[6:0] | OT[23] | CSI[31:24]`; `NUMD = (len/4) - 1` (0's based dword count).
+  **Permission:** `nvme_cmd_allowed()` lets an unprivileged opener issue only the
+  Identify CNS variants; Get Log Page (and every other admin opcode) needs
+  `CAP_SYS_ADMIN`, so SMART on NVMe is root-only unless the engine is given that
+  capability. [fact-check: tag removed; permission rule added]
 - SMART / Health log page `02h` layout (`struct nvme_smart_log`, 512 bytes):
 
 | Offset | Size | Field |
@@ -471,12 +511,19 @@ issued through the same timeout-guarded worker as data reads.
   Bit 3 set ⇒ the drive is already protecting itself; imaging is still possible and is
   the right move; writes to it are refused (irrelevant for us).
 - Sysfs (verified on this machine): `/sys/class/nvme/nvme0/{state,model,serial,firmware_rev,reset_controller,rescan_controller,queue_count}`;
-  `state` = `live` when healthy (other values: `new`, `resetting`, `connecting`,
-  `deleting`, `dead`; UNVERIFIED list). Writing `1` to `reset_controller` performs a
-  controller reset (root) — the NVMe equivalent of "offline/running". `/dev/nvme0` is
-  the admin char device; `/dev/nvme0n1` the namespace block device. NVMe block timeout:
-  `/sys/block/nvme0n1/queue/io_timeout` (ms; module param `nvme_core.io_timeout`,
-  default 30 s; UNVERIFIED exact path/default).
+  `state` = `live` when healthy; the full list (`drivers/nvme/host/sysfs.c`
+  `state_name[]`, verified) is `new`, `live`, `resetting`, `connecting`, `deleting`,
+  `deleting (no IO)`, `dead` (anything else prints `unknown state`). `reset_controller`
+  is write-only (`S_IWUSR`); writing anything performs `nvme_reset_ctrl_sync()` (root) —
+  the NVMe equivalent of "offline/running". `/dev/nvme0` is the admin char device;
+  `/dev/nvme0n1` the namespace block device. NVMe I/O timeout (verified in
+  `drivers/nvme/host/core.c` and locally): module parameter
+  `/sys/module/nvme_core/parameters/io_timeout` (`nvme_io_timeout`, **seconds**,
+  default 30, mode 0644; `admin_timeout` default 60 s) is copied into each namespace
+  queue when it is created, and the live per-device knob is
+  `/sys/block/nvme0n1/queue/io_timeout` (**milliseconds**, reads `30000` here). Change
+  the queue attribute at run time; changing the module parameter only affects queues
+  created afterwards.
 
 #### 2.2.8 Device identity (udev `60-persistent-storage.rules`, verified on this box)
 
@@ -501,36 +548,56 @@ fingerprint falls back to `(model, size, first-4KiB hash, partition-table GUID)`
 - Socket: `socket(AF_NETLINK, SOCK_RAW | SOCK_CLOEXEC, NETLINK_KOBJECT_UEVENT /* 15 */)`,
   `bind` with `nl_groups = 1` (kernel multicast group 1; udevd re-broadcasts processed
   events on group 2 in libudev format, which we do not need). Unprivileged processes
-  may receive group-1 uevents (UNVERIFIED on hardened kernels).
+  **may** bind and receive group 1: `lib/kobject_uevent.c` creates the socket with
+  `NL_CFG_F_NONROOT_RECV` (only *sending* needs `CAP_SYS_ADMIN` in the owning user
+  namespace). Caveat (verified, `uevent_net_init`): the kernel only delivers uevents to
+  network namespaces owned by the initial user namespace, so inside an unprivileged
+  container/sandbox with its own user+net namespace the socket binds fine but never
+  receives anything — the engine must fall back to polling there. [fact-check: tag
+  removed]
 - Message: `"<ACTION>@<DEVPATH>\0"` followed by `KEY=VALUE\0` pairs. Actions:
   `add remove change move online offline bind unbind`. Max message 2048 bytes
-  (`UEVENT_BUFFER_SIZE`, UNVERIFIED value). Relevant pairs: `SUBSYSTEM=block`,
-  `DEVTYPE=disk|partition`, `DEVNAME=sdb`, `MAJOR`, `MINOR`, `SEQNUM`.
+  (`UEVENT_BUFFER_SIZE` in `include/linux/kobject.h`, verified; `UEVENT_NUM_ENVP = 64`).
+  Relevant pairs: `SUBSYSTEM=block`, `DEVTYPE=disk|partition`, `DEVNAME=sdb`, `MAJOR`,
+  `MINOR`, `SEQNUM` (always appended last).
 - Engine listens for `remove` of its device's `DEVPATH` (⇒ device gone, immediately,
   without waiting for a read to fail) and `add` of any `SUBSYSTEM=block DEVTYPE=disk`
   (⇒ candidate for re-identification). Fallback when the socket cannot be opened:
   poll `/dev/disk/by-id/` and `/sys/block/` every 500 ms.
-- USB device-level sysfs: `/sys/bus/usb/devices/<bus-port>/authorized` (write `0`
-  then `1` to deconfigure/reconfigure = software "replug" without power cycle;
-  verified attribute, UNVERIFIED that it reliably re-enumerates mass-storage bridges),
-  `/sys/bus/usb/drivers/usb/{unbind,bind}` (driver-core generic attributes).
+- USB device-level sysfs: `/sys/bus/usb/devices/<bus-port>/authorized`. Verified
+  semantics (`drivers/usb/core/hub.c`): writing `0` → `usb_deauthorize_device()` =
+  `usb_set_configuration(dev, -1)` (deconfigure: all interface drivers incl.
+  `usb-storage`/`uas` are unbound, so `/dev/sdX` disappears); writing `1` →
+  `usb_authorize_device()` = `usb_autoresume_device()` + `usb_choose_configuration()`
+  + `usb_set_configuration()` (interfaces re-registered, driver rebinds, SCSI
+  re-probes and a new `/dev/sdX` appears). **It does not reset the port or
+  re-enumerate the device**, so a wedged bridge firmware is *not* reset by it; it is a
+  driver-level rebind, not a replug. [fact-check: corrected] The real software replug
+  is `ioctl(fd, USBDEVFS_RESET /* _IO('U', 20) */)` on `/dev/bus/usb/BBB/DDD`
+  (`usb_reset_device()`: port reset, descriptors re-verified, drivers' `pre_reset`/
+  `post_reset` run — what the `usbreset` utility does), and the only way to drop Vbus
+  is `/sys/bus/usb/devices/.../<hub_interface>/port<X>/disable` (kernel ≥ 6.0, June
+  2022 ABI; works only on hubs with per-port power switching, "most hubs don't").
+  Writing `1` to `.../remove` logically disconnects the port and needs a *physical*
+  reconnect to re-enumerate. `/sys/bus/usb/drivers/usb/{unbind,bind}` (driver-core
+  generic attributes) is equivalent in effect to the `authorized` toggle.
 
-### 2.3 Windows mapping (best effort; all UNVERIFIED unless noted)
+### 2.3 Windows mapping (best effort; rows marked ✓ were verified against Microsoft Learn on 2026-10-12, the rest are UNVERIFIED)
 
 | Linux concept | Windows equivalent |
 |---------------|--------------------|
-| `/dev/sdX` | `\\.\PhysicalDriveN` opened with `CreateFileW(GENERIC_READ, FILE_SHARE_READ\|FILE_SHARE_WRITE, OPEN_EXISTING, FILE_FLAG_NO_BUFFERING \| FILE_FLAG_OVERLAPPED)` |
-| `O_DIRECT` alignment | `FILE_FLAG_NO_BUFFERING`: offset/length multiples of sector size, buffer aligned to sector size |
-| `pread` with timeout | `ReadFile` with `OVERLAPPED.Offset/OffsetHigh`, wait with `GetOverlappedResultEx(timeout_ms)`; on timeout `CancelIoEx(h, &ov)` then wait for completion (the cancel may itself block until the miniport abandons the request) |
-| `BLKGETSIZE64` | `IOCTL_DISK_GET_LENGTH_INFO` |
-| `BLKSSZGET/BLKPBSZGET` | `IOCTL_STORAGE_QUERY_PROPERTY` with `StorageAccessAlignmentProperty` |
+| `/dev/sdX` | `\\.\PhysicalDriveN` opened with `CreateFileW(GENERIC_READ, FILE_SHARE_READ\|FILE_SHARE_WRITE, OPEN_EXISTING, FILE_FLAG_NO_BUFFERING \| FILE_FLAG_OVERLAPPED)` (UNVERIFIED flag combination) |
+| `O_DIRECT` alignment ✓ | `FILE_FLAG_NO_BUFFERING` ("File Buffering" doc): access sizes **and** the `OVERLAPPED` offset must be integer multiples of the *volume sector size*; buffer addresses should be aligned to the *physical* sector size (`STORAGE_ACCESS_ALIGNMENT_DESCRIPTOR.BytesPerPhysicalSector`; "depending on the disk, this requirement may not be enforced") — page-aligned (`VirtualAlloc`) buffers satisfy both. [fact-check: logical vs physical distinction added] |
+| `pread` with timeout ✓ (partly) | `ReadFile` with `OVERLAPPED.Offset/OffsetHigh`, wait with `GetOverlappedResultEx(h, &ov, &n, timeout_ms, FALSE)`: returns FALSE with `GetLastError() == WAIT_TIMEOUT` (258) when the interval elapses, `ERROR_IO_INCOMPLETE` (996) when `timeout_ms == 0` (verified); then `CancelIoEx(h, &ov)` and wait for completion (UNVERIFIED: the cancel may itself block until the miniport abandons the request) |
+| `BLKGETSIZE64` ✓ | `IOCTL_DISK_GET_LENGTH_INFO` → `GET_LENGTH_INFORMATION.Length` (bytes) |
+| `BLKSSZGET/BLKPBSZGET` ✓ | `IOCTL_STORAGE_QUERY_PROPERTY` with `StorageAccessAlignmentProperty` → `STORAGE_ACCESS_ALIGNMENT_DESCRIPTOR` (`BytesPerLogicalSector`, `BytesPerPhysicalSector`; Vista+) |
 | serial/model | `IOCTL_STORAGE_QUERY_PROPERTY` with `StorageDeviceProperty` (`STORAGE_DEVICE_DESCRIPTOR.SerialNumberOffset`) |
-| SMART ATA | `SMART_RCV_DRIVE_DATA` (`0x0007C088`) with `SENDCMDINPARAMS` |
-| NVMe SMART | `IOCTL_STORAGE_QUERY_PROPERTY` with `StorageDeviceProtocolSpecificProperty`, `ProtocolTypeNvme`, `NVMeDataTypeLogPage`, log 0x02 |
-| SG_IO | `IOCTL_SCSI_PASS_THROUGH_DIRECT` (`SCSI_PASS_THROUGH_DIRECT.TimeOutValue` in seconds) |
-| `EIO` | `ERROR_IO_DEVICE` (1117), `ERROR_CRC` (23), `ERROR_SECTOR_NOT_FOUND` (27), `ERROR_DISK_OPERATION_FAILED` (1127) |
-| `ENODEV/ENXIO` | `ERROR_DEVICE_NOT_CONNECTED` (1167), `ERROR_FILE_NOT_FOUND` (2) on reopen, `ERROR_NOT_READY` (21), `ERROR_NO_MEDIA_IN_DRIVE` (1112) |
-| `EINTR`/cancel | `ERROR_OPERATION_ABORTED` (995); `ERROR_IO_PENDING` (997) is not an error |
+| SMART ATA ✓ | `SMART_RCV_DRIVE_DATA` = `CTL_CODE(IOCTL_DISK_BASE 0x07, 0x0022, METHOD_BUFFERED, FILE_READ_ACCESS\|FILE_WRITE_ACCESS)` = `0x0007C088` (smartmontools `os_win32.cpp` uses the same value) with `SENDCMDINPARAMS{cBufferSize=512, irDriveRegs={bFeaturesReg=0xD0, bSectorCountReg=1, bCylLowReg=0x4F, bCylHighReg=0xC2, bCommandReg=0xB0}}`; output buffer ≥ `sizeof(SENDCMDOUTPARAMS) - 1 + 512`; the 512-byte page is in `SENDCMDOUTPARAMS.bBuffer`. The handle needs read+write access, so the source must be opened `GENERIC_READ\|GENERIC_WRITE` for this one ioctl (it still issues no write command) |
+| NVMe SMART ✓ | `IOCTL_STORAGE_QUERY_PROPERTY`, `STORAGE_PROPERTY_QUERY{PropertyId=StorageDeviceProtocolSpecificProperty, QueryType=PropertyStandardQuery}` with `STORAGE_PROTOCOL_SPECIFIC_DATA{ProtocolType=ProtocolTypeNvme, DataType=NVMeDataTypeLogPage, ProtocolDataRequestValue=0x02, ProtocolDataRequestSubValue=NSID, ProtocolDataOffset=sizeof(STORAGE_PROTOCOL_SPECIFIC_DATA), ProtocolDataLength=512}` (Windows 10 / Server 2016+) |
+| SG_IO ✓ | `IOCTL_SCSI_PASS_THROUGH_DIRECT` with `SCSI_PASS_THROUGH_DIRECT` (`TimeOutValue` in **seconds**, `DataIn = SCSI_IOCTL_DATA_IN`, `SenseInfoOffset`, `Cdb[16]`) |
+| `EIO` ✓ | `ERROR_IO_DEVICE` (1117), `ERROR_CRC` (23), `ERROR_SECTOR_NOT_FOUND` (27), `ERROR_DISK_OPERATION_FAILED` (1127) |
+| `ENODEV/ENXIO` ✓ | `ERROR_DEVICE_NOT_CONNECTED` (1167), `ERROR_FILE_NOT_FOUND` (2) on reopen, `ERROR_NOT_READY` (21), `ERROR_NO_MEDIA_IN_DRIVE` (1112) |
+| `EINTR`/cancel ✓ | `ERROR_OPERATION_ABORTED` (995); `ERROR_IO_PENDING` (997) is not an error |
 | uevent | `RegisterDeviceNotificationW` + `WM_DEVICECHANGE` (`DBT_DEVICEARRIVAL`/`DBT_DEVICEREMOVECOMPLETE`) or `CM_Register_Notification` |
 | sysfs timeout | `HKLM\SYSTEM\CurrentControlSet\Services\disk\TimeOutValue` (seconds, global, needs reboot) — do not touch by default |
 
@@ -761,8 +828,13 @@ clock jumps backwards are absorbed by shifting t0/ts; pauses shift t0/t1/ts so t
 `--max-error-rate` measures bytes of *failed reads per second*, so it can trigger while
 the bad-sector total does not change (areas being re-marked). `--max-bad-areas=[+]n`
 counts maximal runs of `-` blocks (`+n` = new ones only). `--max-read-errors=n` counts
-failed reads. `--max-slow-reads=n` counts slow 1-second ticks in passes 1–2 (needs
-`--min-read-rate`; `--reset-slow` makes it "consecutive slow seconds").
+failed reads. `--max-slow-reads=n` counts **reads** issued while the current second is
+flagged slow (`update_rates()` returns `current_slow`, recomputed once per second but
+returned after every read, so several reads in one slow second all count) in passes
+1–2 (needs `--min-read-rate`; with `--reset-slow` the counter is zeroed whenever a
+second is not slow, which the manual describes as "exits only after the rate has
+remained below the minimum for at least n seconds"). [fact-check: was "slow 1-second
+ticks"]
 
 DiskRescue additions:
 
@@ -844,9 +916,15 @@ echo 0  > /sys/class/scsi_disk/H:C:T:L/max_retries   # no kernel retries; the en
 Alternative read path (opt-in, root): SG_IO READ(10/16) with `timeout` in ms
 (2.2.5). The kernel still runs EH when the command times out, but the engine gets the
 timeout result and sense data as soon as EH finishes, and `max_retries` does not apply
-to pass-through commands. On NVMe there is no SG_IO; use `NVME_IOCTL_IO_CMD` with
-`timeout_ms` (UNVERIFIED that the read opcode `0x02` passthrough is allowed
-unprivileged; assume root).
+to pass-through commands. On NVMe there is no SG_IO; use `NVME_IOCTL_IO_CMD`
+(`_IOWR('N', 0x43, struct nvme_passthru_cmd)`) with `timeout_ms`. Unprivileged use is
+allowed under the rules in `drivers/nvme/host/ioctl.c::nvme_cmd_allowed()` (verified):
+the fd must be the **namespace** device (`/dev/nvme0n1`, never a partition), the
+controller's Commands Supported and Effects log must mark the opcode as supported
+(`NVME_CMD_EFFECTS_CSUPP`) with only benign effect bits, and a command that writes or
+changes logical block contents needs the fd open for writing — so NVMe READ (`0x02`)
+through a read-only fd works without `CAP_SYS_ADMIN` on controllers that publish the
+effects log; otherwise root. [fact-check: tag removed]
 
 Linux `io_uring`/AIO are **not** used: they still cannot cancel a request the driver
 has already issued, and they complicate O_DIRECT buffer ownership. A thread per read
@@ -890,8 +968,10 @@ re-attach:
 ```
 1. close + reopen fd                                   (ddrescue --reopen-on-error; clears per-fd state, cheap)
 2. write "offline" then "running" to device/state ; write 1 to device/rescan      (SCSI soft reset at sdev level)
-3. USB: echo 0 > .../authorized ; sleep 1 ; echo 1 > .../authorized             (software replug) UNVERIFIED efficacy
-   USB: unbind/bind the usb driver for the device   (/sys/bus/usb/drivers/usb/{unbind,bind})
+3. USB: ioctl(USBDEVFS_RESET) on /dev/bus/usb/BBB/DDD                            (port reset + re-enumeration = software replug; usb_reset_device)
+   USB: echo 0 > .../authorized ; sleep 1 ; echo 1 > .../authorized             (driver-level rebind only: deconfigure/reconfigure, no port reset — cheaper, try first)
+   USB: unbind/bind the usb driver for the device   (/sys/bus/usb/drivers/usb/{unbind,bind}; same effect as the authorized toggle)
+   USB: echo 1 > .../<hub_interface>/port<X>/disable ; sleep 2 ; echo 0 > .../disable   (Vbus off/on; kernel >= 6.0 and only hubs with per-port power switching)
    NVMe: echo 1 > /sys/class/nvme/nvmeN/reset_controller
 4. echo 1 > device/delete ; echo "- - -" > /sys/class/scsi_host/hostN/scan        (full re-probe)
 5. external power cycle via --on-reset-hook; then re-attach wait
@@ -956,9 +1036,12 @@ forced saves at: pass/phase boundaries, before abandoning a worker, before any r
 ladder step, on `SIGINT/SIGTERM/SIGHUP` (handled like ddrescue: set a flag, finish the
 current read, save, re-raise the signal), and every `--mapfile-interval`.
 
-Windows: `MoveFileExW(MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)` replaces
-`rename`; `FlushFileBuffers` replaces `fsync` (UNVERIFIED directory-fsync equivalent;
-none needed on NTFS).
+Windows: `MoveFileExW(MOVEFILE_REPLACE_EXISTING /* 0x1 */ | MOVEFILE_WRITE_THROUGH /* 0x8 */)`
+replaces `rename` (flags verified: REPLACE_EXISTING replaces the target's contents,
+WRITE_THROUGH "does not return until the file is actually moved on the disk"; Microsoft
+does not document same-volume replace as atomic — UNVERIFIED atomicity, so keep
+`map.bak`); `FlushFileBuffers` replaces `fsync` (UNVERIFIED directory-fsync
+equivalent; none needed on NTFS).
 
 ### 3.9 Device-type strategies
 
@@ -1042,7 +1125,7 @@ timeout`; the card may enter permanent write-protect (irrelevant) or "locked" st
 |------|------------------------|------------|
 | **GNU ddrescue** | Pure `read()`-based; relies on kernel EH; 5 copy passes + trim + scrape + retry; mapfile; no device identity, no timeouts per read (only `--timeout` since last good read). | Core algorithm and mapfile adopted verbatim. |
 | **HDDSuperClone / OpenSuperClone** | SCSI/ATA pass-through (sense/ATA status per read, per-command timeouts, marks exact bad LBA from ATA return data), 4 copy phases (fwd skip-on-error, bwd skip-on-error, fwd rate-skip, fwd no-skip), self-learning head-skip (“about 7 read errors”), `--skip-threshold` 2000 ms read-time skip trigger, `--max-skip-size` reset to prevent runaway skipping, *dividing* passes (cluster/8 or /4 then /16) instead of trimming, **virtual disk** (`/dev/sdv` via a kernel driver: data is read from the source *on demand* when a filesystem tool reads the virtual disk, so only the sectors a file system actually needs are ever touched), USB relay power cycling, "direct IO" IDE/AHCI register access bypassing the OS (pro). Progress log in LBA hex with extra skip/error columns; imports/exports ddrescue maps. | Pass-through read path (opt-in), sense-aware classification, per-read timeouts, latency-based skip trigger (`slow_read_ms` = 2000 ms default in passes 1–2), max-skip reset, dividing instead of trimming for flash, reset/power-cycle hook. Virtual-disk/on-demand imaging is planned as `--domain-from-filesystem` (image only used blocks + metadata first), not a kernel driver. |
-| **DMDE** | Windows/Linux; its own "disk image" with bad-sector map; read settings (retries, timeouts, "skip after N errors", block size), can work on a partial image + device simultaneously; file-system reconstruction drives *which* sectors to read. (UNVERIFIED: details from vendor docs not re-read.) | Domain mapfiles + later FS-driven domains. |
+| **DMDE** | Windows/Linux/macOS/DOS. Device I/O parameters (manual `devioparams.html`, verified): *auto retries on CRC error* and *on seek error* (0 = none; non-zero reads sector-by-sector up to the error and retries that sector), *I/O buffer size in sectors* (max sectors per request), *jump over sectors after error* (skip N sectors on an unrecoverable error — "if there are areas of sequential bad sectors, skipping significantly reduces loading and further device damaging"), *read back after jump* (read the skipped region backwards until the next error), *timeout, msec* and *SCSI/ATA timeout, s*, and fill patterns (4-byte LE) for bad vs skipped sectors. Its disk-image tool keeps a bad-sector map and can source from a partial image + device; file-system reconstruction drives *which* sectors to read. | Domain mapfiles + later FS-driven domains; the distinct bad-vs-skipped fill pattern is a cheap idea worth copying (`--fill-skipped`). |
 | **R-Studio (Technician)** | "Multi-pass imaging": good areas first, bad/slow later; runtime imaging (data read once from the device is cached in the image and served from it afterwards); timeouts "depend more on the OS"; read attempts count; exclusive regions. | Same principle; DiskRescue's later stages always read from the image+map and request the engine to fill missing blocks on demand (`command mode` like ddrescue: `c pos size`). |
 
 ddrescue command mode (adopted as the engine's library API for later stages):
@@ -1080,7 +1163,11 @@ mapfile format, `u` write mapfile, `f` compact+write+quit, `q` quit without writ
    or `--exit-on-slow` behaviour (exit code 16 in OSC) + power-cycle hook + resume.
 9. **Runaway skipping**: skip size reaches max and the rest of the disk is skipped in
    huge steps, leaving almost everything NonTried for the slow backward pass. OSC
-   resets to the initial size when the max is reached; ddrescue caps at max. DiskRescue
+   resets to the initial size when the max is reached (manual: "if the actual current
+   skipping size grows to this number, then the starting skip size is reset to the
+   original"); ddrescue caps at max (`rescuebook.cc`: `else eskip_size = max_skipbs`)
+   and only resets when good data is read. Both behaviours confirmed in source/manual;
+   the choice remains a design decision to validate on real hardware. DiskRescue
    follows OSC (reset to initial when max is hit) and counts `skip_resets`.
 10. **Errors at a constant stride** (bad head on a multi-head drive): recorded as
     `head_stride`; v1 only reports it; the user may run with `--domain-mapfile` built
@@ -1213,9 +1300,17 @@ then assert):
 Optional, **root-only, not in CI** (documented for manual validation on the dev box):
 `losetup` the fixture and run against `/dev/loopN` (exercises `BLKSSZGET/BLKGETSIZE64`
 and O_DIRECT on a real block device); `dm-flakey`/`dm-error` targets for EIO
-injection with real kernel semantics; `modprobe scsi_debug dev_size_mb=64 opts=2
-every_nth=100` for synthetic MEDIUM ERRORs through the full SCSI stack (UNVERIFIED
-`opts` bit values); a real USB stick with `authorized` toggling for the re-attach path.
+injection with real kernel semantics; `modprobe scsi_debug dev_size_mb=64 opts=2`
+for synthetic MEDIUM ERRORs through the full SCSI stack (verified in
+`drivers/scsi/scsi_debug.c`: `opts` bits `1` noise, `2` medium_err
+(`SDEBUG_OPT_MEDIUM_ERR`), `4` timeout, `8` recovered_err, `16` transport_err, `32`
+DIF err, `64` DIX err, `128` MAC timeout, `0x100` short transfer, `0x8000` host busy,
+`0x10000` command abort; with bit 2 set every READ overlapping LBA `0x1234`
+(sector 4660) for 10 sectors fails with MEDIUM ERROR / ASC 0x11 and a VALID
+Information field — tunable with `medium_error_start=` / `medium_error_count=`;
+`every_nth` is *not* needed for this, it only gates the timeout/other injected
+errors, "timeout every nth command"); a real USB stick with `USBDEVFS_RESET` and
+`authorized` toggling for the re-attach path. [fact-check: `every_nth=100` dropped]
 
 Unit tests for the map: property tests (`proptest`) that random sequences of
 `change_chunk_status` keep the invariants (sorted, contiguous, covering, no equal
@@ -1240,13 +1335,13 @@ Versions are `max_stable_version` from crates.io on 2026-10-12 unless tagged.
 | CLI | `clap` | 4.6.7 | derive API; ddrescue-compatible long options |
 | TUI (progress screen) | `ratatui` | 0.30.2 | optional; `indicatif` 0.18.6 for plain progress bars |
 | logging | `tracing` | 0.1.44 | structured events → `--log-events/--log-rates/--log-reads` equivalents |
-| sidecar JSON | `serde` 1.0.229 + `serde_json` | 1.0.x (UNVERIFIED exact) | |
+| sidecar JSON | `serde` 1.0.229 + `serde_json` | 1.0.154 | |
 | errors | `thiserror` 2.0.21 / `anyhow` 1.0.104 | | |
 | hotplug (pure Rust) | `netlink-sys` 0.9.0 **or** raw `libc` socket | | `neli` 0.7.4 is an alternative; the libudev-based `udev` crate (0.9.3) needs `libudev-dev` at build time (not installed on this box) — avoid |
 | mmap for later stages (not the engine) | `memmap2` | 0.9.11 | never mmap the source device |
 | Windows | `windows-sys` | 0.61.2 | `CreateFileW`, `ReadFile`/`OVERLAPPED`, `CancelIoEx`, `DeviceIoControl` |
-| property tests | `proptest` | 1.x (UNVERIFIED) | map invariants |
-| temp files in tests | `tempfile` | 3.x (UNVERIFIED) | |
+| property tests | `proptest` | 1.12.0 | map invariants |
+| temp files in tests | `tempfile` | 3.27.0 | |
 
 Not recommended: `tokio`/`io-uring` for the read path (3.5); any crate that shells out
 to `smartctl`/`ddrescue` (not available on the dev box, and the engine must own the
@@ -1261,7 +1356,10 @@ Primary (read during research):
 - GNU ddrescue 1.28 source tarball: `https://ftpmirror.gnu.org/gnu/ddrescue/ddrescue-1.28.tar.lz`
   (files `doc/ddrescue.texi`, `rescuebook.cc`, `rescuebook.h`, `mapfile.cc`, `mapbook.cc`,
   `main.cc`, `main_common.cc`, `io.cc`, `block.h`, `testsuite/check.sh`). Manual online:
-  `https://www.gnu.org/software/ddrescue/manual/ddrescue_manual.html` (rate-limited during research; the texinfo in the tarball is the same text).
+  `https://www.gnu.org/software/ddrescue/manual/ddrescue_manual.html` (still HTTP 429
+  on 2026-10-12; the tarball downloaded fine with `curl` from ftpmirror.gnu.org and was
+  unpacked with `lzip`, and `doc/ddrescue.texi` is the same text — all section 2.1/3.3/3.4
+  claims were re-read from it during the fact-check).
 - OpenSuperClone (HDDSuperClone) manual: `https://raw.githubusercontent.com/ISpillMyDrink/OpenSuperClone/master/doc/opensuperclone.texi`
   (Theory of Operation, Usage, Exit Codes, Progress Log Structure, Important Notes, WARNING).
 - Linux kernel: `drivers/scsi/scsi_sysfs.c` (`timeout`, `eh_timeout`, `state`, `delete`, `rescan` attributes),
@@ -1283,7 +1381,47 @@ Primary (read during research):
 - Local sysfs inspection of `/sys/block/nvme0n1`, `/sys/class/nvme/nvme0` (attribute names, `state=live`, `max_sectors_kb=128`).
 - Wikipedia, "Self-Monitoring, Analysis and Reporting Technology" (attributes 5/196/197/198/199 conventions):
   `https://en.wikipedia.org/wiki/Self-Monitoring,_Analysis_and_Reporting_Technology`
-- crates.io API (`https://crates.io/api/v1/crates/<name>`) for crate versions, 2026-10-12.
+- crates.io API (`https://crates.io/api/v1/crates/<name>`) for crate versions, 2026-10-12
+  (needs a `User-Agent` header or it returns 403).
+
+Added during the 2026-10-12 fact-check (all read in full or grepped locally):
+
+- Linux master: `include/scsi/scsi_proto.h` (READ_16/ATA_16/ATA_12, sense keys),
+  `drivers/scsi/scsi_ioctl.c` (`scsi_cmd_allowed`), `drivers/scsi/scsi_error.c`
+  (`scsi_get_sense_info_fld`, EH escalation order), `drivers/scsi/scsi_common.c`
+  (`scsi_normalize_sense`), `drivers/scsi/sense_codes.h` (ASC/ASCQ strings),
+  `drivers/scsi/sd.c` (`max_retries_store`, `sd_completed_bytes`), `drivers/scsi/sd.h`,
+  `drivers/scsi/scsi_sysfs.c`, `drivers/scsi/scsi_debug.c` (`SDEBUG_OPT_*`,
+  `OPT_MEDIUM_ERR_ADDR`), `drivers/nvme/host/{core.c,ioctl.c,sysfs.c,nvme.h}`
+  (`io_timeout`, `nvme_cmd_allowed`, `state_name[]`), `block/blk-sysfs.c`
+  (`queue/io_timeout`), `include/linux/kobject.h` (`UEVENT_BUFFER_SIZE`),
+  `lib/kobject_uevent.c` (`NL_CFG_F_NONROOT_RECV`, `uevent_net_init`),
+  `drivers/usb/core/{hub.c,sysfs.c,port.c}` (`usb_authorize_device`,
+  `usb_deauthorize_device`, `usb_reset_device`, `remove`, `port<X>/disable`),
+  `Documentation/ABI/testing/sysfs-bus-usb`, `include/uapi/linux/nvme_ioctl.h`,
+  `include/uapi/linux/usbdevice_fs.h` (`USBDEVFS_RESET`) —
+  `https://raw.githubusercontent.com/torvalds/linux/master/...`.
+- libnvme: `src/nvme/types.h` (`struct nvme_smart_log`, `enum nvme_smart_crit`,
+  `NVME_LOG_LID_SMART`), `src/nvme/ioctl.h` (`NVME_LOG_CDW10_*_SHIFT/MASK`),
+  `src/nvme/ioctl.c` (`nvme_get_log`: `numd = (len >> 2) - 1`) —
+  `https://raw.githubusercontent.com/linux-nvme/libnvme/master/...`.
+- smartmontools: `lib/scsiata.cpp` (SAT protocol values 3/4/5, CDB byte layout),
+  `lib/atacmds.cpp` (`ata_checksum`), `include/smartmon/ata.h` —
+  `https://raw.githubusercontent.com/smartmontools/smartmontools/main/...`.
+- T10 03-348r2 "SBC-2 4-byte LBA commands on 8 byte capable drives" (quotes the SBC
+  INFORMATION-field rules for unrecovered/recovered read errors and the VALID-bit
+  overflow rule): `https://www.t10.org/ftp/t10/document.03/03-348r2.pdf`.
+- OpenSuperClone manual re-read for phases, `--skip-threshold`, `--max-skip-size`
+  reset, exit code 16, passthrough/USB statements, 512 KB transfer default.
+- DMDE manual, "Device I/O parameters": `https://dmde.com/manual/devioparams.html`.
+- Microsoft Learn: System Error Codes 0–499 / 500–999 / 1000–1299, `MoveFileExW`,
+  `GetOverlappedResultEx`, `IOCTL_DISK_GET_LENGTH_INFO`, "File Buffering",
+  `SCSI_PASS_THROUGH_DIRECT`, `STORAGE_PROTOCOL_SPECIFIC_DATA`, `SENDCMDINPARAMS`
+  (`SMART_RCV_DRIVE_DATA` semantics; the numeric `0x7C088` is `CTL_CODE` arithmetic,
+  cross-checked with smartmontools `os_win32.cpp`).
+- Local: `man 2 open` (manpages 6.17-1) O_DIRECT section; `modinfo scsi_debug`;
+  `/sys/module/nvme_core/parameters/{io_timeout,admin_timeout}` = 30 / 60;
+  `/sys/block/nvme0n1/queue/io_timeout` = 30000.
 
 Secondary (search results, not fully read):
 

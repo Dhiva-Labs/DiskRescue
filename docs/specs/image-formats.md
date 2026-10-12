@@ -1,9 +1,12 @@
 # Still-image formats: carving, validation and repair
 
 Status: implementation spec for the DiskRescue carver (`carve::image`) and repair modules
-(`repair::jpeg`, `repair::png`). Lines tagged `UNVERIFIED` could not be confirmed against a
-primary source during research and must be checked by the fact-checker or by a fixture test
-before the behaviour is relied on.
+(`repair::jpeg`, `repair::png`). Fact-check pass 2026-10-12: all byte-level claims in
+sections 2 and 6 were verified against primary sources (T.81 / libjpeg `jstdhuff.c` by
+script, ExifTool module sources, PhotoRec, dcraw, lclevy, libopenraw, crate sources and a
+fixture run against the real crates); corrections are in place. The few lines still tagged
+`UNVERIFIED` are performance estimates or heuristics that only a fixture/benchmark run can
+settle, and must not be relied on until measured.
 
 Conventions used in this document:
 
@@ -50,9 +53,13 @@ Formats are listed in priority order for a photo/video recovery tool:
 
 Carving from a raw image recovers **contiguous** files only. On FAT/exFAT SD cards written
 sequentially by a camera, photos are usually contiguous; on NTFS/ext4 system disks and on
-cards that were partially deleted and refilled, 5-15 % of large files are fragmented
-(UNVERIFIED, figure commonly quoted in carving literature, not measured here). The carver
-must therefore:
+cards that were partially deleted and refilled, a significant share of large files is
+fragmented. Measured figures (Garfinkel, "Carving contiguous and fragmented files with fast
+object validation", DFRWS 2007, Table 1/3, 324-drive corpus): 6 % of all files, **16 % of
+JPEGs**, 20 % of AVIs, 17 % of MPEGs were in two or more fragments; roughly half the drives
+had no fragmented file at all, while the worst drive had 43 % of its JPEGs fragmented
+(Digital Investigation 4S (2007) S2-S12, doi:10.1016/j.diin.2007.06.017; author copy https://simson.net/clips/academic/2007.DFRWS.pdf).
+The carver must therefore:
 
 - Prefer the filesystem-parser path (which follows the cluster chain) and only carve the
   unallocated/unreadable remainder.
@@ -215,8 +222,9 @@ Rules the validator applies during the walk (all cheap, all catch real false pos
   valid for the SOF type (2.1.5).
 - All quant tables and Huffman tables referenced by the scan are defined (except when the
   DHT-less Motion-JPEG convention is detected, 3.6).
-- Reject if total header length (SOI..SOS) > 16 MiB (UNVERIFIED cap; biggest legitimate headers
-  are multi-segment XMP + ICC + MPF, a few MB).
+- Reject if total header length (SOI..SOS) > 16 MiB (chosen default, not a sourced figure;
+  biggest legitimate headers are multi-segment XMP + ICC + MPF, a few MB; make it a
+  `--max-jpeg-header` option).
 
 #### 2.1.4 Entropy-coded data, stuffing, fill, restart markers
 
@@ -306,9 +314,10 @@ find_jpeg_end(buf, soi):
 continue; on `FF D0..D7` continue; otherwise return position of the FF. For validation at
 L2 the same loop is replaced by the Huffman symbol decoder (3.2) which also counts MCUs.
 
-The scan-data walk must be bounded: `max_jpeg_size` (default 256 MiB; PhotoRec's hard cap is
-50 MiB, which is too small for 100-megapixel bodies and for MPF depth/gain-map files; the
-Phase One IQ4 at 151 MP produces JPEGs > 60 MB (UNVERIFIED figure)).
+The scan-data walk must be bounded: `max_jpeg_size` (default 256 MiB, a chosen cap, not a
+sourced figure; PhotoRec's hard cap is 50 MiB (`file_jpg.c`: `.max_filesize=50*1024*1024`),
+which is too small for 100-megapixel bodies and for MPF depth/gain-map files; the Phase One
+IQ4 at 151 MP produces JPEGs > 60 MB (UNVERIFIED figure)).
 
 #### 2.1.7 MPF (CIPA DC-007) layout
 
@@ -328,7 +337,7 @@ MPEntry (16 bytes, byte order of the TIFF header):
 
 | Offset | Size | Field |
 |---|---|---|
-| 0 | u32 | Individual Image Attribute: bit 31 dependent parent, bit 30 dependent child, bit 29 representative image, bits 26-24 image data format (0 = JPEG), bits 23-0 MP type code: 0x030000 baseline MP primary, 0x010001 large thumbnail (VGA), 0x010002 large thumbnail (full HD), 0x020001 multi-frame panorama, 0x020002 multi-frame disparity, 0x020003 multi-angle, 0x000000 undefined |
+| 0 | u32 | Individual Image Attribute: bit 31 dependent parent, bit 30 dependent child, bit 29 representative image, bits 26-24 image data format (0 = JPEG), bits 23-0 MP type code: 0x030000 baseline MP primary, 0x010001 large thumbnail (VGA), 0x010002 large thumbnail (full HD), 0x010003/0x010004/0x010005 large thumbnail (4K/8K/16K, later CIPA revisions), 0x020001 multi-frame panorama, 0x020002 multi-frame disparity, 0x020003 multi-angle, 0x000000 undefined (bit masks cross-checked against ExifTool `MPF.pm`: flags mask 0xF8000000, format mask 0x07000000, type mask 0x00FFFFFF) |
 | 4 | u32 | Individual Image Size (bytes, SOI..EOI inclusive) |
 | 8 | u32 | Individual Image Data Offset, relative to T; **0 for the first image** |
 | 12 | u16 | Dependent Image 1 Entry Number |
@@ -344,13 +353,26 @@ Output naming: a file with NumberOfImages > 1 whose later images are `0x020002/0
 #### 2.1.8 Trailers after EOI
 
 - **Samsung "Motion Photo" / SEF trailer**: after the JPEG (and after MPF images) Samsung
-  appends an MP4 and then a SEF directory: the file ends with `... "SEFH" <u32 version> <u32 count> <entries> <u32 dir_len> "SEFT"`,
-  i.e. the last 4 bytes are `53 45 46 54`. Each entry = `u32 type, u32 offset_from_SEFH_backwards, u32 size` with
-  block keys like `"MotionPhoto_Data"`, `"Image_UTC_Data"`. The XMP of such files carries
-  `MotionPhoto=1` and `MicroVideoOffset`. UNVERIFIED (reverse-engineered format, no spec);
-  the carver should treat "XMP says MotionPhoto and the bytes after EOI start with
-  `00 00 00 xx 66 74 79 70` (ftyp)" as authoritative and use the MP4 walker (video spec) to
-  find the end, then look for a SEFT-terminated block right after.
+  appends an MP4 and then a SEF directory. Layout (reverse-engineered, no public spec; this is
+  exactly what ExifTool `Samsung.pm` `ProcessSamsung` parses, all integers **little-endian**):
+  the file ends with `<u32le dir_len> "SEFT"` (last 4 bytes `53 45 46 54`; the 6 bytes before
+  EOF therefore read `00 00 53 45 46 54` for any dir_len < 64 KiB, which is what ExifTool
+  tests). The directory block of `dir_len` bytes immediately precedes those 8 bytes:
+  `"SEFH" <u32 version (seen 101)> <u32 count>` then `count` 12-byte entries:
+  `u16 (unused) @0, u16 block_type @2, u32 noff @4, u32 size @8`. `noff` is a **negative**
+  offset: the block's data starts at `dirPos - noff` where `dirPos` = offset of `"SEFH"`;
+  `size` is the block length (`size >= 8`, `size <= noff`). Each data block =
+  `u32 @0 (type copy), u32 name_len @4, name[name_len] @8, payload`. Known block types /
+  names: 0x0001 `EmbeddedImage` (`DualShot_1`, `SingleShot`), 0x0100 `EmbeddedAudioFile`
+  (Sound & Shot), 0x0201 `SurroundShotVideo`, 0x0a01 `Image_UTC_Data` (timestamp), 0x0a30
+  `MotionPhoto_Data` (the MP4), 0x0aa1 `MCC_Data`, 0x0a41 `BackupRestore_Data`. Older
+  Galaxy "Sound & Shot" files end with `"QDIOBS"` instead of `SEFT` (same block chain). The
+  XMP of such files carries `GCamera:MotionPhoto=1` (newer) or `GCamera:MicroVideo=1` +
+  `MicroVideoOffset` (older). The carver should treat "XMP says MotionPhoto and the bytes
+  after EOI start with `00 00 00 xx 66 74 79 70` (ftyp)" as authoritative and use the MP4
+  walker (video spec) to find the end, then accept a SEFT-terminated block right after
+  (extent = end of `"SEFT"`). Source: https://raw.githubusercontent.com/exiftool/exiftool/master/lib/Image/ExifTool/Samsung.pm
+  (`ProcessSamsung`, `%Image::ExifTool::Samsung::Trailer`).
 - **Google Motion Photo (Pixel)**: XMP `GCamera:MicroVideoOffset` (bytes from end of file to
   start of MP4) or `Container:Directory` with `Item:Length` entries (Motion Photo v2); the MP4
   follows EOI directly. Same handling: detect `ftyp` right after EOI.
@@ -603,7 +625,7 @@ Lh = 2 + (17+12) + (17+162) + (17+12) + (17+162) = 418 = 0x01A2.
 
 | Item | Value |
 |---|---|
-| Magic | `FF D8 FF` at offset 0, followed by `E0..EF`, `DB`, `C0..C3`, `C4`, `FE`, `DD`, `C9..CB` (arithmetic; still carve). PhotoRec additionally accepts `FF D8 FF FF`. |
+| Magic | `FF D8 FF` at offset 0, followed by `E0..EF`, `DB`, `C0..C3`, `C4`, `FE`, `DD`, `C9..CB` (arithmetic; still carve). PhotoRec registers only the 3-byte `FF D8 FF` (`file_jpg.c` `jpg_header`) and then validates the segment chain; it does not special-case `FF D8 FF FF`. Treat a 4th byte of `FF` as fill (2.1.1) and continue the walk. |
 | Minimum size | 134 bytes (SOI + minimal DQT 69 + SOF 19 + DHT 2x(19+...) + SOS 14 + 1 MCU + EOI, in practice); reject < 256 bytes as not worth emitting |
 | Maximum plausible | 256 MiB default; raise with `--max-jpeg-size` |
 | Exact end | 2.1.6 |
@@ -677,7 +699,7 @@ mark `variant = cgbi`, do not attempt L2 inflate with the zlib wrapper.
 | Blocks | repeated: `0x2C` Image Descriptor (u16le left, top, width, height, u8 packed: bit 7 LCT flag, bit 6 interlace, bit 5 sort, bits 2-0 LCT size) + LCT + `u8 LZW min code size (2..8)` + data sub-blocks; `0x21` Extension: `u8 label` (0xF9 GCE, 0xFE comment, 0x01 plain text, 0xFF application: 11-byte id e.g. `NETSCAPE2.0`) + sub-blocks; `0x3B` trailer |
 | Data sub-blocks | `u8 len` (1..255), `len` bytes, ..., `00` terminator |
 | Exact end | walk blocks until 0x3B; end = offset of 0x3B + 1 |
-| Min / max | 14 + 1 (`GIF89a` + LSD + 0x3B) is legal but useless; emit only >= 64 bytes; max 256 MiB (animations) |
+| Min / max | 6 + 7 + 1 = 14 bytes (`GIF89a` + LSD + 0x3B) is legal but useless; emit only >= 64 bytes; max 256 MiB (animations) |
 | False positives | "GIF8" + "7a"/"9a" + width/height nonzero + first block byte in {0x21, 0x2C, 0x3B}: negligible |
 | Validation | L1 block walk; L2 LZW decode of each image (code size progression, clear/EOI codes, pixel count == w*h); L3 gif crate |
 
@@ -693,8 +715,8 @@ chain (`00`) and append `3B`; viewers show frames decoded so far.
 | 6 | u32le | reserved (0) |
 | 10 | u32le | bfOffBits = offset of pixel array (>= 14 + DIB header size) |
 | 14 | u32le | DIB header size: 12 (BITMAPCOREHEADER), 40 (INFO), 52 (V2), 56 (V3), 108 (V4), 124 (V5); other values -> reject |
-| 18 | i32le / u16le(core) | width |
-| 22 | i32le / u16le(core) | height (negative = top-down) |
+| 18 | i32le | width (BITMAPCOREHEADER, DIB size 12: `u16le` width at 18, `u16le` height at 20, `u16le` planes at 22, `u16le` bpp at 24, no compression field) |
+| 22 | i32le | height (negative = top-down; INFO and later headers only) |
 | 26 | u16le | planes = 1 |
 | 28 | u16le | bpp: 1,4,8,16,24,32 (0 = JPEG/PNG embedded) |
 | 30 | u32le | compression: 0 BI_RGB, 1 RLE8, 2 RLE4, 3 BITFIELDS, 4 JPEG, 5 PNG, 6 ALPHABITFIELDS, 11-13 CMYK |
@@ -746,9 +768,8 @@ RAW variants that change the magic word (same IFD structure, walker must accept 
 | `49 49 52 4F` ("IIRO") | ORF little-endian (magic word 0x4F52) | Olympus |
 | `4D 4D 4F 52` ("MMOR") | ORF big-endian | Olympus E-series early |
 | `49 49 52 53` ("IIRS") | ORF variant (0x5352) | Olympus, some models |
-| `49 49 55 00` ("IIU\0") | RW2 / RWL (Panasonic/Leica), magic word 0x55 | IFD0 offset is 0x18 in RW2 (`49 49 55 00 18 00 00 00`); older Panasonic `.RAW` use IFD0 offset 8 UNVERIFIED |
-| `49 49 2A 00` + `43 52 02 00` at 8 | CR2 | "CR", major 2, minor 0; u32le at 12 = offset of raw IFD (IFD3) |
-| `49 49 2A 00` + `43 52 01 00` at 8 | CRW-era "CR2 v1" (never shipped) UNVERIFIED | ignore |
+| `49 49 55 00` ("IIU\0") | RW2 / RWL (Panasonic/Leica), magic word 0x55 | IFD0 offset is 0x18 in RW2 (`49 49 55 00 18 00 00 00`, PRONOM fmt/662); older Panasonic `.RAW` (pre-2008, DMC-FZ8/FZ18/L10 era) use IFD0 offset 8: `49 49 55 00 08 00 00 00` (libopenraw RW2 notes give this 8-byte magic). Accept any IFD0 offset in 8..=64 KiB. |
+| `49 49 2A 00` + `43 52 02 00` at 8 | CR2 | "CR", major 2, minor 0; u32le at 12 = offset of raw IFD (IFD3) (lclevy CR2 notes). Only major version 2 has ever been observed; reject other values. |
 
 Walker:
 
@@ -796,15 +817,15 @@ order; most writers comply, treat descending as a strong negative signal, not fa
 
 | Format | Detect | Where things are | Extent notes |
 |---|---|---|---|
-| CR2 (Canon) | `II*\0` + `CR` 02 00 at 8; Make "Canon" | IFD0: full-size JPEG preview via 0x0111/0x0117 (Compression 6); IFD1: 160x120 thumb via 0x0201/0x0202; IFD2: small uncompressed RGB; IFD3 (u32le at offset 12): raw, lossless JPEG (SOF3) via 0x0111/0x0117, 0xC640 CR2Slice (3 x SHORT), 0xC5D8/0xC5E0 raw dims | max of strips; raw strip is last |
-| NEF / NRW (Nikon) | Make "NIKON CORPORATION" / "NIKON"; mostly `MM` | IFD0: thumbnail (160x120 RGB strips) + `0x014A SubIFDs` -> [preview JPEG (Compression 6, 0x0201/0x0202 or strips), raw (Compression 34713)]; MakerNote "Nikon\0" + 00 02 xx 00 + TIFF header (offsets relative to makernote TIFF header at makernote+10); preview in MakerNote IFD tag 0x0011 PreviewIFD (0x0201/0x0202 relative to makernote TIFF header) UNVERIFIED | max of SubIFD strips |
-| ARW / SR2 / SRF (Sony) | Make "SONY"; PhotoRec: "SONY " with trailing space -> .arw, "SONY" -> .sr2 UNVERIFIED | IFD0: preview JPEG (0x0201/0x0202) + SubIFDs -> raw (Compression 32767 = Sony ARW compressed, strips); 0xC634 DNGPrivateData -> SR2Private IFD (tags 0x7200 SR2SubIFDOffset, 0x7201 SR2SubIFDLength, 0x7221 SR2SubIFDKey, encrypted) UNVERIFIED tag ids | max of strips incl. SR2SubIFDOffset+Length |
+| CR2 (Canon) | `II*\0` + `CR` 02 00 at 8; Make "Canon" | IFD0: full-size JPEG preview via 0x0111/0x0117 (Compression 6); IFD1: 160x120 thumb via 0x0201/0x0202; IFD2: small uncompressed RGB; IFD3 (u32le at offset 12): raw, lossless JPEG (SOF3) via 0x0111/0x0117, 0xC640 RawImageSegmentation ("cr2_slice", 3 x SHORT: slice count-1, slice width, last slice width), 0xC5E0 CR2CFAPattern, 0xC6C5 SRawType, 0xC5D8/0xC5D9 unknown (ExifTool `Exif.pm`; raw dimensions come from the SOF3 inside the strip, not from these tags) | max of strips; raw strip is last |
+| NEF / NRW (Nikon) | Make "NIKON CORPORATION" / "NIKON"; mostly `MM` | IFD0: thumbnail (160x120 RGB strips) + `0x014A SubIFDs` -> [preview JPEG (Compression 6, 0x0201/0x0202 or strips), raw (Compression 34713)]; MakerNote `"Nikon\0"` + `02 1x 00 00` (version) + TIFF header (`II`/`MM` + 2A + IFD offset 8) at makernote+10, IFD at makernote+18; all makernote offsets relative to that TIFF header (ExifTool `MakerNotes.pm`: Start = valuePtr+18, Base = start-8); preview in MakerNote tag 0x0011 PreviewIFD (ExifTool `Nikon.pm`, SubIFD with standard 0x0201/0x0202, relative to the makernote TIFF header) | max of SubIFD strips |
+| ARW / SR2 / SRF (Sony) | Make "SONY". PhotoRec `file_tiff_le.c` really does `memcmp(make, "SONY", 5) == 0` (NUL-terminated, 4 chars) -> `.sr2`, `memcmp(make, "SONY ", 5) == 0` (trailing space) -> `.arw`, with a `TODO` admitting the correct rule is "sr2 if Sony::FileFormat begins with 1". Authoritative rule (ExifTool `Sony.pm` tag 0xB000 FileFormat, BYTE[4] in the MakerNote): `01 00 00 00` = SR2, `02 00 00 00` = ARW 1.0, `03 0x 00 00` = ARW 2.x, `04..06 ...` = ARW 3-5; prefer it, fall back to the Make-string heuristic | IFD0: preview JPEG (0x0201/0x0202) + SubIFDs -> raw (Compression 32767 = Sony ARW compressed, strips); 0xC634 DNGPrivateData -> SR2Private IFD (tags 0x7200 SR2SubIFDOffset, 0x7201 SR2SubIFDLength, 0x7221 SR2SubIFDKey (LONG, decryption key); ExifTool `Sony.pm` `SR2Private`) | max of strips incl. SR2SubIFDOffset+Length |
 | DNG (Adobe) | `0xC612 DNGVersion` BYTE[4] in IFD0 (e.g. 01 04 00 00) | IFD0 may be the preview (NewSubFileType 1) with SubIFDs -> raw (NewSubFileType 0), raw often **tiled** (0x0144/0x0145, Compression 7 lossless JPEG or 34892 lossy JPEG, 52546 JPEG XL in DNG 1.7); 0xC68C OriginalRawFileData embeds the original camera file; 0xC71C PreviewApplicationName etc. | max over tiles/strips/private |
-| PEF (Pentax/Ricoh) | Make "PENTAX Corporation" / "PENTAX" / "RICOH IMAGING COMPANY, LTD." | IFD0: raw (Compression 65535 Pentax), strips; IFD1: thumbnail JPEG 0x0201/0x0202; preview JPEG in MakerNote (`AOC\0` + MM/II; tags 0x0003 PreviewImageSize, 0x0004 PreviewImageLength, 0x0005 PreviewImageStart - absolute file offsets) UNVERIFIED | max incl. makernote preview |
-| ORF (Olympus / OM System) | magic IIRO/MMOR/IIRS | IFD0: raw strips (Compression 1 but packed 12-bit, length may be less than w*h*2); IFD1: thumbnail; preview JPEG in MakerNote (`OLYMPUS\0II` + 03 00, offsets relative to makernote start; CameraSettings IFD 0x2020 -> 0x0101 PreviewImageStart / 0x0102 PreviewImageLength) UNVERIFIED tag ids | max incl. makernote preview |
-| RW2 / RWL (Panasonic / Leica) | `IIU\0` | IFD0 at 0x18: 0x0002 SensorWidth, 0x0003 SensorHeight (SHORT), 0x002D RawFormat, 0x002E JpgFromRaw (UNDEFINED, whole JPEG incl. Exif, in the value area), 0x0118 RawDataOffset (LONG, **no byte count**), 0x0127 JpgFromRaw2 (newer bodies) | raw data runs from RawDataOffset to EOF. Estimate: for RawFormat 4/5 (v4/v5 packed compression) size ~= ceil(SensorWidth*SensorHeight*16/14) rounded up to a multiple of 0x4000 (dcraw `panasonic_load_raw` reads 0x4000-byte blocks of 14 pixels per 16 bytes) UNVERIFIED; for RawFormat 6/7 (G9II, S5II) the raw is a different compressed stream, size unknown -> fall back to "up to next carved header or next FS cluster boundary + validation". Report `extent_confidence = low` |
+| PEF (Pentax/Ricoh) | Make "PENTAX Corporation" / "PENTAX" / "RICOH IMAGING COMPANY, LTD." | IFD0: raw (Compression 65535 Pentax), strips; IFD1: thumbnail JPEG 0x0201/0x0202; preview JPEG in MakerNote (`AOC\0` then `MM`/`II` on newer bodies, IFD directly after on older ones; ExifTool parses it with `FixBase` because the offset base varies; tags **0x0002 PreviewImageSize** (2 x SHORT), **0x0003 PreviewImageLength**, **0x0004 PreviewImageStart** (`IsOffset => 2` = relative to the start of the file, not the TIFF header or makernote); 0x0005 is PentaxModelID, not a preview tag; ExifTool `Pentax.pm`) | max incl. makernote preview |
+| ORF (Olympus / OM System) | magic IIRO/MMOR/IIRS | IFD0: raw strips (Compression 1 but packed 12-bit, length may be less than w*h*2); IFD1: thumbnail; preview JPEG in MakerNote (`OLYMPUS\0` + `II`/`MM` + `03 00`, IFD at makernote+12, offsets relative to makernote start (ExifTool `MakerNotes.pm`: Start = valuePtr+12, Base = start-12); `OM SYSTEM\0` header: IFD at +16, same base rule; old `OLYMP\0` header: IFD at +8, offsets relative to the TIFF header; CameraSettings IFD 0x2020 -> 0x0100 PreviewImageValid, 0x0101 PreviewImageStart, 0x0102 PreviewImageLength, ExifTool `Olympus.pm`) | max incl. makernote preview |
+| RW2 / RWL (Panasonic / Leica) | `IIU\0` | IFD0 at 0x18: 0x0002 SensorWidth, 0x0003 SensorHeight (SHORT), 0x002D RawFormat, 0x002E JpgFromRaw (UNDEFINED, whole JPEG incl. Exif, in the value area), 0x0118 RawDataOffset (LONG, **no byte count**), 0x0127 JpgFromRaw2 (newer bodies) | raw data runs from RawDataOffset to EOF. RawFormat values (ExifTool `PanasonicRaw.pm`): 2 = old `.RAW` (FZ8/FZ18), 3 = old `.RAW` (L10), 4 = RW2 for most bodies (incl. G9 pixel-shift off), 5 = GH5s / G9 pixel-shift on, 6 = DC-S1 / S1R pixel-shift off, 7 = S1R pixel-shift on (5 and 7 are lossless). Size estimate for RawFormat 4 (dcraw `panasonic_load_raw`: 14 pixels per 128 bits, i.e. 16 bytes per 14 pixels, `pana_bits` refilling 0x4000-byte blocks with `load_flags = 0x2008`; dcraw's own detection test is `(file_len - data_offset) / (raw_width*8/7) == raw_height`): `size ~= raw_width * raw_height * 8 / 7` bytes where raw_width/raw_height are the **sensor** dims (0x0002/0x0003), allowing up to one extra 0x4000 block of padding. For RawFormat 5/6/7 the stream is a different (v5/v6/v7) compression whose length is not derivable from the header -> fall back to "up to next carved header or next FS cluster boundary + validation". Report `extent_confidence = low` for everything but RawFormat 4 |
 | ERF (Epson) | Make "SEIKO EPSON CORP." | plain TIFF, raw in IFD0 strips | exact |
-| SRW (Samsung NX) | Make "SAMSUNG" | IFD0 + SubIFDs, raw strips (Compression 32770/32772/32773 Samsung) | max of strips |
+| SRW (Samsung NX) | Make "SAMSUNG" | IFD0 + SubIFDs, raw strips (Compression 32769 Packed RAW, 32770 Samsung SRW Compressed, 32772 Samsung SRW Compressed 2 (NX3000/NXmini); **32773 is PackBits**, not Samsung; ExifTool `Exif.pm`) | max of strips |
 | 3FR/FFF (Hasselblad), MEF (Mamiya), MOS (Leaf), IIQ (Phase One), DCR/KDC (Kodak), SR2 | by Make | generic walker | max |
 
 Naming: use the Make/Model from IFD0 plus DateTimeOriginal from the ExifIFD (same tags as
@@ -820,16 +841,21 @@ All multi-byte fields big-endian.
 | 16 | 4 | format version ASCII, `"0201"` |
 | 20 | 8 | camera number ID (ASCII digits) |
 | 28 | 32 | camera model string, NUL padded (e.g. `"X-T3"`) |
-| 60 | 4 | directory version ASCII (`"0100"`, `"0130"`, `"0159"`...) |
-| 64 | 20 | unknown |
+| 60 | 4 | directory version ASCII (`"0100"`, `"0130"`, `"0159"`...; ExifTool labels this field `FirmwareVersion`) |
+| 64 | u32be | 1 for M-RAW (multi-shot) files, 0 otherwise (ExifTool `FujiFilm.pm` comments) |
+| 68 | u32be | high word of M-RAW offset (only seen zero) |
+| 72 | u32be | M-RAW header offset (0 when not M-RAW) |
+| 76 | u32be | M-RAW header length |
+| 80 | u32be | unknown (only seen zero) |
 | 84 | u32be | JPEG offset (embedded full Exif JPEG with preview) |
 | 88 | u32be | JPEG length |
 | 92 | u32be | CFA header offset ("metadata container") |
 | 96 | u32be | CFA header length |
 | 100 | u32be | CFA offset (raw data; a TIFF container `49 49 2A 00` on X-series, bare on old bodies) |
 | 104 | u32be | CFA length |
-| 108 | 12 | unknown (ExifTool: u32 at 108 = RAFCompression on newer dir versions) UNVERIFIED |
-| 120 | u32be | second CFA/offset record on newer directory versions (dir version >= "0159"?) UNVERIFIED |
+| 108 | u32be | RAFCompression: 0 = uncompressed, 2 = lossless, 3 = lossy (ExifTool `FujiFilm.pm` `RAFHeader` 0x6c, valid only when the first 3 bytes are zero; on some old RAF versions the embedded JPEG itself starts at 108, i.e. `jpeg_off == 108`, so always test `jpeg_off` first) |
+| 112 | 8 | unknown (libopenraw: "12 unknown bytes" from 108) |
+| 120 | u32be | unknown offset (libopenraw: "unknown offset, purpose unclear"); not needed for extent. UNVERIFIED whether it is a second CFA record |
 
 CFA header record format at CFA header offset: `u32be count`, then `count` records of
 `u16be tag, u16be size, data[size]`. Tags: 0x0100 RawImageFullSize (u16 h, u16 w), 0x0110
@@ -908,15 +934,16 @@ CR3 specifics (lclevy/canon_cr3 reverse engineering):
 | Box | Content |
 |---|---|
 | `ftyp` | as above |
-| `moov` | contains `uuid 85c0b687-820f-11e0-8111-f4ce462b6a48` (Canon metadata): `CNCV` (version string "CanonCR3_001/01.09.00/01.00.00"), `CCTP`, `CTBO` (offset table: u32be count, records {u32 index, u64 offset, u64 size}; index 1 = XMP uuid box, 2 = PRVW uuid box, 3 = mdat, 4 = ... ), `CMT1` (IFD0 TIFF), `CMT2` (Exif IFD TIFF), `CMT3` (MakerNote TIFF), `CMT4` (GPS TIFF), `THMB` (u8 version, 3 bytes, u16 width, u16 height, u32 jpeg_size, u16, u16, then JPEG 160x120); then `mvhd`, `trak` x 3-5 (track 1 full-size JPEG, 2 SD crx, 3 HD crx, 4 metadata, 5 dual-pixel) with `stsd` sample entries of type `CRAW` (43 52 41 57) and `stco/co64` chunk offsets into mdat |
+| `moov` | contains `uuid 85c0b687-820f-11e0-8111-f4ce462b6a48` (Canon metadata): `CNCV` (30-byte version string, e.g. "CanonCR3_001/00.09.00/00.00.00" EOS R/RP/M50, "CanonCR3_001/01.09.00/01.00.00" raw-burst rolls, "CanonCR3_002/..." and "CanonCR3_003/..." for HDR-preview variants, "CanonCRM0001/..." for CRM movies, "CanonHEIF001/..." for Canon HEIF - match the prefix `Canon` only), `CCTP`, `CTBO` (offset table: u32be count (4 or 5), records of 20 bytes {u32 index (1-based), u64 offset, u64 size}; index 1 = XMP uuid box, 2 = PRVW uuid box, 3 = mdat, 4 = zero offset/size, 5 (newer bodies) = `uuid 5766b829-bb6a-47c5-bcfb-8b9f2260d06d` containing `CMTA`), `CMT1` (IFD0 TIFF), `CMT2` (Exif IFD TIFF), `CMT3` (MakerNote TIFF), `CMT4` (GPS TIFF), `THMB` (after the 8-byte box header: u8 version (0 or 1), 3 flag bytes, u16 width (160), u16 height (120), u32 jpeg_size, u16 (=1), u16 (=0), then JPEG at box+24, padded to 4); then `mvhd`, `trak` x 3-5 (track 1 full-size JPEG, 2 SD crx, 3 HD crx, 4 metadata (CTMD), 5 dual-pixel) with `stsd` sample entries of type `CRAW` (43 52 41 57) and `stco/co64` chunk offsets into mdat |
 | `uuid be7acfcb-97a9-42e8-9c71-999491e3afac` | XMP packet |
-| `uuid eaf42b5e-1c98-4b88-b9fb-b7dc406e4d16` | `PRVW` box: u32 size, `PRVW`, 6 bytes, u16 width, u16 height (1620x1080), 2 bytes, u32 jpeg_size, JPEG |
+| `uuid eaf42b5e-1c98-4b88-b9fb-b7dc406e4d16` | `PRVW` box: u32 size, `PRVW`, u32 (0), u16 (1), u16 width, u16 height (1620x1080), u16 (1), u32 jpeg_size at +20, JPEG at +24, padded to 4 |
 | `mdat` | track payloads in order: JPEG (full size), SD crx, HD crx, CTMD records, dual-pixel |
 
 Note the task brief says `CRAW` is an ftyp compatible brand; it is not - `CRAW` is the
 `stsd` sample-entry type inside each `trak`. CR3 detection = major brand `crx `.
-Extent = end of `mdat` = `CTBO[3].offset + CTBO[3].size` = box walk end; use both, they must
-agree. The embedded full-size JPEG (track 1, first `stco` entry) is extractable as a plain
+Extent = `max(offset + size)` over all CTBO records with non-zero size (on bodies that write
+CTBO record 5 the `CMTA` uuid box follows `mdat`, so `CTBO[3]` alone under-reads) and this
+must equal the box-walk end; use both, they must agree. The embedded full-size JPEG (track 1, first `stco` entry) is extractable as a plain
 JPEG even when the crx data is damaged.
 
 Carving parameters: magic `66 74 79 70` at offset 4 with size at 0 in 16..=256; min size ~1 KB;
@@ -1001,8 +1028,9 @@ children `<name>.preview.jpg` by the parent's parser, not by the outer loop). If
 validated only at L1 or is Partial, the inner JPEG **is** carved separately (it may be the only
 recoverable thing).
 
-Bad-sector awareness: `find_end` receives the mapfile; if the extent crosses a `-` (bad) or
-`*`/`/` (untried/non-trimmed) region, the result is at best `Partial{reason: BadSectors(ranges)}`
+Bad-sector awareness: `find_end` receives the mapfile; if the extent crosses a `-` (bad
+sector), `?` (non-tried), `*` (non-trimmed) or `/` (non-scraped) region (ddrescue manual,
+"Mapfile structure"; only `+` is finished), the result is at best `Partial{reason: BadSectors(ranges)}`
 and the repair module gets the list of zero-filled ranges inside the file (this is far more
 useful than guessing: a 4 KiB zero hole inside scan data is precisely located).
 
@@ -1126,7 +1154,16 @@ header-transplanted in the report).
 **Missing DHT (Motion-JPEG convention):** AVI/MOV MJPEG frames, some webcams and some
 security cameras omit DHT; decoders assume the Annex K tables (OpenDML AVI spec). If SOS
 references table 0/1 and no DHT was seen, insert the 420-byte segment from 2.1.11 before SOS.
-jpeg-decoder does this only when told the stream is MJPEG; zune-jpeg: UNVERIFIED.
+Both Rust decoders apply the Annex K tables automatically **only** when the file carries an
+APP0 segment whose payload starts with `AVI1\0` (the OpenDML marker): jpeg-decoder sets
+`is_mjpeg` on `AppData::Avi1` and calls `fill_default_mjpeg_tables` (`decoder.rs`); zune-jpeg
+0.5.15 sets `is_mjpeg` on `AVI1\0` and fills the tables (`decoder.rs`, `huffman.rs`
+`fill_mjpeg_tables`). Neither exposes an API to force it. Verified on fixtures
+(2026-10-12): a DHT-stripped JFIF file fails in jpeg-decoder with "scan makes use of unset
+dc huffman table" and in zune-jpeg with `HuffmanDecode("No DC table for component Y")`
+(strict and non-strict alike); the same bytes with the APP0 rewritten to `AVI1\0` decode in
+both. So the repair must either insert the DHT segment (preferred, viewer-portable) or
+rewrite/insert an `AVI1` APP0 before handing the file to a crate.
 
 **Bad segment length:** when `walk_headers` fails at segment `S` (length points to a byte that
 is not FF, or past EOF), scan forward from `S+4` for the next `FF xx` with `xx` a valid
@@ -1315,11 +1352,16 @@ img.save(f"{OUT}/strips.tif", "TIFF", compression=None)          # StripOffsets/
 img.save(f"{OUT}/strips_lzw.tif", "TIFF", compression="tiff_lzw")
 ```
 
-Restart intervals: Pillow has no DRI option; use ffmpeg: `ffmpeg -i baseline.jpg -c:v mjpeg
--q:v 3 -restart_interval 4 rst.jpg`? ffmpeg's mjpeg encoder has no restart-interval option
-(UNVERIFIED); instead write DRI fixtures with a tiny Python baseline encoder (our own
-re-emitter from 3.4 can produce them: decode `baseline.jpg` symbols, re-encode with `Ri = 8`
-and RST markers - this doubles as a round-trip test of the encoder).
+Restart intervals: Pillow >= 10.2.0 exposes libjpeg's restart markers directly:
+`img.save("rst.jpg", "JPEG", quality=90, restart_marker_blocks=8)` (DRI every 8 MCUs) or
+`restart_marker_rows=1` (one interval per MCU row) - Pillow handbook, "JPEG saving options"
+(https://pillow.readthedocs.io/en/stable/handbook/image-file-formats.html#jpeg-saving);
+verified with Pillow 12.1.1 that the output contains `FF DD` and `FF D0..D7`. ffmpeg's mjpeg
+encoder has **no** restart-interval option (`ffmpeg -h encoder=mjpeg` on 8.0 lists only
+`huffman`, `force_duplicated_matrix` and the generic mpegvideo flags; same in the codecs
+manual), so do not use it for DRI fixtures. Our own re-emitter from 3.4 should additionally
+regenerate `rst.jpg` from `baseline.jpg` symbols with `Ri = 8` as a round-trip test of the
+encoder (output must be byte-identical to Pillow's apart from APPn/COM segments).
 
 Motion-JPEG without DHT: `ffmpeg -y -i baseline.jpg -c:v mjpeg -q:v 4 -frames:v 1 mjpeg.avi`
 then extract the frame bytes from the AVI (`00dc` chunk) and strip the DHT segment with
@@ -1369,8 +1411,13 @@ Python (ffmpeg writes DHT; the stripped copy models the OpenDML convention).
   and iloc tests). AVIF variant: brand `avif`, item type `av01`, payload random bytes.
   CR3 variant: `ftyp(crx , 1, crx isom)` + `moov` containing `uuid 85c0b687...` with `CNCV`,
   `CTBO` (3 records) and `CMT1` (TIFF from the Exif builder) + `uuid eaf42b5e...` with `PRVW`
-  + JPEG + `mdat` with the full JPEG first. Real HEIC muxing by ffmpeg (`-f heif`) is
-  available only in ffmpeg >= 7.1 UNVERIFIED and is not relied on.
+  + JPEG + `mdat` with the full JPEG first. ffmpeg has **no HEIF muxer** at all as of
+  8.0/9.0 (`ffmpeg -muxers` lists `avif` but no `heif`; the Changelog records only
+  "Support for HEIF/AVIF still images and tiled still images" = *demuxing* in 7.0 and
+  "ffmpeg CLI tiled HEIF support" in 8.1), so real HEIC fixtures must be hand-built as above
+  or taken from a real device. AVIF fixtures can be produced with ffmpeg's `avif` muxer
+  (`ffmpeg -i x.png -c:v libaom-av1 -still-picture 1 x.avif`, muxer documented in
+  ffmpeg-formats "avif").
 - `bmp_bad_size()`: Pillow BMP with bfSize patched to 0 and a top-down (negative height)
   variant.
 - `webp_vp8x()`: Pillow WebP with `exif=` and an ICC profile -> VP8X path.
@@ -1437,18 +1484,18 @@ Versions from crates.io on 2026-10-12 unless tagged.
 
 | Crate | Version | Pure Rust | Use | Behaviour on truncated / corrupt input |
 |---|---|---|---|---|
-| `zune-jpeg` | 0.5.15 | yes | L3 JPEG decode; also DHT-less MJPEG? UNVERIFIED | Non-strict (default): on scan EOF returns `Ok(partial buffer)`, remaining pixels filled with grey (128), `decoded_output_bytes()` reports stable bytes; strict (`ZuneJpegOptions::set_strict(true)`): `Err(DecodeErrors::ExhaustedData)`. Premature EOI in headers -> `Err(FormatStatic("Premature End of image"))`. Use strict for grading, non-strict for "show what we have". |
-| `jpeg-decoder` | 0.3.2 | yes | reference second opinion; `is_mjpeg` path fills default Huffman tables | `decode()` returns `Err` on any EOF or format error; **never** a partial image. Missing DHT (non-MJPEG) -> `Err("scan makes use of unset dc huffman table")`. |
-| `image` | 0.25.10 | yes | one-stop decode for PNG/GIF/BMP/WebP/TIFF (JPEG goes through zune-jpeg) | JPEG: inherits zune-jpeg; which mode `image` configures is UNVERIFIED. PNG/others: `Err` on truncation (no partial) UNVERIFIED. |
-| `png` | 0.18.1 | yes | PNG decode and the repair writer (`Encoder`) | `Reader::next_row`/`next_frame` return `Err(DecodingError::IoError(UnexpectedEof))` or `Format` at the truncation; rows already returned by `next_row` stay valid (streaming), so the repair module uses `next_row` to collect complete rows. `DecodeOptions`: `set_ignore_crc(true)` (default false), `set_ignore_adler32` (default true), `set_skip_ancillary_crc_failures` (default true), `set_ignore_text_chunk`, `set_ignore_iccp_chunk`. |
+| `zune-jpeg` | 0.5.15 | yes | L3 JPEG decode; DHT-less MJPEG only when APP0 is `AVI1\0` (3.6) | Verified on a 60 %-truncated baseline fixture (2026-10-12): non-strict (default) `decode()` returns `Ok(full-size buffer)` with the missing region filled with 128 (grey); strict (`zune_core::options::DecoderOptions::default().set_strict_mode(true)` passed to `JpegDecoder::new_with_options(ZCursor::new(buf), opts)`) returns `Err(DecodeErrors::ExhaustedData)`. **`decoded_output_bytes()` / `decoded_scanlines()` do not exist in 0.5.15** (they are on the `dev` branch / 0.5.16-rc); to know how many rows are valid use our own L2 validator, or wait for 0.5.16. EOI marker while parsing headers -> `Err(FormatStatic("Premature End of image"))` (`decoder.rs`). Use strict for grading, non-strict for "show what we have". |
+| `jpeg-decoder` | 0.3.2 | yes | reference second opinion; fills Annex K tables automatically when APP0 `AVI1` is present (no API to force it) | Verified: `decode()` on the truncated fixture -> `Err("failed to fill whole buffer")`; **never** a partial image. Missing DHT without `AVI1` -> `Err("scan makes use of unset dc huffman table")`; with `AVI1` APP0 -> decodes. |
+| `image` | 0.25.10 | yes | one-stop decode for PNG/GIF/BMP/WebP/TIFF (JPEG goes through zune-jpeg) | JPEG: `JpegDecoder::new` builds zune options with `set_strict_mode(matches!(spec, SpecCompliance::Strict))` and the default `SpecCompliance` is lenient (`codecs/jpeg/decoder.rs`), so `image::load_from_memory` on a truncated JPEG returns `Ok` with grey fill (verified). Verified on truncated fixtures: PNG -> `Err(unexpected end of file)`, WebP -> `Err(Corrupt bitstream)`, TIFF -> `Err(failed to fill whole buffer)`, **GIF -> `Ok` (first frame only is decoded by `load_from_memory`, so a GIF truncated in frame 2 passes)**. No partial output for PNG/WebP/TIFF; use the per-format crates below for that. |
+| `png` | 0.18.1 | yes | PNG decode and the repair writer (`Encoder`) | Verified: on a 60 %-truncated 256x192 RGB PNG `Reader::next_row` returned 124 complete rows then `Err(DecodingError::IoError(UnexpectedEof))`; rows already returned stay valid (streaming), so the repair module uses `next_row` to collect complete rows. `DecodeOptions` (docs.rs 0.18): `set_ignore_crc` (default false), `set_ignore_adler32` (default true), `set_skip_ancillary_crc_failures` (default true), `set_ignore_text_chunk` (default false), `set_ignore_iccp_chunk` (default false), `set_ignore_checksums`. |
 | `miniz_oxide` | 0.9.1 | yes | streaming inflate for PNG/PSD with exact `bytes_out` at failure (`inflate::stream::inflate` with `MZFlush::None`, returns `TINFLStatus::FailedCannotMakeProgress`/`NeedsMoreInput` and the counts) | returns status + consumed/produced counts; partial output retained. |
 | `flate2` | 1.1.10 | yes (default backend = miniz_oxide) | convenience inflate | `read` returns bytes up to the error; then `Err(UnexpectedEof)`/`InvalidData`. |
 | `crc32fast` | 1.5.2 | yes | PNG chunk CRC (same polynomial as zlib) | n/a |
 | `kamadak-exif` | 0.6.1 | yes | Exif from JPEG/TIFF/HEIF/PNG/WebP containers for naming | default: stops at first error -> `Err(Error::InvalidFormat)` on truncation; `Reader::continue_on_error(true)` -> `Err(Error::PartialResult)` from which `distill_partial_result()` yields the fields parsed so far + error list. Use continue-on-error. |
-| `tiff` | 0.11.3 | yes | TIFF/DNG strip & tile decode for L3 on plain TIFF; also exposes IFD walking | `read_chunk(i)` per strip/tile: strips before the truncation decode, the truncated one errors (`TiffError::IoError(UnexpectedEof)`) UNVERIFIED; `read_image()` errors as a whole. RAW compressions (34713, 32767, 65535) unsupported -> `UnsupportedError`. |
-| `image-webp` | 0.2.4 | yes | WebP L3 | `Err` on truncation UNVERIFIED |
-| `gif` | 0.14.2 | yes | GIF L2/L3 (`Decoder::read_next_frame`) | frames before the truncation are returned; the truncated one errors UNVERIFIED |
-| `zune-png` | 0.5.2 | yes | faster PNG alternative | lenient like zune-jpeg UNVERIFIED |
+| `tiff` | 0.11.3 | yes | TIFF/DNG strip & tile decode for L3 on plain TIFF; also exposes IFD walking | Verified: `Decoder::new` + `dimensions()` + `strip_count()` succeed on a truncated file (IFD intact); `read_chunk(i)` on the truncated strip -> `Err(TiffError::IoError(UnexpectedEof, "failed to fill whole buffer"))`; `read_image()` errors as a whole. `read_chunk` seeks per strip, so strips that lie entirely before the truncation decode (single-strip fixture only tested the error path). RAW compressions (34713, 32767, 65535) unsupported -> `UnsupportedError`. |
+| `image-webp` | 0.2.4 | yes | WebP L3 | Verified: `WebPDecoder::new` parses the (RIFF-size-inconsistent) header fine; `read_image` on the truncated lossy fixture -> `Err(DecodingError::BitStreamError)`; no partial output. |
+| `gif` | 0.14.2 | yes | GIF L2/L3 (`Decoder::read_next_frame`) | Verified: 3-frame fixture truncated at 60 % -> `read_next_frame` returns frame 1 `Ok`, then `Err(DecodingError::Io(UnexpectedEof))`; frames before the truncation are returned. |
+| `zune-png` | 0.5.2 | yes | faster PNG alternative | **Not lenient**: verified `decode_raw()` on the truncated fixture -> `Err("I/O error Not enough bytes, expected 4 but found 0")` in both default and `set_strict_mode(true)`; no partial rows. Use the `png` crate for row salvage. |
 | `rawloader` | 0.37.2 | yes | optional L3 for CR2/NEF/ARW/DNG/PEF/ORF/RW2/RAF/ERF/SRW raw decode (validation that the raw strip decodes) | `Err` on bad data; heavy; feature-gated `raw-verify` |
 | `memchr` | 2.8.3 | yes | fast `FF` scanning in entropy data | n/a |
 | `libheif-rs` | 3.0.0 | **no** (links libheif) | not used by default; optional feature `heif-verify` for L3 HEIC | n/a |
@@ -1477,8 +1524,14 @@ and a size cap, since carved input is adversarial by nature.
 - libopenraw format notes: RAF https://libopenraw.freedesktop.org/formats/raf/ , ORF https://libopenraw.freedesktop.org/formats/orf/ , RW2 https://libopenraw.freedesktop.org/formats/rw2/ , CR3 https://libopenraw.freedesktop.org/formats/cr3/
 - ExifTool tag tables: PanasonicRaw https://exiftool.org/TagNames/PanasonicRaw.html , FujiFilm https://exiftool.org/TagNames/FujiFilm.html , Olympus https://exiftool.org/TagNames/Olympus.html , Pentax https://exiftool.org/TagNames/Pentax.html , Sony https://exiftool.org/TagNames/Sony.html , Nikon https://exiftool.org/TagNames/Nikon.html , Canon https://exiftool.org/TagNames/Canon.html
 - RW2 header bytes (`49 49 55 00 18 00 00 00`): https://pronom.nationalarchives.gov.uk/fmt/662
-- Canon CR3 reverse engineering (lclevy): https://github.com/lclevy/canon_cr3
+- Canon CR3 reverse engineering (lclevy): https://github.com/lclevy/canon_cr3 (readme.md: CNCV strings, CTBO/THMB/PRVW layouts); Canon CR2 header and IFD3 (lclevy): http://lclevy.free.fr/cr2/
 - ISO/IEC 14496-12 (ISO BMFF: box, ftyp, meta, iloc) and ISO/IEC 23008-12 (HEIF) - public draft text of 14496-12 is at https://mpeg.chiariglione.org/standards/mpeg-4/iso-base-media-file-format ; Library of Congress HEIF description https://www.loc.gov/preservation/digital/formats/fdd/fdd000525.shtml
 - AVIF specification: https://aomediacodec.github.io/av1-avif/
 - OpenDML AVI / Motion-JPEG DHT convention: https://learn.microsoft.com/en-us/windows/win32/directshow/mjpeg-decoder (and OpenDML AVI File Format Extensions, section "JPEG DHT")
-- Crates (versions from crates.io API, 2026-10-12): https://docs.rs/zune-jpeg , https://github.com/etemesi254/zune-image/tree/dev/crates/zune-jpeg (decoder.rs / mcu.rs for strict vs lenient EOF behaviour), https://github.com/image-rs/jpeg-decoder (decoder.rs), https://docs.rs/png/latest/png/struct.DecodeOptions.html , https://docs.rs/kamadak-exif/latest/exif/enum.Error.html , https://docs.rs/tiff/latest/tiff/decoder/struct.Decoder.html , https://docs.rs/image , https://docs.rs/miniz_oxide , https://docs.rs/flate2
+- Crates (versions re-checked against the crates.io API on 2026-10-12, all `max_stable_version` values in section 6 confirmed): https://docs.rs/zune-jpeg , https://github.com/etemesi254/zune-image/tree/dev/crates/zune-jpeg (decoder.rs / mcu.rs for strict vs lenient EOF behaviour and the `AVI1` MJPEG path), https://github.com/image-rs/jpeg-decoder (decoder.rs, huffman.rs `fill_default_mjpeg_tables`), https://github.com/image-rs/image/blob/main/src/codecs/jpeg/decoder.rs (`SpecCompliance` -> `set_strict_mode`), https://docs.rs/png/latest/png/struct.DecodeOptions.html , https://docs.rs/kamadak-exif/latest/exif/struct.Reader.html (`continue_on_error`, `Error::PartialResult`, `distill_partial_result`), https://docs.rs/tiff/latest/tiff/decoder/struct.Decoder.html (`read_chunk`, `strip_count`, `tile_count`), https://docs.rs/image , https://docs.rs/miniz_oxide , https://docs.rs/flate2 . The "verified" truncation behaviours in section 6 come from a throwaway cargo project (zune-jpeg 0.5.15, jpeg-decoder 0.3.2, image 0.25.10, png 0.18.1, zune-png 0.5.2, tiff 0.11.3, image-webp 0.2.4, gif 0.14.2) run on Pillow 12.1.1 fixtures truncated to 60 %.
+- ExifTool module sources used for RAW/MakerNote/trailer facts: https://raw.githubusercontent.com/exiftool/exiftool/master/lib/Image/ExifTool/{MakerNotes,Nikon,Olympus,Pentax,Sony,Samsung,PanasonicRaw,FujiFilm,Exif,MPF}.pm
+- dcraw `panasonic_load_raw` / `pana_bits` (RW2 size estimate): https://raw.githubusercontent.com/ncruces/dcraw/master/dcraw.c
+- Garfinkel 2007 fragmentation statistics (Digital Investigation 4S, S2-S12, Tables 1 and 3): https://simson.net/clips/academic/2007.DFRWS.pdf , https://doi.org/10.1016/j.diin.2007.06.017
+- Pillow JPEG save options (`restart_marker_blocks` / `restart_marker_rows`, added 10.2.0): https://pillow.readthedocs.io/en/stable/handbook/image-file-formats.html#jpeg-saving
+- ffmpeg encoder/muxer docs and Changelog (no mjpeg DRI option; no HEIF muxer): https://ffmpeg.org/ffmpeg-codecs.html#mjpeg , https://ffmpeg.org/ffmpeg-formats.html#avif , https://raw.githubusercontent.com/FFmpeg/FFmpeg/master/Changelog
+- ddrescue manual, mapfile status characters: https://www.gnu.org/software/ddrescue/manual/ddrescue_manual.html#Mapfile-structure
