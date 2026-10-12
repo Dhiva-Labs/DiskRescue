@@ -398,6 +398,41 @@ fn tiff_jpeg_strips_on_the_grid_are_the_files_own() {
 }
 
 #[test]
+fn tiff_jpeg_strips_missing_their_soi_only_count_once_the_group_is_jpeg() {
+    let mut t = image_tags(7);
+    t.push((0x0111, 4, 3, 400));
+    t.push((0x0117, 4, 3, 420));
+    let table = vec![
+        (400, longs(&[1024, 2048, 3072])),
+        (420, longs(&[1024, 1024, 1024])),
+    ];
+    // The middle strip lost its SOI but the last one is intact: the
+    // structure goes on past it, so it is noted, not cut.
+    let mut blobs = table.clone();
+    blobs.push((1024, fake_jpeg(16, 16, 1024, &mut Rng(1))));
+    blobs.push((3072, fake_jpeg(16, 16, 1024, &mut Rng(3))));
+    let m = measure(&TiffFormat, &le_tiff(&t, &blobs, 4096));
+    assert_eq!((m.status, m.len), (ExtentStatus::Complete, 4096));
+    assert_eq!(m.confidence, Confidence::new(70));
+    assert!(
+        m.notes
+            .iter()
+            .any(|n| n.contains("no JPEG data (FF D8) at 1 offset(s)")),
+        "{:?}",
+        m.notes
+    );
+    // The last strips are gone: the file ends at the first of them.
+    let mut blobs = table.clone();
+    blobs.push((1024, fake_jpeg(16, 16, 1024, &mut Rng(1))));
+    let m = measure(&TiffFormat, &le_tiff(&t, &blobs, 4096));
+    assert_eq!((m.status, m.len), (ExtentStatus::Truncated, 2048));
+    // A group whose first strip is not a JPEG stream says nothing.
+    let m = measure(&TiffFormat, &le_tiff(&t, &table, 4096));
+    assert_eq!((m.status, m.len), (ExtentStatus::Complete, 4096));
+    assert_eq!(m.confidence, Confidence::new(80));
+}
+
+#[test]
 fn tiff_strip_holding_an_unreferenced_file_start_is_cut_there() {
     let mut t = image_tags(1);
     t.push((0x0111, 4, 1, 1024));

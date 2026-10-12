@@ -394,24 +394,26 @@ fn verify_extent(win: &Win, refs: &Refs, ins: &mut Inspected) {
             None => {}
         }
     }
-    let mut cut: Option<(u64, String)> = None;
-    for &(off, tag) in &missing {
-        if off >= verified_end {
-            if cut.as_ref().is_none_or(|c| off < c.0) {
-                cut = Some((
-                    off,
-                    format!(
-                        "no JPEG data (FF D8) at offset {off}, where tag {tag:#06x} points: the file is cut short or overwritten from there on"
-                    ),
-                ));
-            }
-        } else {
-            m.confidence = m.confidence.lowered(5);
-            m.notes.push(format!(
-                "no JPEG data (FF D8) at offset {off}, where tag {tag:#06x} points"
-            ));
-        }
+    // `missing` is in offset order: the first one past the verified
+    // structure ends the file; the ones before it cost a little confidence,
+    // once.
+    let split = missing.partition_point(|j| j.0 < verified_end);
+    let (inside, past) = missing.split_at(split);
+    if let Some(&(off, tag)) = inside.first() {
+        m.confidence = m.confidence.lowered(10);
+        m.notes.push(format!(
+            "no JPEG data (FF D8) at {} offset(s) the IFDs point at, the first at {off} (tag {tag:#06x})",
+            inside.len()
+        ));
     }
+    let mut cut: Option<(u64, String)> = past.first().map(|&(off, tag)| {
+        (
+            off,
+            format!(
+                "no JPEG data (FF D8) at offset {off}, where tag {tag:#06x} points: the file is cut short or overwritten from there on"
+            ),
+        )
+    });
     let allowed = |off: u64, sig: Sig| match sig {
         Sig::Jpeg => refs.is_pointed(off) || refs.is_exempt(off),
         Sig::Tiff => refs.is_exempt(off),
