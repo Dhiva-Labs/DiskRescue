@@ -68,12 +68,23 @@ pub fn check(source: &Path, info: &DeviceInfo, output: &Path, allow_mounted: boo
                 .iter()
                 .map(|m| m.display().to_string())
                 .collect();
-            let msg = format!(
-                "{} is mounted at {}. Unmount it first so nothing writes to it while recovering \
-                 (or pass --allow-mounted to continue anyway).",
-                info.path.display(),
-                mps.join(", ")
-            );
+            let msg = if cfg!(windows) {
+                format!(
+                    "{} is in use by Windows as {}. Take it out of use first so Windows does not write \
+                     to it while recovering: in Disk Management, right-click the disk and choose Offline \
+                     (for a USB stick or card, right-click its volume, choose Change Drive Letter and \
+                     Paths and remove the letter). Or pass --allow-mounted to continue anyway.",
+                    info.path.display(),
+                    mps.join(", ")
+                )
+            } else {
+                format!(
+                    "{} is mounted at {}. Unmount it first so nothing writes to it while recovering \
+                     (or pass --allow-mounted to continue anyway).",
+                    info.path.display(),
+                    mps.join(", ")
+                )
+            };
             if allow_mounted {
                 r.warnings.push(msg);
             } else {

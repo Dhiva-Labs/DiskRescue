@@ -303,15 +303,25 @@ pub(crate) fn mounted_warning(path: &Path, info: &DeviceInfo) -> String {
         .iter()
         .map(|m| m.display().to_string())
         .collect();
-    format!(
-        "{} is mounted{}. Results may be incomplete while it is in use; unmount it for the best results.",
-        path.display(),
-        if mps.is_empty() {
-            String::new()
-        } else {
-            format!(" at {}", mps.join(", "))
-        }
-    )
+    let at = if mps.is_empty() {
+        String::new()
+    } else if cfg!(windows) {
+        format!(" as {}", mps.join(", "))
+    } else {
+        format!(" at {}", mps.join(", "))
+    };
+    if cfg!(windows) {
+        format!(
+            "{} is in use by Windows{at}. Results may be incomplete while it is in use; take it out of \
+             use in Disk Management for the best results.",
+            path.display()
+        )
+    } else {
+        format!(
+            "{} is mounted{at}. Results may be incomplete while it is in use; unmount it for the best results.",
+            path.display()
+        )
+    }
 }
 
 pub(crate) fn missing_map_message(map_path: &Path) -> String {
