@@ -10,6 +10,9 @@ use diskrescue_tui::screens::help::ScreenId;
 use diskrescue_tui::testing::*;
 use diskrescue_tui::{App, Event};
 
+/// Completion and the browser end folder names with the platform's separator.
+const SEP: char = std::path::MAIN_SEPARATOR;
+
 fn contains_all(screen: &str, needles: &[&str]) {
     let flat = common::flatten(screen);
     for n in needles {
@@ -49,27 +52,35 @@ fn tab_completes_the_folder_being_typed_and_lists_the_matches() {
     std::fs::create_dir_all(home.path().join("other")).unwrap();
     let mut app = rescue_form(home.path());
     let base = home.path().display().to_string();
-    common::replace_text(&mut app, &format!("{base}/ot"));
+    common::replace_text(&mut app, &format!("{base}{SEP}ot"));
     press(&mut app, KeyCode::Tab);
-    contains_all(&render(&app, 100, 30), &[&format!("{base}/other/")]);
+    contains_all(&render(&app, 100, 30), &[&format!("{base}{SEP}other{SEP}")]);
     // Two folders start alike: the common part is added and both are shown.
-    common::replace_text(&mut app, &format!("{base}/d"));
+    common::replace_text(&mut app, &format!("{base}{SEP}d"));
     press(&mut app, KeyCode::Tab);
     let s = render(&app, 100, 30);
     contains_all(
         &s,
-        &[&format!("{base}/dis"), "Matches:", "disks/", "discs/"],
+        &[
+            &format!("{base}{SEP}dis"),
+            "Matches:",
+            &format!("disks{SEP}"),
+            &format!("discs{SEP}"),
+        ],
     );
     // One more letter, and Tab finishes the name.
     type_text(&mut app, "k");
     press(&mut app, KeyCode::Tab);
-    contains_all(&render(&app, 100, 30), &[&format!("{base}/disks/")]);
+    contains_all(&render(&app, 100, 30), &[&format!("{base}{SEP}disks{SEP}")]);
     // The image file name follows the folder.
-    contains_all(&render(&app, 100, 30), &["disks/fixture-sdb.img"]);
+    contains_all(
+        &render(&app, 100, 30),
+        &[&format!("disks{SEP}fixture-sdb.img")],
+    );
     // And "~" means the home folder.
     common::replace_text(&mut app, "~/ot");
     press(&mut app, KeyCode::Tab);
-    contains_all(&render(&app, 100, 30), &["~/other/"]);
+    contains_all(&render(&app, 100, 30), &[&format!("~/other{SEP}")]);
 }
 
 #[test]
@@ -87,14 +98,14 @@ fn the_folder_browser_fills_in_the_field() {
             "Choose the folder for the results",
             "Use this folder:",
             "../  (up one folder)",
-            "disks/",
+            &format!("disks{SEP}"),
         ],
     );
     // Into "disks", then "big", and choose it.
     press(&mut app, KeyCode::Down);
     press(&mut app, KeyCode::Down);
     press(&mut app, KeyCode::Enter);
-    contains_all(&render(&app, 100, 30), &["big/"]);
+    contains_all(&render(&app, 100, 30), &[&format!("big{SEP}")]);
     press(&mut app, KeyCode::Down);
     press(&mut app, KeyCode::Down);
     press(&mut app, KeyCode::Right);
@@ -102,10 +113,10 @@ fn the_folder_browser_fills_in_the_field() {
     assert_eq!(app.screen_id(), ScreenId::Form);
     let big = home.path().join("disks/big").display().to_string();
     let s = render(&app, 100, 30);
-    contains_all(&s, &["disks/big", "fixture-sdb.img"]);
+    contains_all(&s, &[&format!("disks{SEP}big"), "fixture-sdb.img"]);
     app.handle_event(ctrl('s'));
     common::wait_for_check(&mut app);
-    contains_all(&render(&app, 100, 30), &["disks/big"]);
+    contains_all(&render(&app, 100, 30), &[&format!("disks{SEP}big")]);
     let _ = big;
     // Cancelling the browser changes nothing.
     press(&mut app, KeyCode::Esc);
@@ -131,7 +142,7 @@ fn the_image_file_can_be_moved_to_another_folder_with_the_browser() {
     press(&mut app, KeyCode::Enter);
     press(&mut app, KeyCode::Enter);
     let s = render(&app, 100, 30);
-    contains_all(&s, &["elsewhere/fixture-sdb.img"]);
+    contains_all(&s, &[&format!("elsewhere{SEP}fixture-sdb.img")]);
 }
 
 #[cfg(unix)]

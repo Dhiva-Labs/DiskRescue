@@ -1417,7 +1417,10 @@ mod tests {
         f.set_text(FieldId::Output, "/mnt/big/rescue");
         assert_eq!(
             f.text(FieldId::Image).unwrap(),
-            "/mnt/big/rescue/fixture-sdb.img"
+            Path::new("/mnt/big/rescue")
+                .join("fixture-sdb.img")
+                .display()
+                .to_string()
         );
         f.set_text(FieldId::Image, "/mnt/other/card.img");
         f.set_text(FieldId::Output, "/mnt/elsewhere");

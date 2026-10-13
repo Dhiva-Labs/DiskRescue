@@ -693,19 +693,20 @@ mod tests {
 
     #[test]
     fn tab_completion_extends_to_the_common_prefix() {
+        const SEP: char = std::path::MAIN_SEPARATOR;
         let d = tree();
         let home = d.path();
         let cwd = Path::new("/");
-        let base = format!("{}/", d.path().display());
+        let base = format!("{}{SEP}", d.path().display());
         let c = complete_path(&format!("{base}Ph"), home, cwd, true);
-        assert_eq!(c.text, format!("{base}Photos/"));
-        assert_eq!(c.candidates, vec!["Photos/".to_string()]);
+        assert_eq!(c.text, format!("{base}Photos{SEP}"));
+        assert_eq!(c.candidates, vec![format!("Photos{SEP}")]);
         // Exact case wins over a different case.
         let c = complete_path(&format!("{base}ph"), home, cwd, true);
-        assert_eq!(c.text, format!("{base}photos-old/"));
+        assert_eq!(c.text, format!("{base}photos-old{SEP}"));
         // Another case is used when nothing matches exactly.
         let c = complete_path(&format!("{base}PHOTOS-"), home, cwd, true);
-        assert_eq!(c.candidates, vec!["photos-old/".to_string()]);
+        assert_eq!(c.candidates, vec![format!("photos-old{SEP}")]);
         // Several matches: extend to what they share.
         std::fs::create_dir(d.path().join("photos-new")).unwrap();
         let c = complete_path(&format!("{base}pho"), home, cwd, true);
@@ -718,7 +719,7 @@ mod tests {
         assert_eq!(c.text, format!("{base}notes.txt"));
         // Home folder.
         let c = complete_path("~/Do", home, cwd, true);
-        assert_eq!(c.text, "~/Docs/");
+        assert_eq!(c.text, format!("~/Docs{SEP}"));
         assert_eq!(
             absolute_from("~/x", home, cwd),
             home.join("x"),

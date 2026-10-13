@@ -143,7 +143,11 @@ mod tests {
         let p = Path::new("/dev/sdz");
         assert!(privilege_hint(&io::Error::from(io::ErrorKind::NotFound), p).is_none());
         let h = privilege_hint(&io::Error::from(io::ErrorKind::PermissionDenied), p).unwrap();
-        assert!(h.contains("sudo") || h.contains("root"), "{h}");
+        if cfg!(windows) {
+            assert!(h.contains("Run as administrator"), "{h}");
+        } else {
+            assert!(h.contains("sudo") || h.contains("root"), "{h}");
+        }
         #[cfg(unix)]
         {
             let h = privilege_hint(&io::Error::from_raw_os_error(libc::EPERM), p).unwrap();
