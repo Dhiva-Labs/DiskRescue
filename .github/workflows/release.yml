@@ -8,8 +8,34 @@ permissions:
   contents: write
 
 jobs:
+  windows:
+    name: Windows binaries
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install toolchain (rust-toolchain.toml)
+        run: rustup show
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-windows
+      - name: build
+        run: cargo build --release -p diskrescue -p diskrescue-tui -p diskrescue-gui
+      - name: package
+        run: |
+          $name = "diskrescue-$env:GITHUB_REF_NAME-x86_64-windows"
+          New-Item -ItemType Directory $name | Out-Null
+          Copy-Item target\release\diskrescue.exe, target\release\diskrescue-tui.exe, `
+            target\release\diskrescue-gui.exe, LICENSE, README.md, docs\USAGE.md $name
+          Compress-Archive -Path $name -DestinationPath "$name.zip"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: diskrescue-*-x86_64-windows.zip
+          if-no-files-found: error
+
   release:
     name: build binaries + .deb + GitHub release
+    needs: windows
     # The desktop app links against the system glibc: build on the oldest
     # Ubuntu the packages support.
     runs-on: ubuntu-24.04
@@ -26,6 +52,9 @@ jobs:
         run: |
           cargo build --release --target x86_64-unknown-linux-musl -p diskrescue -p diskrescue-tui
           cargo build --release -p diskrescue-gui
+      - uses: actions/download-artifact@v4
+        with:
+          name: windows
       - name: package
         run: |
           VERSION=${GITHUB_REF_NAME#v}
@@ -42,7 +71,7 @@ jobs:
             LICENSE README.md docs/USAGE.md "$NAME/"
           tar czf "$NAME.tar.gz" "$NAME"
           packaging/deb/build-deb.sh "$VERSION" "$CLI" "$TUI" "$GUI" .
-          sha256sum "$NAME.tar.gz" "diskrescue_${VERSION}_amd64.deb" > SHA256SUMS
+          sha256sum "$NAME.tar.gz" "diskrescue_${VERSION}_amd64.deb" diskrescue-*-x86_64-windows.zip > SHA256SUMS
       - name: release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -50,4 +79,4 @@ jobs:
           NOTES=".github/release-notes/${GITHUB_REF_NAME}.md"
           if [ -f "$NOTES" ]; then set -- --notes-file "$NOTES"; else set -- --generate-notes; fi
           gh release create "$GITHUB_REF_NAME" --title "DiskRescue $GITHUB_REF_NAME" "$@" \
-            diskrescue-*.tar.gz diskrescue_*_amd64.deb SHA256SUMS
+            diskrescue-*.tar.gz diskrescue-*-x86_64-windows.zip diskrescue_*_amd64.deb SHA256SUMS

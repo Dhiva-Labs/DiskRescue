@@ -1,0 +1,5 @@
+# Windows: link the C runtime statically, so the .exe files run on a PC
+# without the Visual C++ Redistributable (a rescue tool is often started on
+# someone else's machine).
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
