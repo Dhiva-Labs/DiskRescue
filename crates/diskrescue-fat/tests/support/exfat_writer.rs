@@ -4,8 +4,8 @@
 //! Linux-style deletion (bit 7 cleared on every entry of the set, bitmap
 //! bits cleared, FAT left untouched). fsck.exfat -n is the oracle.
 
+use diskrescue_fixtures::FileExt;
 use std::fs::{File, OpenOptions};
-use std::os::unix::fs::FileExt;
 use std::path::Path;
 
 /// A directory: first cluster and its clusters.

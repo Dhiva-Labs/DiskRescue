@@ -237,9 +237,16 @@ impl Drop for Mount {
     }
 }
 
+#[cfg(unix)]
 fn dev_of(p: &Path) -> u64 {
     use std::os::unix::fs::MetadataExt;
     std::fs::metadata(p).map(|m| m.dev()).unwrap_or(0)
+}
+
+/// Mounting (ntfs-3g) is Linux-only; elsewhere the mount tests skip.
+#[cfg(not(unix))]
+fn dev_of(_: &Path) -> u64 {
+    0
 }
 
 /// Deterministic pseudo-random bytes (incompressible).

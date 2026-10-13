@@ -120,11 +120,15 @@ pub fn standard_tree(root: &Path) -> BTreeMap<String, Expect> {
     ] {
         m.insert(d.to_string(), Expect::Dir);
     }
-    std::os::unix::fs::symlink("hello.txt", root.join("link")).unwrap();
-    m.insert("link".into(), Expect::Symlink("hello.txt".into()));
-    let long_target = format!("DCIM/100CANON/{}", "t".repeat(90));
-    std::os::unix::fs::symlink(&long_target, root.join("longlink")).unwrap();
-    m.insert("longlink".into(), Expect::Symlink(long_target));
+    // The tree feeds mkfs.ext4 -d, which only exists on Unix.
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink("hello.txt", root.join("link")).unwrap();
+        m.insert("link".into(), Expect::Symlink("hello.txt".into()));
+        let long_target = format!("DCIM/100CANON/{}", "t".repeat(90));
+        std::os::unix::fs::symlink(&long_target, root.join("longlink")).unwrap();
+        m.insert("longlink".into(), Expect::Symlink(long_target));
+    }
     // Sparse file: 8 islands of data in 2 MiB, so the extent tree needs an
     // index level (more than 4 extents).
     let total = 2 * 1024 * 1024usize;
