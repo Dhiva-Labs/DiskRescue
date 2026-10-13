@@ -38,10 +38,11 @@ apps:
   tui:
     command: bin/diskrescue-tui
   gui:
-    command: bin/diskrescue-gui
-    desktop: meta/gui/diskrescue.desktop
+    command: bin/diskrescue-gui-launch
 
 parts:
+  # Command line and terminal app: core24's loader and libraries, so they
+  # run the same on every host.
   diskrescue:
     plugin: rust
     source: .
@@ -49,23 +50,28 @@ parts:
     rust-path:
       - crates/diskrescue
       - crates/diskrescue-tui
-      - crates/diskrescue-gui
     build-attributes:
       - enable-patchelf
+  # Desktop app: left on the host's loader so it can load the host's
+  # graphics drivers; snap/local/diskrescue-gui-launch picks the loader.
+  gui:
+    plugin: rust
+    source: .
+    rust-channel: "1.97.1"
+    rust-path:
+      - crates/diskrescue-gui
     build-packages:
       - pkg-config
       - libxkbcommon-dev
       - libwayland-dev
-    # The desktop app loads these at run time (winit and glutin use dlopen).
-    stage-packages:
-      - libgl1
-      - libegl1
-      - libxkbcommon0
-      - libxkbcommon-x11-0
-      - libwayland-client0
-      - libwayland-cursor0
-      - libwayland-egl1
-      - libx11-6
-      - libxcursor1
-      - libxrandr2
-      - libxi6
+  launcher:
+    plugin: dump
+    source: snap/local
+    organize:
+      diskrescue-gui-launch: bin/diskrescue-gui-launch
+
+lint:
+  ignore:
+    # The desktop app keeps the host's loader on purpose (see the gui part).
+    - classic:
+        - bin/diskrescue-gui

@@ -5,8 +5,8 @@
 //! (0xE5 on every slot, FAT chain freed, high cluster word kept) or, with
 //! `win32`, also zeroes the high cluster word like Windows does on FAT32.
 
+use diskrescue_fixtures::FileExt;
 use std::fs::{File, OpenOptions};
-use std::os::unix::fs::FileExt;
 use std::path::Path;
 
 /// Fixed timestamp used for every entry: 2024-05-01 12:30:10.

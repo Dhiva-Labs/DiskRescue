@@ -9,3 +9,4 @@ Terminal=false
 Categories=Utility;System;
 Keywords=recovery;undelete;photo;video;repair;sd card;usb;disk;
 StartupNotify=true
+StartupWMClass=diskrescue

@@ -37,20 +37,38 @@ jobs:
         # Vulkan driver); they never need a display.
         run: env -u DISPLAY -u WAYLAND_DISPLAY cargo test --workspace --no-fail-fast
 
-  windows-check:
-    name: windows target check
-    runs-on: ubuntu-latest
+  windows:
+    name: windows build + test + virtual disk
+    # Builds with MSVC, runs the test suite (tests whose fixture tools are
+    # Linux-only skip themselves), then rescues a FAT32 VHDX through
+    # \\.\PhysicalDriveN: listing, the output-on-source guard, raw imaging,
+    # recovery of existing and deleted photos and videos, and the desktop app.
+    runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
       - name: Install toolchain (rust-toolchain.toml)
         run: rustup show
-      - name: add target
-        run: rustup target add x86_64-pc-windows-gnu
       - uses: Swatinem/rust-cache@v2
         with:
-          key: windows-check
-      - name: check
-        run: cargo check --workspace --target x86_64-pc-windows-gnu
+          key: windows
+      - name: test
+        run: cargo test --workspace --no-fail-fast
+      - name: build release
+        run: cargo build --release -p diskrescue -p diskrescue-tui -p diskrescue-gui
+      - name: tools for the test photos and videos
+        run: |
+          python -m pip install --quiet pillow
+          if (-not (Get-Command ffmpeg -ErrorAction SilentlyContinue)) { choco install ffmpeg -y --no-progress }
+      - name: virtual disk end-to-end
+        run: .github/scripts/windows-smoke.ps1 -Bin target\release
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: windows-smoke
+          path: |
+            C:\drsmoke\gui.png
+            C:\drsmoke\out-device\report.txt
+          if-no-files-found: ignore
 
   musl-build:
     name: static musl build

@@ -632,7 +632,7 @@ fn descending_fragmented_chain_is_fast() {
     let off = p.entry_offset + 28;
     drop(w);
     {
-        use std::os::unix::fs::FileExt;
+        use diskrescue_fixtures::FileExt;
         let f = std::fs::OpenOptions::new().write(true).open(&img).unwrap();
         f.write_all_at(&size.to_le_bytes(), off).unwrap();
     }

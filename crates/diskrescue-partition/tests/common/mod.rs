@@ -2,8 +2,8 @@
 //! tools), MBR/GPT writers and a tiny deterministic RNG.
 #![allow(dead_code)]
 
+use diskrescue_fixtures::FileExt;
 use std::fs::{File, OpenOptions};
-use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Arc;

@@ -1,0 +1,18 @@
+#!/bin/sh
+# Start the desktop app on the loader that matches the machine's graphics
+# drivers.
+#
+# The app loads the host's own Vulkan and OpenGL drivers at run time, and
+# those are built against the host's glibc (Mesa on Ubuntu 26.04 needs glibc
+# 2.43, newer than core24's 2.39). The app itself needs glibc 2.39. With 2.39
+# or newer it runs on the host's loader and libraries, like the .deb. On older
+# hosts core24's glibc is the newer one, so it runs on core24's loader; the
+# drivers still come from the host. --library-path is not inherited by the
+# programs the app starts (pkexec, the file manager).
+bin="$SNAP/bin/diskrescue-gui"
+v=$(getconf GNU_LIBC_VERSION 2>/dev/null | cut -d' ' -f2)
+if [ -n "$v" ] && [ "$(printf '%s\n2.39\n' "$v" | sort -V | head -n1)" = "2.39" ]; then
+    exec "$bin" "$@"
+fi
+core=/snap/core24/current
+exec "$core/lib64/ld-linux-x86-64.so.2" --library-path "$core/lib/x86_64-linux-gnu" "$bin" "$@"

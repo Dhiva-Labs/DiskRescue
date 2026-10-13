@@ -6,7 +6,6 @@
 
 mod common;
 
-use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -414,7 +413,7 @@ fn is_root() -> bool {
 }
 
 #[cfg(unix)]
-fn set_mode(p: &Path, mode: u32) {
+fn set_mode(p: &std::path::Path, mode: u32) {
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(p, std::fs::Permissions::from_mode(mode)).unwrap();
 }

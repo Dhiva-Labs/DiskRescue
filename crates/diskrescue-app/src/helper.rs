@@ -35,19 +35,25 @@ use crate::text::percent;
 /// How often the block map is read from the progress map.
 pub const MAP_POLL: Duration = Duration::from_secs(3);
 
-/// The `diskrescue` program: next to the current executable, else on
-/// `PATH`. Always an absolute path.
+/// The `diskrescue` program: in the snap's `bin` (`$SNAP/bin`), next to the
+/// current executable, else on `PATH`. Always an absolute path.
+///
+/// The snap is checked first because its launcher may start the desktop app
+/// through core24's loader, and `current_exe` then names the loader.
 pub fn cli_path() -> Option<PathBuf> {
     let name = format!("diskrescue{}", std::env::consts::EXE_SUFFIX);
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            let p = dir.join(&name);
-            if p.is_file() {
-                return Some(p);
-            }
-        }
-    }
-    find_on_path(&name)
+    let snap_bin = std::env::var_os("SNAP")
+        .map(|s| PathBuf::from(s).join("bin"))
+        .filter(|d| d.is_absolute());
+    let exe_dir = std::env::current_exe()
+        .ok()
+        .and_then(|e| e.parent().map(PathBuf::from));
+    snap_bin
+        .into_iter()
+        .chain(exe_dir)
+        .map(|d| d.join(&name))
+        .find(|p| p.is_file())
+        .or_else(|| find_on_path(&name))
 }
 
 fn find_on_path(name: &str) -> Option<PathBuf> {

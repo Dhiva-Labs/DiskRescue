@@ -55,6 +55,7 @@
 pub mod damage;
 pub mod disk;
 pub mod error;
+pub mod fileext;
 pub mod fs;
 pub mod media;
 pub mod raw;
@@ -63,4 +64,5 @@ pub mod sets;
 pub mod tools;
 
 pub use error::{FixtureError, Result};
+pub use fileext::FileExt;
 pub use tools::Missing;
