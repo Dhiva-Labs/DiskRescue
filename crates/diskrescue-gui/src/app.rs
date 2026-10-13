@@ -503,6 +503,12 @@ impl DiskRescueApp {
                     Some(wizard::Action::StartPrivileged { image, then }) => {
                         self.start_privileged(*image, *then)
                     }
+                    Some(wizard::Action::RestartAsAdmin) => {
+                        match diskrescue_app::helper::restart_as_admin() {
+                            Ok(()) => ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close),
+                            Err(e) => w.restart_error = Some(e.message().to_string()),
+                        }
+                    }
                     None => {}
                 }
             }

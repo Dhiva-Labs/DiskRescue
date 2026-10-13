@@ -92,6 +92,9 @@ pub enum Action {
         /// The recovery from the copy.
         then: Box<RecoverPlan>,
     },
+    /// Windows: start DiskRescue again with administrator rights and close
+    /// this window.
+    RestartAsAdmin,
 }
 
 type Check = Preflight<ResolvedRecover>;
@@ -99,6 +102,8 @@ type Check = Preflight<ResolvedRecover>;
 /// The wizard's state (kept while the rescue runs, so that "Back to the
 /// settings" returns to it).
 pub struct Wizard {
+    /// Why "Restart as administrator" failed (Windows), shown in the banner.
+    pub restart_error: Option<String>,
     /// What is rescued.
     pub source: Source,
     /// 0, 1 or 2.
@@ -233,6 +238,7 @@ impl Wizard {
         let output = free_folder(&base.join(format!("{name} - recovered")));
         let image = image_name(&base.join(format!("{name}.img")), false);
         Wizard {
+            restart_error: None,
             source,
             step: 0,
             photos: true,
@@ -1041,9 +1047,19 @@ impl Wizard {
                 );
                 if cfg!(windows) {
                     ui.label(
-                        "Close DiskRescue, then right-click it and choose \"Run as administrator\", \
-                         and start the rescue again.",
+                        "DiskRescue can start again with administrator rights: Windows asks you to \
+                         allow it, then this window closes and the new one opens. Choose the drive \
+                         again there.",
                     );
+                    ui.add_space(4.0);
+                    if widgets::primary_button(ui, !job_running, "Restart as administrator")
+                        .clicked()
+                    {
+                        action = Some(Action::RestartAsAdmin);
+                    }
+                    if let Some(e) = &self.restart_error {
+                        ui.colored_label(ui.visuals().error_fg_color, e);
+                    }
                     return;
                 }
                 ui.add_space(4.0);

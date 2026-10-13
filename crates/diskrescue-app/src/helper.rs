@@ -58,6 +58,55 @@ fn find_on_path(name: &str) -> Option<PathBuf> {
         .find(|p| p.is_file())
 }
 
+/// Start a new copy of this program with administrator rights and return;
+/// the caller then closes itself. On Windows this shows the standard
+/// permission prompt (UAC); elsewhere it is unavailable (Linux copies through
+/// [`start_image_privileged`] instead).
+pub fn restart_as_admin() -> Result<()> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::UI::Shell::ShellExecuteW;
+        use windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+        let exe = std::env::current_exe().map_err(|e| {
+            AppError::failed(format!("cannot find DiskRescue's own program file: {e}"))
+        })?;
+        let wide = |s: &std::ffi::OsStr| {
+            s.encode_wide()
+                .chain(std::iter::once(0))
+                .collect::<Vec<u16>>()
+        };
+        let verb = wide(std::ffi::OsStr::new("runas"));
+        let file = wide(exe.as_os_str());
+        // SAFETY: both strings are NUL-terminated UTF-16 buffers that outlive
+        // the call; the other pointers are documented as optional (null).
+        let r = unsafe {
+            ShellExecuteW(
+                std::ptr::null_mut(),
+                verb.as_ptr(),
+                file.as_ptr(),
+                std::ptr::null(),
+                std::ptr::null(),
+                SW_SHOWNORMAL,
+            )
+        };
+        // ShellExecuteW reports success with a value greater than 32.
+        if (r as isize) <= 32 {
+            return Err(AppError::failed(
+                "Windows did not start DiskRescue with administrator rights (the request was cancelled \
+                 or blocked). Right-click DiskRescue and choose \"Run as administrator\" instead.",
+            ));
+        }
+        Ok(())
+    }
+    #[cfg(not(windows))]
+    {
+        Err(AppError::failed(
+            "restarting with administrator rights is only available on Windows",
+        ))
+    }
+}
+
 /// True when the current user cannot open `path` for reading (a device
 /// node that needs administrator rights). The node is opened read-only and
 /// closed again; nothing is read.
@@ -458,11 +507,11 @@ fn stop_child(child: &Mutex<Child>, signalled: &AtomicBool) {
     if signalled.swap(true, Ordering::SeqCst) {
         return;
     }
-    if !matches!(c.try_wait(), Ok(None)) {
-        return;
-    }
+    let running = matches!(c.try_wait(), Ok(None));
+    #[cfg(not(unix))]
+    let _ = running;
     #[cfg(unix)]
-    {
+    if running {
         if let Ok(pid) = i32::try_from(c.id()) {
             // SAFETY: kill(2) on the pid of our own child, which has not been
             // reaped (checked under the same lock that guards reaping).
