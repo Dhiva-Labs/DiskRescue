@@ -126,13 +126,30 @@ assign letter=$letter
     Run 'list' @(0) @('list', '--all')
     $json = & $cli list --all --json | Out-String
     if ($LASTEXITCODE) { Fail "list --json exited with $LASTEXITCODE" }
-    if ($json -notmatch "PhysicalDrive$n`"") { Fail "list does not show $dev" }
     Write-Host $json
+    $devices = $json | ConvertFrom-Json
+    $card = $devices | Where-Object { $_.path -match "PhysicalDrive$n$" }
+    if (-not $card) {
+        Fail "list does not show $dev"
+    } elseif ($card.mountpoints -notcontains "${letter}:\") {
+        Fail "list does not show $dev in use as ${letter}:\ (mount points: $($card.mountpoints -join ', '))"
+    }
+    $sysNumber = (Get-Partition -DriveLetter $env:SystemDrive.TrimEnd(':')).DiskNumber
+    $sys = $devices | Where-Object { $_.path -match "PhysicalDrive$sysNumber$" }
+    if (-not $sys -or $sys.mountpoints -notcontains "$env:SystemDrive\") {
+        Fail "the system disk (PhysicalDrive$sysNumber) is not shown as $env:SystemDrive\"
+    }
+
+    # ------------------------------------------------------------ in use
+    Run 'image while Windows uses the drive' @(3) @('image', $dev, "$work\inuse.img")
+    Run 'image with --allow-mounted' @(0) @('image', $dev, "$work\inuse.img", '--allow-mounted')
+    Remove-Item "$work\inuse.img*" -ErrorAction SilentlyContinue
 
     # ------------------------------------------------------------ safety
-    Run 'image onto the source drive' @(3) @('image', $dev, "${letter}:\copy.img")
+    # --allow-mounted, so only the output-on-source guard can refuse.
+    Run 'image onto the source drive' @(3) @('image', $dev, "${letter}:\copy.img", '--allow-mounted')
     if (Test-Path "${letter}:\copy.img") { Fail 'image wrote onto the drive it rescues' }
-    Run 'recover onto the source drive' @(3) @('recover', $dev, '-o', "${letter}:\out")
+    Run 'recover onto the source drive' @(3) @('recover', $dev, '-o', "${letter}:\out", '--allow-mounted')
     if (Test-Path "${letter}:\out") { Fail 'recover wrote onto the drive it rescues' }
 
     # Rescue the way a failing card should be handled: Windows lets go of it.
