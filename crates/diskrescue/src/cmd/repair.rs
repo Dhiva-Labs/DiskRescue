@@ -53,7 +53,13 @@ pub fn render(report: &Report, output: &Path, width: usize, p: &Paint) -> String
             .repair
             .as_ref()
             .and_then(|r| r.output.as_ref())
-            .map(|o| output.join(o).display().to_string())
+            // Name by name, so the separators are the platform's.
+            .map(|o| {
+                o.components()
+                    .fold(output.to_path_buf(), |p, c| p.join(c))
+                    .display()
+                    .to_string()
+            })
             .unwrap_or_else(|| "-".into());
         t.row(vec![display_name(f), before_text(f), colored, out]);
     }
@@ -205,11 +211,16 @@ mod tests {
         report.add_file(f);
         report.add_file(rec("IMG_2.JPG", Outcome::Damaged));
         let s = render(&report, Path::new("fixed"), 120, &Paint::plain());
+        let copy = Path::new("fixed")
+            .join("repaired")
+            .join("IMG_1.JPG")
+            .display()
+            .to_string();
         for needle in [
             "FILE",
             "IMG_1.JPG",
             "repaired",
-            "fixed/repaired/IMG_1.JPG",
+            copy.as_str(),
             "appended EOI",
             "good.jpg",
             "colours may differ",

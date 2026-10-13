@@ -78,7 +78,10 @@ pub struct ResultItem {
 /// `root/rel` when `rel` is a plain relative path (no `..`, not absolute).
 fn inside(root: &Path, rel: &Path) -> Option<PathBuf> {
     let plain = rel.components().all(|c| matches!(c, Component::Normal(_)));
-    (plain && rel.components().next().is_some()).then(|| root.join(rel))
+    // Joined name by name, so a report written with `/` reads back with the
+    // platform's separator.
+    (plain && rel.components().next().is_some())
+        .then(|| rel.components().fold(root.to_path_buf(), |p, c| p.join(c)))
 }
 
 /// One [`ResultItem`] per file of `report`; `root` is the output folder
@@ -354,7 +357,12 @@ mod tests {
         });
         r.add_file(f);
         let it = items(&r, Path::new("/out"));
-        assert_eq!(it[0].path.as_deref(), Some(Path::new("/out/files/a.jpg")));
+        let root = std::path::absolute("/out").unwrap();
+        assert_eq!(it[0].path, Some(root.join("files").join("a.jpg")));
+        assert_eq!(
+            it[0].path.as_ref().map(|p| p.display().to_string()),
+            Some(root.join("files").join("a.jpg").display().to_string())
+        );
         assert!(it[0].repaired.is_none());
         assert_eq!(it[0].notes, vec!["repair: appended EOI".to_string()]);
         assert!(is_usable(Outcome::PartiallyRepaired) && !is_usable(Outcome::Failed));

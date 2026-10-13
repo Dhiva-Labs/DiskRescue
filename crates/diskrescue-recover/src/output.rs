@@ -77,12 +77,32 @@ impl OutputTree {
 
     /// Relative path for the repaired copy of `original` (itself relative).
     /// Files from outside the tree (the `repair` command) keep only their name.
+    ///
+    /// Only a path made of plain names counts as inside the tree. Anything
+    /// else keeps just its name: joining an absolute path, a rooted one
+    /// (`\photos\a.jpg`) or a drive-relative one (`C:a.jpg`) on Windows
+    /// replaces the base, and `..` climbs out of it, so the copy would land
+    /// outside the output folder.
     pub fn repaired_relative(original: &Path) -> PathBuf {
-        let rel: PathBuf = if original.is_absolute() {
-            PathBuf::from(original.file_name().unwrap_or_default())
+        use std::path::Component;
+        let inside = original
+            .components()
+            .all(|c| matches!(c, Component::Normal(_) | Component::CurDir));
+        let rel: PathBuf = if inside {
+            original
+                .components()
+                .filter(|c| matches!(c, Component::Normal(_)))
+                .collect()
         } else {
-            original.to_path_buf()
+            PathBuf::new()
         };
+        if rel.as_os_str().is_empty() {
+            let name = original
+                .file_name()
+                .map(|n| sanitize_component(&n.to_string_lossy()))
+                .unwrap_or_else(|| "_".to_string());
+            return Path::new("repaired").join(name);
+        }
         Path::new("repaired").join(rel)
     }
 
@@ -212,6 +232,39 @@ mod tests {
             OutputTree::repaired_relative(Path::new("carved/videos/undated/f1.mp4")),
             PathBuf::from("repaired/carved/videos/undated/f1.mp4")
         );
+        for outside in [
+            "../../x/broken.mp4",
+            "./../broken.mp4",
+            "a/../../broken.mp4",
+        ] {
+            assert_eq!(
+                OutputTree::repaired_relative(Path::new(outside)),
+                PathBuf::from("repaired/broken.mp4"),
+                "{outside}"
+            );
+        }
+        assert_eq!(
+            OutputTree::repaired_relative(Path::new("..")),
+            PathBuf::from("repaired/_")
+        );
+    }
+
+    /// On Windows, rooted and drive-relative paths are not absolute, but
+    /// joining them still leaves the output folder.
+    #[cfg(windows)]
+    #[test]
+    fn repaired_copies_of_rooted_windows_paths_stay_inside() {
+        for p in [
+            r"\photos\broken.mp4",
+            r"C:broken.mp4",
+            r"D:\x\broken.mp4",
+            r"\\srv\share\broken.mp4",
+        ] {
+            let rel = OutputTree::repaired_relative(Path::new(p));
+            assert_eq!(rel, PathBuf::from(r"repaired\broken.mp4"), "{p}");
+            let root = Path::new(r"E:\out");
+            assert!(root.join(&rel).starts_with(root), "{p}");
+        }
     }
 
     #[test]
