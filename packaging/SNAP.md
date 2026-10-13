@@ -6,8 +6,18 @@ classic confinement blocks later releases until it is reviewed. Order:
 
 1. Post the request below in the Snapcraft forum, category "store-requests",
    titled "Classic confinement request for diskrescue".
-2. When it is approved, build with `snapcraft pack` and test the snap in the
-   `snaptest` LXD VM (`snap install --classic --dangerous`), running all three
+2. When it is approved, build from a clean export of the committed tree,
+   never from the working tree: `snapcraft pack` copies the whole directory,
+   `target/` included (tens of GB), into the build container. Keep the
+   export under your home directory, where the LXD snap can see it.
+
+   ```bash
+   rm -rf ../diskrescue-snap && mkdir ../diskrescue-snap
+   git archive HEAD | tar -x -C ../diskrescue-snap
+   cd ../diskrescue-snap && snapcraft pack --use-lxd
+   ```
+
+   Test the snap in the `snaptest` LXD VM (`snap install --classic --dangerous`), running all three
    apps: `diskrescue list`, `diskrescue.tui` (terminal), `diskrescue.gui`
    (under xvfb-run, screenshot), and an image + recover of a file-backed
    source. Check that `diskrescue.gui` finds `$SNAP/bin/diskrescue` for the
