@@ -21,8 +21,43 @@ classic confinement blocks later releases until it is reviewed. Order:
    apps: `diskrescue list`, `diskrescue.tui` (terminal), `diskrescue.gui`
    (under xvfb-run, screenshot), and an image + recover of a file-backed
    source. Check that `diskrescue.gui` finds `$SNAP/bin/diskrescue` for the
-   administrator copy.
+   administrator copy. Test traps:
+   - The VM is a server image: install the X and GL libraries every desktop
+     has (`libxcursor1 libxi6 libxrandr2 libxkbcommon-x11-0 libx11-xcb1 libgl1
+     libegl1 libgl1-mesa-dri libvulkan1 mesa-vulkan-drivers`), or the window
+     fails with "libXcursor.so.1: cannot open shared object file".
+   - Run the TUI as `script -qc "stty cols 120 rows 40; timeout --foreground 4
+     diskrescue.tui" /dev/null`: without `stty` the pseudo-terminal is 0x0 and
+     nothing is drawn; without `--foreground`, `timeout` puts it in a
+     background process group and the first terminal mode change stops it
+     (state `T`), so it never sees SIGTERM.
+   - Start the desktop app both ways: `diskrescue.gui`, and the fallback
+     `/snap/core24/current/lib64/ld-linux-x86-64.so.2 --library-path
+     /snap/core24/current/lib/x86_64-linux-gnu $SNAP/bin/diskrescue-gui`.
 3. `snapcraft upload --release=stable diskrescue_0.1.0_amd64.snap`.
+
+Verified 2026-10-13 with that procedure (snaptest, Ubuntu 24.04): install,
+list, image (byte-identical), recover of an existing and a deleted JPEG
+(byte-identical), the output-on-source guard (exit 3), the TUI, and the
+desktop app through both loaders.
+
+## How the snap is built
+
+- `diskrescue` and `diskrescue-tui` are patched to core24's loader and
+  libraries (`enable-patchelf`), so they behave the same on every host.
+- `diskrescue-gui` stays on the host's loader. It loads the host's Vulkan and
+  OpenGL drivers (and X11/Wayland libraries) at run time, and those are built
+  against the host's glibc: Mesa on Ubuntu 26.04 needs glibc 2.43, newer than
+  core24's 2.39, so under core24's loader the window could not open. Staging
+  GL libraries does not help: `dlopen` from a patched binary never sees them
+  (the linter reported all of them unused).
+- `bin/diskrescue-gui-launch` (from `snap/local`) starts it on the host's
+  loader when the host has glibc 2.39 or newer (what the binary needs), and on
+  core24's loader with core24's libraries otherwise (Ubuntu 22.04: its drivers
+  are older than core24's glibc, so they still load). `--library-path` is not
+  inherited by the programs the app starts.
+- Through core24's loader `current_exe()` names the loader, so the desktop app
+  looks for its helper in `$SNAP/bin` first.
 
 ## Classic confinement request
 
