@@ -634,36 +634,67 @@ impl StatusMap {
     /// only be demoted (re-read later), never promoted, and finished data is
     /// never touched. Returns the number of boundaries fixed.
     pub fn join_subsectors(&mut self, sector: u64) -> usize {
-        if sector <= 1 {
+        if sector <= 1 || self.blocks.len() < 2 {
             return 0;
         }
+        // One pass over a stack, so a map of a badly damaged disk (hundreds
+        // of thousands of blocks) is fixed in linear time. After each block
+        // is pushed, the boundary below the top is fixed until it is
+        // aligned or next to finished data. A fix either aligns that
+        // boundary or removes a block, and a removal can only expose the
+        // boundary below, which is then fixed the same way. This makes
+        // exactly the changes ddrescue's left-to-right walk with one step
+        // back makes (the tests compare the two on random maps).
+        let mut out: Vec<MapBlock> = Vec::with_capacity(self.blocks.len());
         let mut fixed = 0usize;
-        let mut i = 0usize;
-        // Each fix removes one unaligned non-finished boundary and steps
-        // back one index, so the loop runs at most ~3 x (number of blocks)
-        // iterations; the guard only exists to make that bound explicit.
-        let mut guard = self.blocks.len().saturating_mul(4) + 16;
-        while i + 1 < self.blocks.len() && guard > 0 {
-            guard -= 1;
-            let left = self.blocks[i];
-            let right = self.blocks[i + 1];
-            let p = left.end();
-            if p % sector == 0
-                || left.status == BlockStatus::Finished
-                || right.status == BlockStatus::Finished
-            {
-                i += 1;
-                continue;
+        for &b in &self.blocks {
+            match out.last_mut() {
+                Some(top) if top.status == b.status => top.size += b.size,
+                _ => out.push(b),
             }
-            let sec_start = p - p % sector;
-            let sec_end = sec_start.saturating_add(sector);
-            if left.status.rank() <= right.status.rank() {
-                self.set(Range::new(p, sec_end.min(right.end())), left.status);
-            } else {
-                self.set(Range::new(sec_start.max(left.pos), p), right.status);
+            while out.len() >= 2 {
+                let n = out.len();
+                let (left, right) = (out[n - 2], out[n - 1]);
+                let p = left.end();
+                if p % sector == 0
+                    || left.status == BlockStatus::Finished
+                    || right.status == BlockStatus::Finished
+                {
+                    break;
+                }
+                fixed += 1;
+                let sec_start = p - p % sector;
+                let sec_end = sec_start.saturating_add(sector);
+                if left.status.rank() <= right.status.rank() {
+                    // The partial sector goes to the left block.
+                    let to = sec_end.min(right.end());
+                    out[n - 2].size = to - left.pos;
+                    if to == right.end() {
+                        out.pop();
+                    } else {
+                        out[n - 1].pos = to;
+                        out[n - 1].size = right.end() - to;
+                    }
+                } else {
+                    // The partial sector goes to the right block.
+                    let from = sec_start.max(left.pos);
+                    out[n - 1].pos = from;
+                    out[n - 1].size = right.end() - from;
+                    if from == left.pos {
+                        out.remove(n - 2);
+                        if n >= 3 && out[n - 3].status == out[n - 2].status {
+                            out[n - 3].size += out[n - 2].size;
+                            out.pop();
+                        }
+                    } else {
+                        out[n - 2].size = from - left.pos;
+                    }
+                }
             }
-            fixed += 1;
-            i = i.saturating_sub(1);
+        }
+        if fixed > 0 {
+            self.blocks = out;
+            self.recount();
         }
         fixed
     }
@@ -830,6 +861,114 @@ mod tests {
         assert!(m.is_empty());
         m.resize(10, ResizePolicy::KeepFinished).unwrap();
         assert_eq!(chars(&m), "0:10?");
+        m.validate().unwrap();
+    }
+
+    impl StatusMap {
+        /// The original walk (ddrescue's loop with one step back, one
+        /// `set` per fix), kept as the reference for the linear version.
+        fn join_subsectors_reference(&mut self, sector: u64) -> usize {
+            if sector <= 1 {
+                return 0;
+            }
+            let mut fixed = 0usize;
+            let mut i = 0usize;
+            // Each fix removes one unaligned non-finished boundary and steps
+            // back one index, so the loop runs at most ~3 x (number of blocks)
+            // iterations; the guard only exists to make that bound explicit.
+            let mut guard = self.blocks.len().saturating_mul(4) + 16;
+            while i + 1 < self.blocks.len() && guard > 0 {
+                guard -= 1;
+                let left = self.blocks[i];
+                let right = self.blocks[i + 1];
+                let p = left.end();
+                if p % sector == 0
+                    || left.status == BlockStatus::Finished
+                    || right.status == BlockStatus::Finished
+                {
+                    i += 1;
+                    continue;
+                }
+                let sec_start = p - p % sector;
+                let sec_end = sec_start.saturating_add(sector);
+                if left.status.rank() <= right.status.rank() {
+                    self.set(Range::new(p, sec_end.min(right.end())), left.status);
+                } else {
+                    self.set(Range::new(sec_start.max(left.pos), p), right.status);
+                }
+                fixed += 1;
+                i = i.saturating_sub(1);
+            }
+            fixed
+        }
+    }
+
+    /// The linear `join_subsectors` makes the same changes as the walk it
+    /// replaced, on random maps with every status, odd sizes and several
+    /// sector sizes.
+    #[test]
+    fn join_subsectors_matches_the_reference_walk() {
+        let statuses = [
+            BlockStatus::NonTried,
+            BlockStatus::NonTrimmed,
+            BlockStatus::NonScraped,
+            BlockStatus::BadSector,
+            BlockStatus::Finished,
+        ];
+        let mut rng = StdRng::seed_from_u64(0x0a11_09e5);
+        let mut total = 0usize;
+        for round in 0..4000 {
+            let n = rng.gen_range(1..40);
+            let mut blocks = Vec::new();
+            let mut pos = 0u64;
+            for _ in 0..n {
+                let size = match rng.gen_range(0..4) {
+                    0 => rng.gen_range(1..8),
+                    1 => rng.gen_range(1..600),
+                    2 => 512 * rng.gen_range(1..5),
+                    _ => rng.gen_range(1..5000),
+                };
+                let status = statuses[rng.gen_range(0..statuses.len())];
+                blocks.push(MapBlock { pos, size, status });
+                pos += size;
+            }
+            let sector = [2u64, 7, 512, 4096][rng.gen_range(0..4)];
+            let mut a = StatusMap::from_contiguous(blocks);
+            let mut b = a.clone();
+            let fa = a.join_subsectors(sector);
+            let fb = b.join_subsectors_reference(sector);
+            assert_eq!(a.blocks(), b.blocks(), "round {round}, sector {sector}");
+            assert_eq!(fa, fb, "round {round}, sector {sector}");
+            assert_eq!(a.stats(), b.stats(), "round {round}");
+            a.validate().unwrap();
+            total += fa;
+        }
+        assert!(total > 10_000, "only {total} boundaries needed fixing");
+    }
+
+    #[test]
+    fn join_subsectors_is_linear_on_a_badly_damaged_map() {
+        let blocks: Vec<MapBlock> = (0..200_000u64)
+            .map(|i| MapBlock {
+                pos: i * 512,
+                size: 512,
+                status: [
+                    BlockStatus::Finished,
+                    BlockStatus::BadSector,
+                    BlockStatus::NonScraped,
+                    BlockStatus::NonTrimmed,
+                    BlockStatus::NonTried,
+                ][(i % 5) as usize],
+            })
+            .collect();
+        let mut m = StatusMap::from_contiguous(blocks);
+        let t0 = std::time::Instant::now();
+        m.join_subsectors(4096);
+        assert!(
+            t0.elapsed() < std::time::Duration::from_secs(1),
+            "{:?}",
+            t0.elapsed()
+        );
         m.validate().unwrap();
     }
 
