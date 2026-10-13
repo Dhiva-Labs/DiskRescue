@@ -39,7 +39,6 @@ apps:
     command: bin/diskrescue-tui
   gui:
     command: bin/diskrescue-gui
-    desktop: meta/gui/diskrescue.desktop
 
 parts:
   diskrescue:
