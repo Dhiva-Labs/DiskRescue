@@ -54,9 +54,12 @@ fn an_overridable_blocker_needs_the_risk_accepted_before_start() {
     wait_for(&mut h, LIMIT, "Next", |h| enabled(h, "Next"));
     click(&mut h, "Next");
 
-    wait_for(&mut h, LIMIT, "the safety checks", |h| {
-        has_label(h, "The drive is in use by the system (mounted)")
-    });
+    let title = if cfg!(windows) {
+        "The drive is in use by Windows"
+    } else {
+        "The drive is in use by the system (mounted)"
+    };
+    wait_for(&mut h, LIMIT, "the safety checks", |h| has_label(h, title));
     assert!(
         !has_label_containing(&h, "--allow-mounted"),
         "command-line hints are hidden"

@@ -14,7 +14,7 @@ use ratatui::widgets::Paragraph;
 use ratatui::Frame;
 
 use crate::config::{Config, DeviceSource};
-use crate::model::DeviceEntry;
+use crate::model::{DeviceEntry, RESTART_AS_ADMIN};
 use crate::pending::Pending;
 use crate::widgets::{ellipsize_end, wrap_words, ListNav, Theme};
 
@@ -514,10 +514,15 @@ impl Home {
         }
         v.push(Line::raw(""));
         if e.needs_root && !e.system {
-            for l in wrap_words(
-                "Reading this device needs administrator rights. To recover from it, close DiskRescue and start it again with: sudo diskrescue-tui. 'Copy to an image only' and 'Rescue' can ask for your password from here.",
-                w,
-            ) {
+            let text = if cfg!(windows) {
+                format!("Reading this device needs administrator rights. {RESTART_AS_ADMIN}")
+            } else {
+                format!(
+                    "Reading this device needs administrator rights. To recover from it, {}. 'Copy to an image only' and 'Rescue' can ask for your password from here.",
+                    RESTART_AS_ADMIN.replacen("Close", "close", 1)
+                )
+            };
+            for l in wrap_words(&text, w) {
                 v.push(Line::from(Span::styled(l, theme.warn())));
             }
             v.push(Line::raw(""));

@@ -131,7 +131,23 @@ pub fn run_loop(
     }
 }
 
-const USAGE: &str = "\
+const USAGE: &str = if cfg!(windows) {
+    "\
+DiskRescue terminal app: recover photos and videos from failing drives.
+
+Usage: diskrescue-tui [--no-mouse]
+
+Reading a disk, card or USB drive directly needs administrator rights:
+run it in a terminal opened as administrator (right-click Start, Terminal (Admin)).
+Image files and repairs of loose files work without them.
+
+Options:
+    --no-mouse     do not use the mouse
+    -h, --help     show this text
+    -V, --version  show the version
+"
+} else {
+    "\
 DiskRescue terminal app: recover photos and videos from failing drives.
 
 Usage: diskrescue-tui [--no-mouse]
@@ -144,7 +160,8 @@ Options:
     --no-mouse     do not use the mouse
     -h, --help     show this text
     -V, --version  show the version
-";
+"
+};
 
 /// The program: returns the exit code.
 pub fn main() -> i32 {

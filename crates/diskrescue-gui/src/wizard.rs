@@ -1230,6 +1230,14 @@ fn blocker_help(code: BlockerCode) -> (&'static str, &'static str, Fix) {
              often still get the files back.",
             Fix::None,
         ),
+        SourceMounted if cfg!(windows) => (
+            "The drive is in use by Windows",
+            "Open Disk Management (right-click Start), right-click the drive's volume, choose \
+             \"Change Drive Letter and Paths\" and remove its letter (for a hard disk you can \
+             instead right-click the disk and choose \"Offline\"), then press Check again. Or tick \
+             the box below to read it while Windows uses it.",
+            Fix::None,
+        ),
         SourceMounted => (
             "The drive is in use by the system (mounted)",
             "In your file manager, right-click the drive and choose \"Unmount\" (not \"Eject\" or \
