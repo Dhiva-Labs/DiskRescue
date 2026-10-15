@@ -1,5 +1,9 @@
 # DiskRescue
 
+[![ARM64 builds](https://github.com/Dhiva-Labs/DiskRescue/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/Dhiva-Labs/DiskRescue/actions/workflows/ci.yml)
+![Linux x64 | arm64](https://img.shields.io/badge/Linux-x64%20%7C%20arm64-informational?logo=linux&logoColor=white)
+![Windows x64 | arm64](https://img.shields.io/badge/Windows-x64%20%7C%20arm64-informational?logo=windows&logoColor=white)
+
 **Get your photos and videos back from a dying drive, and repair the files
 that came back broken.**
 
@@ -98,7 +102,16 @@ three programs; they are not signed, so SmartScreen or Smart App Control may
 warn about them or block them. When a drive needs administrator rights, the
 desktop app offers to restart itself with them (a UAC prompt).
 
-**Linux:** download the `.deb` or the tarball from the releases page.
+**Linux:** download the `.deb` or the tarball from the releases page, for
+x86-64 or Arm64:
+
+| | x86-64 | Arm64 (aarch64) |
+|---|---|---|
+| Debian / Ubuntu package (24.04 and newer) | `diskrescue_<version>_amd64.deb` | `diskrescue_<version>_arm64.deb` |
+| Tarball (static `diskrescue` and `diskrescue-tui`, `diskrescue-gui`) | `diskrescue-<tag>-x86_64-linux.tar.gz` | `diskrescue-<tag>-aarch64-linux.tar.gz` |
+
+`sudo apt install ./diskrescue_<version>_<arch>.deb`. The releases page also
+lists `SHA256SUMS` for every download.
 
 **From source:**
 

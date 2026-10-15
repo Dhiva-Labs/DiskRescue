@@ -41,6 +41,18 @@ list, image (byte-identical), recover of an existing and a deleted JPEG
 (byte-identical), the output-on-source guard (exit 3), the TUI, and the
 desktop app through both loaders.
 
+## Architectures
+
+`snap/snapcraft.yaml` lists `amd64` and `arm64` under `platforms`; each is
+built on a machine of its own architecture. CI builds the arm64 snap on an
+`ubuntu-24.04-arm` runner on every push, installs it there and starts all
+three programs, the desktop app through both loaders (the check is
+`.github/scripts/snap-smoke.sh`), and keeps the file as the
+`diskrescue-snap-arm64` workflow artifact. It never uploads to the store.
+On arm64 the fallback loader is
+`/snap/core24/current/lib/aarch64-linux-gnu/ld-linux-aarch64.so.1 --library-path
+/snap/core24/current/lib/aarch64-linux-gnu`.
+
 ## How the snap is built
 
 - `diskrescue` and `diskrescue-tui` are patched to core24's loader and
