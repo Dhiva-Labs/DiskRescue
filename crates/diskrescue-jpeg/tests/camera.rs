@@ -192,15 +192,20 @@ fn output_decodes(label: &str, dec: &Decoders, out: &[u8], failures: &mut Vec<St
             "{label}: zune-jpeg cannot decode the repair output ({e:?})"
         ));
     }
-    let dir = std::env::temp_dir().join(format!("djr-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
-    let p = dir.join("out.jpg");
-    std::fs::write(&p, out).unwrap();
+    // A file of its own: tests run in parallel threads of one process, and a
+    // shared path let one test overwrite the file another was decoding.
+    let file = tempfile::Builder::new()
+        .prefix("djr-")
+        .suffix(".jpg")
+        .tempfile()
+        .unwrap();
+    std::fs::write(file.path(), out).unwrap();
+    let p = file.path();
     if dec.pillow {
-        if pillow_decodes(&p) == Some(false) {
+        if pillow_decodes(p) == Some(false) {
             failures.push(format!("{label}: Pillow cannot decode the repair output"));
         }
-    } else if ffmpeg_decodes(&p) == Some(false) {
+    } else if ffmpeg_decodes(p) == Some(false) {
         failures.push(format!("{label}: ffmpeg cannot decode the repair output"));
     }
 }
