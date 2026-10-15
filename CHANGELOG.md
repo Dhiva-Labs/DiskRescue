@@ -20,6 +20,9 @@ Windows support.
   output-on-source guards, raw image, byte-exact recovery of existing and
   deleted photos and videos, the desktop app), also from the installed
   Store package.
+- Fix (Windows): recovering straight from a drive zero-filled the last
+  partial sector of every file; reads of a Windows disk are now always whole
+  sectors.
 - Fix: a repaired copy could be written outside the output folder when the
   file's recorded path was rooted or drive-relative (Windows) or contained
   `..`; only plain folder names are kept now.
