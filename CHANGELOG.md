@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.2.2 (2026-10-16)
 
 - Linux on Arm64: `diskrescue-<tag>-aarch64-linux.tar.gz` (static `diskrescue`
   and `diskrescue-tui` plus the desktop app) and `diskrescue_<version>_arm64.deb`,
