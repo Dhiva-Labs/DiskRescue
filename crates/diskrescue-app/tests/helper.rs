@@ -115,7 +115,10 @@ fn the_helper_job_stops_cleanly_and_resumes() {
     let dir = common::scratch("helper-stop-");
     let src = dir.path().join("big.bin");
     let f = std::fs::File::create(&src).unwrap();
-    f.set_len(512 << 20).unwrap();
+    // Large enough that the first copy is still running when it is stopped:
+    // 512 MiB was sometimes copied completely before the stop arrived on a
+    // busy CI machine.
+    f.set_len(2 << 30).unwrap();
     drop(f);
     let img = dir.path().join("big.img");
     let mut plan = ImagePlan::new(&src, &img);
@@ -142,7 +145,7 @@ fn the_helper_job_stops_cleanly_and_resumes() {
     let s = h.snapshot();
     assert!(s.summary.as_ref().is_some_and(|x| x.cancelled));
     let st = s.map.as_ref().unwrap().stats();
-    assert!(st.rescued > 0 && st.rescued < 512 << 20, "{st:?}");
+    assert!(st.rescued > 0 && st.rescued < 2 << 30, "{st:?}");
 
     plan.tuning.block_size = None;
     let h = start_image_via_cli(plan, cli, Elevation::None);

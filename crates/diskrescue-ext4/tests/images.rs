@@ -312,7 +312,24 @@ fn htree_directory_lists_linearly() {
         .unwrap();
     }
     let img = dir.path().join("htree.img");
-    make_image(&img, 32 << 20, "mkfs.ext4", &["-b", "1024"], Some(&src));
+    // A fixed hash seed, so the hash tree is laid out the same on every run.
+    // With a random one, a deleted name sometimes sat first in its leaf
+    // block, where ext4 clears the entry's inode number instead of merging
+    // it into the entry before, and the file came back unnamed.
+    make_image(
+        &img,
+        32 << 20,
+        "mkfs.ext4",
+        &[
+            "-b",
+            "1024",
+            "-U",
+            "d15c0e5c-0e5c-4a11-8e5c-0d15c0e5c101",
+            "-E",
+            "hash_seed=d15c0e5c-0e5c-4a11-8e5c-0d15c0e5c102",
+        ],
+        Some(&src),
+    );
     // e2fsck -D rebuilds large directories as hash trees.
     run("e2fsck", &["-fyD", &img.to_string_lossy()]);
     let fs = open_path(&img);
