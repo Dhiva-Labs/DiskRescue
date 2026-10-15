@@ -8,13 +8,18 @@
 # Pillow and ffmpeg on PATH.
 #
 #   .github/scripts/windows-smoke.ps1 -Bin target\release
+#
+# With -Packaged it runs the installed Microsoft Store package instead,
+# through its command aliases (so with the package's identity).
 
-param([Parameter(Mandatory)][string]$Bin)
+param([string]$Bin, [switch]$Packaged, [string]$Work = 'C:\drsmoke')
 
 $ErrorActionPreference = 'Stop'
+if ($Packaged) { $Bin = "$env:LOCALAPPDATA\Microsoft\WindowsApps" }
+elseif (-not $Bin) { throw 'pass -Bin <folder with the .exe files> or -Packaged' }
 $cli = (Resolve-Path (Join-Path $Bin 'diskrescue.exe')).Path
 $gui = (Resolve-Path (Join-Path $Bin 'diskrescue-gui.exe')).Path
-$work = 'C:\drsmoke'
+$work = $Work
 $vhd = "$work\card.vhdx"
 $letter = 'R'
 $failures = [System.Collections.Generic.List[string]]::new()
@@ -61,7 +66,8 @@ function Check-Recovered([string]$out, [string]$label) {
 }
 
 # The C runtime is linked in (.cargo/config.toml): no VCRUNTIME140.dll import.
-foreach ($exe in Get-ChildItem (Join-Path $Bin 'diskrescue*.exe')) {
+# (The package's aliases are links, not the programs.)
+foreach ($exe in Get-ChildItem (Join-Path $Bin 'diskrescue*.exe') | Where-Object { -not $Packaged }) {
     $text = [System.Text.Encoding]::ASCII.GetString([System.IO.File]::ReadAllBytes($exe.FullName))
     if ($text.IndexOf('vcruntime140', [System.StringComparison]::OrdinalIgnoreCase) -ge 0) {
         Fail "$($exe.Name) needs the Visual C++ Redistributable (VCRUNTIME140.dll)"
@@ -126,13 +132,30 @@ assign letter=$letter
     Run 'list' @(0) @('list', '--all')
     $json = & $cli list --all --json | Out-String
     if ($LASTEXITCODE) { Fail "list --json exited with $LASTEXITCODE" }
-    if ($json -notmatch "PhysicalDrive$n`"") { Fail "list does not show $dev" }
     Write-Host $json
+    $devices = $json | ConvertFrom-Json
+    $card = $devices | Where-Object { $_.path -match "PhysicalDrive$n$" }
+    if (-not $card) {
+        Fail "list does not show $dev"
+    } elseif ($card.mountpoints -notcontains "${letter}:\") {
+        Fail "list does not show $dev in use as ${letter}:\ (mount points: $($card.mountpoints -join ', '))"
+    }
+    $sysNumber = (Get-Partition -DriveLetter $env:SystemDrive.TrimEnd(':')).DiskNumber
+    $sys = $devices | Where-Object { $_.path -match "PhysicalDrive$sysNumber$" }
+    if (-not $sys -or $sys.mountpoints -notcontains "$env:SystemDrive\") {
+        Fail "the system disk (PhysicalDrive$sysNumber) is not shown as $env:SystemDrive\"
+    }
+
+    # ------------------------------------------------------------ in use
+    Run 'image while Windows uses the drive' @(3) @('image', $dev, "$work\inuse.img")
+    Run 'image with --allow-mounted' @(0) @('image', $dev, "$work\inuse.img", '--allow-mounted')
+    Remove-Item "$work\inuse.img*" -ErrorAction SilentlyContinue
 
     # ------------------------------------------------------------ safety
-    Run 'image onto the source drive' @(3) @('image', $dev, "${letter}:\copy.img")
+    # --allow-mounted, so only the output-on-source guard can refuse.
+    Run 'image onto the source drive' @(3) @('image', $dev, "${letter}:\copy.img", '--allow-mounted')
     if (Test-Path "${letter}:\copy.img") { Fail 'image wrote onto the drive it rescues' }
-    Run 'recover onto the source drive' @(3) @('recover', $dev, '-o', "${letter}:\out")
+    Run 'recover onto the source drive' @(3) @('recover', $dev, '-o', "${letter}:\out", '--allow-mounted')
     if (Test-Path "${letter}:\out") { Fail 'recover wrote onto the drive it rescues' }
 
     # Rescue the way a failing card should be handled: Windows lets go of it.

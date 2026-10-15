@@ -70,7 +70,14 @@ fn home_lists_devices_flags_and_the_other_entries() {
     // The system disk: the warning and its partitions.
     press(&mut app, KeyCode::Down);
     let s = render(&app, 100, 30);
-    contains_all(&s, &["THIS IS THE SYSTEM DISK", "ext4", "mounted at /"]);
+    contains_all(
+        &s,
+        &[
+            "THIS IS THE SYSTEM DISK",
+            "ext4",
+            &format!("mounted at {}", system_root().display()),
+        ],
+    );
     // The other entries explain themselves.
     press(&mut app, KeyCode::Down);
     contains_all(&render(&app, 100, 30), &["A disk image is a file"]);
@@ -183,7 +190,7 @@ fn the_rescue_form_has_good_defaults_and_all_its_fields() {
         &s,
         &[
             "Where should the recovered files be saved?",
-            "DiskRescue/fixture-sdb",
+            &format!("DiskRescue{}fixture-sdb", std::path::MAIN_SEPARATOR),
             "Image file (the copy of the device)",
             "fixture-sdb.img",
             "What do you want back?",

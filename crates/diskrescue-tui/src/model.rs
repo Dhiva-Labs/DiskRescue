@@ -417,6 +417,14 @@ fn split_sentences(text: &str) -> Vec<String> {
     out
 }
 
+/// How to start the terminal app with administrator rights, after "this
+/// device needs administrator rights".
+pub const RESTART_AS_ADMIN: &str = if cfg!(windows) {
+    "Close DiskRescue, open a terminal as administrator (right-click Start, Terminal (Admin)) and run diskrescue-tui there."
+} else {
+    "Close DiskRescue and start it again with: sudo diskrescue-tui"
+};
+
 /// What to do instead, for a blocker.
 pub fn guidance(b: &Blocker, is_root: bool) -> String {
     use BlockerCode::*;
@@ -427,13 +435,16 @@ pub fn guidance(b: &Blocker, is_root: bool) -> String {
             "Even with administrator rights this device cannot be opened. Check that nothing else is using it."
         }
         PermissionDenied => {
-            "Reading a raw device needs administrator rights. Close DiskRescue and start it again with: sudo diskrescue-tui"
+            return format!("Reading a raw device needs administrator rights. {RESTART_AS_ADMIN}");
         }
         SourceUnreadable => {
             "Check that the device is still connected, then press r on the home screen to look again."
         }
         ZeroCapacity => {
             "Nothing can be done in software. A data recovery lab can often still get the data back."
+        }
+        SourceMounted if cfg!(windows) => {
+            "Safest: take it out of use in Disk Management (remove the drive letter of its volume, or set the disk Offline) and try again, so Windows does not write to it. Or continue anyway; the results may then be incomplete."
         }
         SourceMounted => {
             "Safest: eject (unmount) it and try again, so nothing writes to it. Or continue anyway; the results may then be incomplete."

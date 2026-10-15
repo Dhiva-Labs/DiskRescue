@@ -7,7 +7,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use ratatui::Frame;
 
-use crate::model::DeviceEntry;
+use crate::model::{DeviceEntry, RESTART_AS_ADMIN};
 use crate::screens::form::FormKind;
 use crate::widgets::{ellipsize_end, render_list, wrap_words, ListNav, Theme};
 
@@ -241,10 +241,13 @@ impl Menu {
             for l in wrap_words(r, area.width as usize) {
                 lines.push(Line::from(Span::styled(l, theme.bad())));
             }
-        } else if t.needs_root && !it.label.starts_with("Copy") && !it.label.starts_with("Rescue") {
+        } else if t.needs_root
+            && (cfg!(windows) || !it.label.starts_with("Copy") && !it.label.starts_with("Rescue"))
+        {
+            // Only Linux copies can ask for a password from here (pkexec).
             lines.push(Line::raw(""));
             for l in wrap_words(
-                "This device needs administrator rights to read. Close DiskRescue and start it again with: sudo diskrescue-tui",
+                &format!("This device needs administrator rights to read. {RESTART_AS_ADMIN}"),
                 area.width as usize,
             ) {
                 lines.push(Line::from(Span::styled(l, theme.warn())));

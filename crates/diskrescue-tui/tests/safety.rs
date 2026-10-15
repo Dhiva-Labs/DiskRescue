@@ -268,22 +268,23 @@ fn a_device_that_needs_root_says_so_everywhere() {
     app.resize(100, 30);
     app.handle_event(Event::Tick);
     let s = render(&app, 100, 30);
-    contains_all(
-        &s,
-        &[
-            "[needs root]",
-            "needs administrator rights",
-            "sudo diskrescue-tui",
-        ],
-    );
+    // How to get the rights: sudo, or (Windows) a terminal opened as administrator.
+    let how = if cfg!(windows) {
+        "(Admin)"
+    } else {
+        "sudo diskrescue-tui"
+    };
+    contains_all(&s, &["[needs root]", "needs administrator rights", how]);
     // Recover directly cannot run without them: the check explains.
     press(&mut app, KeyCode::Enter);
     press(&mut app, KeyCode::Down);
     press(&mut app, KeyCode::Down);
-    contains_all(
-        &render(&app, 100, 30),
-        &["Close DiskRescue and start it again with: sudo diskrescue-tui"],
-    );
+    let how = if cfg!(windows) {
+        "(Admin)"
+    } else {
+        "Close DiskRescue and start it again with: sudo diskrescue-tui"
+    };
+    contains_all(&render(&app, 100, 30), &[how]);
     press(&mut app, KeyCode::Enter);
     assert_eq!(app.screen_id(), ScreenId::Form);
     app.handle_event(ctrl('s'));

@@ -161,7 +161,28 @@ pub fn file_name(path: &Path) -> String {
 
 /// Make a path absolute without touching the disk.
 pub fn absolute(path: &Path) -> PathBuf {
+    if KEEP_DRIVE_PATHS.with(|k| k.get()) && is_drive_path(path) {
+        return path.to_path_buf();
+    }
     std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+thread_local! {
+    static KEEP_DRIVE_PATHS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Screenshots of the Windows app made on another system: on this thread,
+/// paths such as `C:\Users\Alex` stay as typed instead of being made
+/// absolute below the current folder (which is what a system without drive
+/// letters does with them).
+#[doc(hidden)]
+pub fn keep_drive_paths(on: bool) {
+    KEEP_DRIVE_PATHS.with(|k| k.set(on));
+}
+
+fn is_drive_path(path: &Path) -> bool {
+    let b = path.as_os_str().as_encoded_bytes();
+    b.len() >= 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && matches!(b[2], b'\\' | b'/')
 }
 
 #[cfg(test)]
@@ -180,5 +201,19 @@ mod tests {
     fn names_are_safe() {
         assert_eq!(safe_name("SanDisk/Ultra: 32GB"), "SanDisk_Ultra_ 32GB");
         assert_eq!(safe_name("  ..  "), "drive");
+    }
+
+    #[test]
+    fn drive_paths_are_kept_only_on_request() {
+        let drive = Path::new(r"C:\Users\Alex");
+        if cfg!(not(windows)) {
+            // Without drive letters it is a name below the current folder.
+            assert_ne!(absolute(drive), drive);
+        }
+        keep_drive_paths(true);
+        assert_eq!(absolute(drive), drive);
+        // Other paths are still made absolute.
+        assert!(absolute(Path::new("a.txt")).is_absolute());
+        keep_drive_paths(false);
     }
 }

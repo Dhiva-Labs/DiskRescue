@@ -16,7 +16,7 @@ use crate::event::Event;
 
 /// A device as the system would describe it.
 pub fn device(path: &str, kind: DeviceKind, size: u64) -> DeviceInfo {
-    let name = path.rsplit('/').next().unwrap_or(path).to_string();
+    let name = path.rsplit(['/', '\\']).next().unwrap_or(path).to_string();
     DeviceInfo {
         path: PathBuf::from(path),
         name,
@@ -69,18 +69,29 @@ pub fn failing_usb_stick() -> FixedDevice {
     }
 }
 
+/// Where the running system is mounted: `/`, or the system drive on
+/// Windows.
+pub fn system_root() -> PathBuf {
+    if cfg!(windows) {
+        let drive = std::env::var("SystemDrive").unwrap_or_else(|_| "C:".into());
+        PathBuf::from(format!("{drive}\\"))
+    } else {
+        PathBuf::from("/")
+    }
+}
+
 /// An internal disk that holds the running system.
 pub fn system_disk() -> FixedDevice {
     let mut d = device("/dev/fixture-nvme0n1", DeviceKind::NvmeSsd, 512_110_190_592);
     d.model = Some("Samsung SSD 970".into());
-    d.mountpoints = vec![PathBuf::from("/"), PathBuf::from("/boot/efi")];
+    d.mountpoints = vec![system_root(), PathBuf::from("/boot/efi")];
     d.partitions.push(PartitionInfo {
         path: Some(PathBuf::from("/dev/fixture-nvme0n1p2")),
         number: 2,
         start: 1 << 30,
         size: 500_000_000_000,
         fs_type: Some("ext4".into()),
-        mountpoints: vec![PathBuf::from("/")],
+        mountpoints: vec![system_root()],
     });
     FixedDevice {
         info: d,

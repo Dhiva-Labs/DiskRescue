@@ -133,10 +133,19 @@ pub fn advice(info: &DeviceInfo) -> Vec<String> {
     mps.sort();
     mps.dedup();
     if !mps.is_empty() {
-        out.push(format!(
-            "It is mounted at {}. Unmount (eject) it before copying it, so that nothing writes to it.",
-            mps.join(", ")
-        ));
+        out.push(if cfg!(windows) {
+            format!(
+                "Windows uses it as {}. Take it out of use before copying it, so that Windows does not \
+                 write to it: in Disk Management, choose Offline for the disk (for a USB stick or card, \
+                 remove the drive letter of its volume).",
+                mps.join(", ")
+            )
+        } else {
+            format!(
+                "It is mounted at {}. Unmount (eject) it before copying it, so that nothing writes to it.",
+                mps.join(", ")
+            )
+        });
     }
     if info.read_only {
         out.push(

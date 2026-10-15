@@ -12,8 +12,13 @@
 //! * `IOCTL_DISK_GET_DRIVE_GEOMETRY_EX`: size (works with zero access);
 //!   `IOCTL_DISK_GET_LENGTH_INFO` once the disk is opened for reading.
 //!
-//! Partitions and mountpoints are not collected (a note says so). Reading
-//! uses `FILE_FLAG_NO_BUFFERING` with page-aligned buffers and positional
+//! Mount points are the drive letters (`E:\`) of the volumes that lie on
+//! the drive (`IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS` on every `\\.\X:`,
+//! zero access), so the system drive and drives Windows has in use are
+//! recognised. Partitions and folder mount points are not collected (a note
+//! says so).
+//!
+//! Reading uses `FILE_FLAG_NO_BUFFERING` with page-aligned buffers and positional
 //! `seek_read`; opening for reading needs an elevated process.
 //!
 //! Only `DeviceIoControl` and `GetVolumePathNameW` come from `windows-sys`;
@@ -29,7 +34,7 @@ use std::path::{Path, PathBuf};
 
 use diskrescue_core::device::{DeviceInfo, DeviceKind, Transport};
 use diskrescue_core::{Error, Result};
-use windows_sys::Win32::Storage::FileSystem::GetVolumePathNameW;
+use windows_sys::Win32::Storage::FileSystem::{GetLogicalDrives, GetVolumePathNameW};
 use windows_sys::Win32::System::IO::DeviceIoControl;
 
 use crate::winparse;
@@ -137,7 +142,39 @@ fn drive_number(info: &DeviceInfo) -> Option<u32> {
         .and_then(|d| d.parse().ok())
 }
 
-fn describe_drive(path: &Path, name: &str) -> io::Result<DeviceInfo> {
+/// Physical drive numbers of the volume at `\\.\X:`.
+fn volume_disks(letter: char) -> io::Result<Vec<u32>> {
+    let file = open_query(Path::new(&format!(r"\\.\{letter}:")))?;
+    let mut buf = vec![0u8; 8 + 24 * 64];
+    let got = ioctl(&file, IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS, &[], &mut buf)?;
+    Ok(winparse::parse_volume_disk_extents(&buf[..got]))
+}
+
+/// `(drive number, X:\)` for every drive letter whose volume lies on a
+/// physical drive. Letters without one (optical drives without a disc,
+/// network drives, `subst`) are skipped.
+fn drive_letters() -> Vec<(u32, PathBuf)> {
+    // SAFETY: GetLogicalDrives takes no arguments and only returns a mask.
+    let mask = unsafe { GetLogicalDrives() };
+    let mut out = Vec::new();
+    for i in 0..26u8 {
+        if mask & (1 << i) == 0 {
+            continue;
+        }
+        let letter = char::from(b'A' + i);
+        match volume_disks(letter) {
+            Ok(disks) => {
+                for n in disks {
+                    out.push((n, PathBuf::from(format!(r"{letter}:\"))));
+                }
+            }
+            Err(e) => log::debug!("{letter}: {e}"),
+        }
+    }
+    out
+}
+
+fn describe_drive(path: &Path, name: &str, letters: &[(u32, PathBuf)]) -> io::Result<DeviceInfo> {
     let file = open_query(path)?;
     let desc = query_property(&file, STORAGE_DEVICE_PROPERTY)
         .ok()
@@ -158,7 +195,8 @@ fn describe_drive(path: &Path, name: &str) -> io::Result<DeviceInfo> {
         kind = DeviceKind::Optical;
     }
     let mut warnings = vec![
-        "Windows backend (best effort): partitions and mountpoints are not listed".to_string(),
+        "Windows backend (best effort): partitions are not listed; volumes are shown by drive letter"
+            .to_string(),
     ];
     if size == 0 {
         let mut w = String::from("device reports no capacity: controller failure is likely");
@@ -181,6 +219,14 @@ fn describe_drive(path: &Path, name: &str) -> io::Result<DeviceInfo> {
             ));
         }
     }
+    let number: Option<u32> = name
+        .strip_prefix("PhysicalDrive")
+        .and_then(|d| d.parse().ok());
+    let mountpoints: Vec<PathBuf> = letters
+        .iter()
+        .filter(|(n, _)| Some(*n) == number)
+        .map(|(_, p)| p.clone())
+        .collect();
     Ok(DeviceInfo {
         path: path.to_path_buf(),
         name: name.to_string(),
@@ -198,7 +244,7 @@ fn describe_drive(path: &Path, name: &str) -> io::Result<DeviceInfo> {
         rotational: seek.unwrap_or(false),
         read_only: false,
         partitions: Vec::new(),
-        mountpoints: Vec::new(),
+        mountpoints,
         health: None,
         warnings,
     })
@@ -206,10 +252,11 @@ fn describe_drive(path: &Path, name: &str) -> io::Result<DeviceInfo> {
 
 /// Enumerate `\\.\PhysicalDrive0..63`.
 pub(crate) fn enumerate() -> Result<Vec<DeviceInfo>> {
+    let letters = drive_letters();
     let mut out = Vec::new();
     for n in 0..64u32 {
         let path = drive_path(n);
-        match describe_drive(&path, &format!("PhysicalDrive{n}")) {
+        match describe_drive(&path, &format!("PhysicalDrive{n}"), &letters) {
             Ok(i) => out.push(i),
             Err(e) if e.raw_os_error() == Some(2) => {}
             Err(e) => log::debug!("{}: {e}", path.display()),
@@ -222,7 +269,7 @@ pub(crate) fn enumerate() -> Result<Vec<DeviceInfo>> {
 pub(crate) fn describe(path: &Path) -> Result<DeviceInfo> {
     let s = path.to_string_lossy();
     let name = s.rsplit('\\').next().unwrap_or(&s).to_string();
-    describe_drive(path, &name).map_err(|e| {
+    describe_drive(path, &name, &drive_letters()).map_err(|e| {
         if e.raw_os_error() == Some(2) {
             Error::NotFound(format!("{}: no such device", path.display()))
         } else {

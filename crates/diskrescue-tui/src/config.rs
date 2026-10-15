@@ -80,7 +80,12 @@ impl Config {
             is_root,
             devices: DeviceSource::System,
             opener: Opener::System,
-            elevation: Elevation::Pkexec,
+            // pkexec is Linux only; on Windows the app is started as administrator.
+            elevation: if cfg!(windows) {
+                Elevation::Off
+            } else {
+                Elevation::Pkexec
+            },
         }
     }
 

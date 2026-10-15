@@ -9,4 +9,6 @@ mod gallery;
 mod pages;
 mod repair;
 mod small_window;
+mod store_images;
+mod store_screenshots;
 mod wizard;

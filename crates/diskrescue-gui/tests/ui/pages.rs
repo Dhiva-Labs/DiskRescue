@@ -47,7 +47,11 @@ fn drives_page_shows_cards_badges_and_blocks_the_system_disk() {
     ] {
         assert!(has_label(&h, name), "{name} missing");
     }
-    assert!(has_label(&h, "Mounted"));
+    // A drive in use: "Mounted", or on Windows (a drive letter) "In use".
+    assert!(has_label(
+        &h,
+        if cfg!(windows) { "In use" } else { "Mounted" }
+    ));
     assert!(has_label(&h, "Failing"));
     assert!(has_label(&h, "This is the disk your computer runs from"));
     assert!(enabled(&h, "Rescue SanDisk Ultra"));

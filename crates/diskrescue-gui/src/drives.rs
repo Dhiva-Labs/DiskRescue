@@ -389,14 +389,25 @@ fn badges(ui: &mut Ui, e: &DeviceEntry) {
         ));
     }
     if e.mounted() && !e.system {
-        list.push((
-            "Mounted",
-            Kind::Warn,
-            Some(
-                "The system is using this drive. Unmount it in your file manager before rescuing, \
-                 so that nothing writes to it.",
-            ),
-        ));
+        list.push(if cfg!(windows) {
+            (
+                "In use",
+                Kind::Warn,
+                Some(
+                    "Windows is using this drive (it has a drive letter). Take it out of use before \
+                     rescuing, so that Windows does not write to it.",
+                ),
+            )
+        } else {
+            (
+                "Mounted",
+                Kind::Warn,
+                Some(
+                    "The system is using this drive. Unmount it in your file manager before \
+                     rescuing, so that nothing writes to it.",
+                ),
+            )
+        });
     }
     if e.info.read_only {
         list.push(("Read-only", Kind::Info, None));
