@@ -123,6 +123,9 @@ assign letter=$letter
     $dcim = "${letter}:\DCIM\100TEST"
     New-Item -ItemType Directory -Force $dcim | Out-Null
     Copy-Item "$work\media\*" $dcim
+    # Written to the disk before two are deleted: a file deleted while its
+    # data is still only in Windows' cache never reaches the disk at all.
+    Write-VolumeCache -DriveLetter $letter
     Remove-Item "$dcim\IMG_0002.JPG", "$dcim\VID_0002.MP4"
     Write-VolumeCache -DriveLetter $letter
     $n = (Get-Partition -DriveLetter $letter).DiskNumber
