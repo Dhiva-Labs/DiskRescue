@@ -1050,7 +1050,7 @@ dependencies = [
 
 [[package]]
 name = "diskrescue"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "clap",
  "crossterm",
@@ -1078,7 +1078,7 @@ dependencies = [
 
 [[package]]
 name = "diskrescue-app"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "diskrescue-core",
  "diskrescue-device",
@@ -1101,7 +1101,7 @@ dependencies = [
 
 [[package]]
 name = "diskrescue-carve"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "aho-corasick",
  "blake3",
@@ -1123,7 +1123,7 @@ dependencies = [
 
 [[package]]
 name = "diskrescue-core"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "blake3",
  "log",
@@ -1135,7 +1135,7 @@ dependencies = [
 
 [[package]]
 name = "diskrescue-device"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "diskrescue-core",
  "libc",
@@ -1149,7 +1149,7 @@ dependencies = [
 
 [[package]]
 name = "diskrescue-ext4"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "diskrescue-core",
  "log",
@@ -1161,7 +1161,7 @@ dependencies = [
 
 [[package]]
 name = "diskrescue-fat"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "diskrescue-core",
  "diskrescue-fixtures",
@@ -1174,7 +1174,7 @@ dependencies = [
 
 [[package]]
 name = "diskrescue-fixtures"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "crc32fast",
  "diskrescue-core",
@@ -1189,7 +1189,7 @@ dependencies = [
 
 [[package]]
 name = "diskrescue-gui"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "color_quant",
  "diskrescue-app",
@@ -1213,7 +1213,7 @@ dependencies = [
 
 [[package]]
 name = "diskrescue-imaging"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "diskrescue-core",
  "libc",
@@ -1227,7 +1227,7 @@ dependencies = [
 
 [[package]]
 name = "diskrescue-isobmff"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "diskrescue-core",
  "log",
@@ -1239,7 +1239,7 @@ dependencies = [
 
 [[package]]
 name = "diskrescue-jpeg"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "diskrescue-core",
  "image",
@@ -1254,7 +1254,7 @@ dependencies = [
 
 [[package]]
 name = "diskrescue-ntfs"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "diskrescue-core",
  "log",
@@ -1266,7 +1266,7 @@ dependencies = [
 
 [[package]]
 name = "diskrescue-partition"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "crc32fast",
  "diskrescue-core",
@@ -1280,7 +1280,7 @@ dependencies = [
 
 [[package]]
 name = "diskrescue-png"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "crc32fast",
  "diskrescue-core",
@@ -1295,7 +1295,7 @@ dependencies = [
 
 [[package]]
 name = "diskrescue-recover"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "blake3",
  "diskrescue-carve",
@@ -1322,7 +1322,7 @@ dependencies = [
 
 [[package]]
 name = "diskrescue-stills"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "diskrescue-core",
  "diskrescue-fixtures",
@@ -1336,7 +1336,7 @@ dependencies = [
 
 [[package]]
 name = "diskrescue-tui"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "crossterm",
  "ctrlc",
@@ -1353,7 +1353,7 @@ dependencies = [
 
 [[package]]
 name = "diskrescue-video"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "diskrescue-core",
  "log",
