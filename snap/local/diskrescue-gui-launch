@@ -15,4 +15,9 @@ if [ -n "$v" ] && [ "$(printf '%s\n2.39\n' "$v" | sort -V | head -n1)" = "2.39" 
     exec "$bin" "$@"
 fi
 core=/snap/core24/current
-exec "$core/lib64/ld-linux-x86-64.so.2" --library-path "$core/lib/x86_64-linux-gnu" "$bin" "$@"
+case "$(uname -m)" in
+    x86_64)  loader=lib64/ld-linux-x86-64.so.2; libs=lib/x86_64-linux-gnu ;;
+    aarch64) loader=lib/aarch64-linux-gnu/ld-linux-aarch64.so.1; libs=lib/aarch64-linux-gnu ;;
+    *) echo "diskrescue-gui: unsupported architecture $(uname -m)" >&2; exit 1 ;;
+esac
+exec "$core/$loader" --library-path "$core/$libs" "$bin" "$@"
