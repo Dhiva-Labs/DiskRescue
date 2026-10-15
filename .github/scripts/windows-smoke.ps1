@@ -39,9 +39,11 @@ function Run([string]$what, [int[]]$expect, [string[]]$argv) {
     }
 }
 
-function Diskpart([string]$name, [string]$script) {
+# (Not named Diskpart: PowerShell names ignore case and functions come before
+# programs, so "diskpart" inside it would call itself.)
+function Invoke-Diskpart([string]$name, [string]$script) {
     Set-Content -Encoding ascii -Path "$work\$name.txt" -Value $script
-    diskpart /s "$work\$name.txt" | Out-Host
+    diskpart.exe /s "$work\$name.txt" | Out-Host
     if ($LASTEXITCODE) { throw "diskpart $name failed ($LASTEXITCODE)" }
 }
 
@@ -109,7 +111,7 @@ Get-ChildItem "$work\media" | Format-Table Name, Length | Out-Host
 
 try {
     # ------------------------------------------------------------ the card
-    Diskpart 'attach' @"
+    Invoke-Diskpart 'attach' @"
 create vdisk file="$vhd" maximum=128 type=fixed
 select vdisk file="$vhd"
 attach vdisk
@@ -121,6 +123,9 @@ assign letter=$letter
     $dcim = "${letter}:\DCIM\100TEST"
     New-Item -ItemType Directory -Force $dcim | Out-Null
     Copy-Item "$work\media\*" $dcim
+    # Written to the disk before two are deleted: a file deleted while its
+    # data is still only in Windows' cache never reaches the disk at all.
+    Write-VolumeCache -DriveLetter $letter
     Remove-Item "$dcim\IMG_0002.JPG", "$dcim\VID_0002.MP4"
     Write-VolumeCache -DriveLetter $letter
     $n = (Get-Partition -DriveLetter $letter).DiskNumber
@@ -189,7 +194,7 @@ assign letter=$letter
     }
 } finally {
     if (Get-DiskImage -ImagePath $vhd -ErrorAction SilentlyContinue | Where-Object Attached) {
-        Diskpart 'detach' @"
+        Invoke-Diskpart 'detach' @"
 select vdisk file="$vhd"
 detach vdisk
 "@
