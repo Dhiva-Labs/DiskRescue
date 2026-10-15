@@ -220,9 +220,10 @@ jobs:
             file "$d/bin/$b" | grep -q 'ARM aarch64'
           done
           # The programs patched onto core24 must name core24's aarch64 loader.
-          readelf -l "$d/bin/diskrescue" | grep -i 'interpreter'
-          readelf -l "$d/bin/diskrescue" | grep -q 'ld-linux-aarch64.so.1'
-      - name: install the snap and start all three programs
+          for b in diskrescue diskrescue-tui; do
+            readelf -l "$d/bin/$b" | grep -q 'Requesting program interpreter: /snap/core24/current/lib/ld-linux-aarch64.so.1'
+          done
+      - name: install the snap and run its programs
         run: .github/scripts/snap-smoke.sh "${{ steps.snapcraft.outputs.snap }}"
       - uses: actions/upload-artifact@v4
         with:

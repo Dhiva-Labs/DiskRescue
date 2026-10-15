@@ -37,8 +37,10 @@ done
 run_gui() {
     local log=$1 status=0
     shift
-    "$@" xvfb-run -a timeout 10 diskrescue.gui 2>"$log" || status=$?
-    tail -n 20 "$log"
+    # xvfb-run sends the program's stderr to its stdout, so capture both.
+    "$@" xvfb-run -a timeout 10 diskrescue.gui >"$log" 2>&1 || status=$?
+    # What the program itself printed (not the loader trace).
+    grep -Ev '^ *[0-9]+:' "$log" | tail -n 20 || true
     test "$status" -eq 124 || { echo "diskrescue.gui exited early with status $status"; exit 1; }
 }
 
