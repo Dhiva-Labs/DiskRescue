@@ -42,7 +42,8 @@ jobs:
     # Builds with MSVC, runs the test suite (tests whose fixture tools are
     # Linux-only skip themselves), then rescues a FAT32 VHDX through
     # \\.\PhysicalDriveN: listing, the output-on-source guard, raw imaging,
-    # recovery of existing and deleted photos and videos, and the desktop app.
+    # recovery of existing and deleted photos and videos, and the desktop app;
+    # then the same again through the installed Microsoft Store package.
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -61,6 +62,38 @@ jobs:
           if (-not (Get-Command ffmpeg -ErrorAction SilentlyContinue)) { choco install ffmpeg -y --no-progress }
       - name: virtual disk end-to-end
         run: .github/scripts/windows-smoke.ps1 -Bin target\release
+      - name: install the Microsoft Store package
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $pub = 'CN=DiskRescue CI'
+          $msix = "$env:RUNNER_TEMP\diskrescue-ci.msix"
+          & .\packaging\windows\msix\build-msix.ps1 -Name 'DiskRescue.CI' -Publisher $pub -Out $msix
+          # A throwaway certificate, trusted on this CI machine only, to install it.
+          $cert = New-SelfSignedCertificate -Type CodeSigningCert -Subject $pub -CertStoreLocation Cert:\CurrentUser\My -TextExtension @('2.5.29.19={text}')
+          $pw = ConvertTo-SecureString -String 'ci' -Force -AsPlainText
+          $pfx = "$env:RUNNER_TEMP\ci.pfx"
+          Export-PfxCertificate -Cert $cert -FilePath $pfx -Password $pw | Out-Null
+          Import-PfxCertificate -FilePath $pfx -CertStoreLocation Cert:\LocalMachine\TrustedPeople -Password $pw | Out-Null
+          $signtool = (Get-ChildItem 'C:\Program Files (x86)\Windows Kits\10\bin\10.*\x64\signtool.exe' | Sort-Object FullName -Descending | Select-Object -First 1).FullName
+          & $signtool sign /fd SHA256 /f $pfx /p ci $msix
+          if ($LASTEXITCODE) { throw 'signing failed' }
+          Add-AppxPackage $msix
+          "installed $((Get-AppxPackage DiskRescue.CI).PackageFullName)"
+      - name: virtual disk end-to-end, inside the package
+        run: |
+          $version = (Select-String -Path Cargo.toml -Pattern '^version = "(.+)"').Matches[0].Groups[1].Value
+          $aliases = "$env:LOCALAPPDATA\Microsoft\WindowsApps"
+          foreach ($tool in 'diskrescue', 'diskrescue-tui') {
+            $out = & "$aliases\$tool.exe" --version | Out-String
+            if ($LASTEXITCODE -or $out -notmatch [regex]::Escape($version)) { throw "$tool --version through the alias: '$out'" }
+            "$tool alias: $($out.Trim())"
+          }
+          .github/scripts/windows-smoke.ps1 -Packaged -Work C:\drsmoke-msix
+      - name: remove the package
+        if: always()
+        shell: powershell
+        run: Get-AppxPackage DiskRescue.CI | Remove-AppxPackage
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -68,6 +101,7 @@ jobs:
           path: |
             C:\drsmoke\gui.png
             C:\drsmoke\out-device\report.txt
+            C:\drsmoke-msix\gui.png
           if-no-files-found: ignore
 
   musl-build:

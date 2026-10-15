@@ -8,13 +8,18 @@
 # Pillow and ffmpeg on PATH.
 #
 #   .github/scripts/windows-smoke.ps1 -Bin target\release
+#
+# With -Packaged it runs the installed Microsoft Store package instead,
+# through its command aliases (so with the package's identity).
 
-param([Parameter(Mandatory)][string]$Bin)
+param([string]$Bin, [switch]$Packaged, [string]$Work = 'C:\drsmoke')
 
 $ErrorActionPreference = 'Stop'
+if ($Packaged) { $Bin = "$env:LOCALAPPDATA\Microsoft\WindowsApps" }
+elseif (-not $Bin) { throw 'pass -Bin <folder with the .exe files> or -Packaged' }
 $cli = (Resolve-Path (Join-Path $Bin 'diskrescue.exe')).Path
 $gui = (Resolve-Path (Join-Path $Bin 'diskrescue-gui.exe')).Path
-$work = 'C:\drsmoke'
+$work = $Work
 $vhd = "$work\card.vhdx"
 $letter = 'R'
 $failures = [System.Collections.Generic.List[string]]::new()
@@ -61,7 +66,8 @@ function Check-Recovered([string]$out, [string]$label) {
 }
 
 # The C runtime is linked in (.cargo/config.toml): no VCRUNTIME140.dll import.
-foreach ($exe in Get-ChildItem (Join-Path $Bin 'diskrescue*.exe')) {
+# (The package's aliases are links, not the programs.)
+foreach ($exe in Get-ChildItem (Join-Path $Bin 'diskrescue*.exe') | Where-Object { -not $Packaged }) {
     $text = [System.Text.Encoding]::ASCII.GetString([System.IO.File]::ReadAllBytes($exe.FullName))
     if ($text.IndexOf('vcruntime140', [System.StringComparison]::OrdinalIgnoreCase) -ge 0) {
         Fail "$($exe.Name) needs the Visual C++ Redistributable (VCRUNTIME140.dll)"

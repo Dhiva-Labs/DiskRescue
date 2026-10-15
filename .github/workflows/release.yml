@@ -32,6 +32,16 @@ jobs:
           name: windows
           path: diskrescue-*-x86_64-windows.zip
           if-no-files-found: error
+      # The Microsoft Store package, for uploading in Partner Center (the Store
+      # signs it; it is not attached to the GitHub release).
+      - name: Microsoft Store package
+        shell: powershell
+        run: packaging\windows\msix\build-msix.ps1 -Out "dist\DiskRescue-$($env:GITHUB_REF_NAME.TrimStart('v'))-x64.msix"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: microsoft-store
+          path: dist/*.msix
+          if-no-files-found: error
 
   release:
     name: build binaries + .deb + GitHub release

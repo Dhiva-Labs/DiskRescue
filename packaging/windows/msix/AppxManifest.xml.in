@@ -1,0 +1,91 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Microsoft Store package. build-msix.ps1 fills in @NAME@, @PUBLISHER@ and @VERSION@. -->
+<Package
+  xmlns="http://schemas.microsoft.com/appx/manifest/foundation/windows10"
+  xmlns:uap="http://schemas.microsoft.com/appx/manifest/uap/windows10"
+  xmlns:uap5="http://schemas.microsoft.com/appx/manifest/uap/windows10/5"
+  xmlns:desktop4="http://schemas.microsoft.com/appx/manifest/desktop/windows10/4"
+  xmlns:rescap="http://schemas.microsoft.com/appx/manifest/foundation/windows10/restrictedcapabilities"
+  IgnorableNamespaces="uap uap5 desktop4 rescap">
+
+  <Identity Name="@NAME@" Publisher="@PUBLISHER@" Version="@VERSION@" ProcessorArchitecture="x64" />
+
+  <Properties>
+    <DisplayName>DiskRescue</DisplayName>
+    <PublisherDisplayName>Dhiva-Labs</PublisherDisplayName>
+    <Logo>Assets\StoreLogo.png</Logo>
+  </Properties>
+
+  <Dependencies>
+    <!-- allowElevation needs Windows 10 1809 or later. -->
+    <TargetDeviceFamily Name="Windows.Desktop" MinVersion="10.0.17763.0" MaxVersionTested="10.0.26100.0" />
+  </Dependencies>
+
+  <Resources>
+    <Resource Language="en-us" />
+  </Resources>
+
+  <Applications>
+    <!-- The desktop app. Reading a whole drive needs administrator rights: it
+         then restarts itself through the UAC prompt (allowElevation). -->
+    <Application Id="DiskRescue" Executable="diskrescue-gui.exe" EntryPoint="Windows.FullTrustApplication">
+      <uap:VisualElements
+        DisplayName="DiskRescue"
+        Description="Recover photos and videos from failing or formatted SD cards, USB drives and disks, and repair damaged ones."
+        BackgroundColor="transparent"
+        Square150x150Logo="Assets\Square150x150Logo.png"
+        Square44x44Logo="Assets\Square44x44Logo.png">
+        <uap:DefaultTile Wide310x150Logo="Assets\Wide310x150Logo.png" />
+      </uap:VisualElements>
+      <Extensions>
+        <uap5:Extension Category="windows.appExecutionAlias" Executable="diskrescue-gui.exe" EntryPoint="Windows.FullTrustApplication">
+          <uap5:AppExecutionAlias>
+            <uap5:ExecutionAlias Alias="diskrescue-gui.exe" />
+          </uap5:AppExecutionAlias>
+        </uap5:Extension>
+      </Extensions>
+    </Application>
+
+    <!-- `diskrescue` and `diskrescue-tui` in a terminal (not in the Start menu). -->
+    <Application Id="DiskRescueCli" Executable="diskrescue.exe" EntryPoint="Windows.FullTrustApplication"
+      desktop4:Subsystem="console" desktop4:SupportsMultipleInstances="true">
+      <uap:VisualElements
+        DisplayName="DiskRescue (command line)"
+        Description="DiskRescue's command-line program."
+        BackgroundColor="transparent"
+        Square150x150Logo="Assets\Square150x150Logo.png"
+        Square44x44Logo="Assets\Square44x44Logo.png"
+        AppListEntry="none" />
+      <Extensions>
+        <uap5:Extension Category="windows.appExecutionAlias" Executable="diskrescue.exe" EntryPoint="Windows.FullTrustApplication">
+          <uap5:AppExecutionAlias desktop4:Subsystem="console">
+            <uap5:ExecutionAlias Alias="diskrescue.exe" />
+          </uap5:AppExecutionAlias>
+        </uap5:Extension>
+      </Extensions>
+    </Application>
+    <Application Id="DiskRescueTui" Executable="diskrescue-tui.exe" EntryPoint="Windows.FullTrustApplication"
+      desktop4:Subsystem="console" desktop4:SupportsMultipleInstances="true">
+      <uap:VisualElements
+        DisplayName="DiskRescue (terminal)"
+        Description="DiskRescue's interactive terminal app."
+        BackgroundColor="transparent"
+        Square150x150Logo="Assets\Square150x150Logo.png"
+        Square44x44Logo="Assets\Square44x44Logo.png"
+        AppListEntry="none" />
+      <Extensions>
+        <uap5:Extension Category="windows.appExecutionAlias" Executable="diskrescue-tui.exe" EntryPoint="Windows.FullTrustApplication">
+          <uap5:AppExecutionAlias desktop4:Subsystem="console">
+            <uap5:ExecutionAlias Alias="diskrescue-tui.exe" />
+          </uap5:AppExecutionAlias>
+        </uap5:Extension>
+      </Extensions>
+    </Application>
+  </Applications>
+
+  <Capabilities>
+    <rescap:Capability Name="runFullTrust" />
+    <!-- Raw reads of \\.\PhysicalDriveN need an elevated process. -->
+    <rescap:Capability Name="allowElevation" />
+  </Capabilities>
+</Package>
