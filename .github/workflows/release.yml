@@ -156,7 +156,9 @@ jobs:
         # Its dependencies must resolve on this architecture, the installed
         # programs must run, and the desktop app must open a window.
         run: |
-          sudo apt-get install -y ./diskrescue_${VERSION}_${{ matrix.deb }}.deb xvfb mesa-vulkan-drivers libgl1-mesa-dri libegl1
+          # The libraries every desktop has, which the desktop app loads at run time.
+          sudo apt-get install -y ./diskrescue_${VERSION}_${{ matrix.deb }}.deb xvfb libxcursor1 libxi6 libxrandr2 \
+            libxkbcommon-x11-0 libx11-xcb1 libgl1 libegl1 libgl1-mesa-dri libvulkan1 mesa-vulkan-drivers
           diskrescue --version
           diskrescue-tui --version
           status=0

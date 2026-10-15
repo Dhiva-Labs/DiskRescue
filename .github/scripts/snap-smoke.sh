@@ -51,7 +51,7 @@ fi
 
 echo "== desktop app, core24 loader =="
 fake=$(mktemp -d)
-printf '#!/bin/sh\necho "GNU_LIBC_VERSION glibc 2.35"\n' > "$fake/getconf"
+printf '#!/bin/sh\necho "glibc 2.35"\n' > "$fake/getconf"
 chmod +x "$fake/getconf"
 log=$(mktemp)
 run_gui "$log" env LD_DEBUG=libs "PATH=$fake:$PATH"
