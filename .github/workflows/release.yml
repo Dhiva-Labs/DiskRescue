@@ -9,37 +9,55 @@ permissions:
 
 jobs:
   windows:
-    name: Windows binaries
-    runs-on: windows-latest
+    name: Windows binaries (${{ matrix.arch }})
+    # Each architecture is built natively (ARM64 on Windows 11 on ARM).
+    strategy:
+      matrix:
+        include:
+          - arch: x64
+            os: windows-latest
+            triple: x86_64
+          - arch: arm64
+            os: windows-11-arm
+            triple: aarch64
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
+      - name: Install rustup (the ARM image has none)
+        run: |
+          if (-not (Get-Command rustup -ErrorAction SilentlyContinue)) {
+            $init = "$env:RUNNER_TEMP\rustup-init.exe"
+            Invoke-WebRequest "https://static.rust-lang.org/rustup/dist/aarch64-pc-windows-msvc/rustup-init.exe" -OutFile $init
+            & $init -y --default-toolchain none --profile minimal
+            "$env:USERPROFILE\.cargo\bin" | Out-File -Append -Encoding utf8 $env:GITHUB_PATH
+          }
       - name: Install toolchain (rust-toolchain.toml)
         run: rustup show
       - uses: Swatinem/rust-cache@v2
         with:
-          key: release-windows
+          key: release-windows-${{ matrix.arch }}
       - name: build
         run: cargo build --release -p diskrescue -p diskrescue-tui -p diskrescue-gui
       - name: package
         run: |
-          $name = "diskrescue-$env:GITHUB_REF_NAME-x86_64-windows"
+          $name = "diskrescue-$env:GITHUB_REF_NAME-${{ matrix.triple }}-windows"
           New-Item -ItemType Directory $name | Out-Null
           Copy-Item target\release\diskrescue.exe, target\release\diskrescue-tui.exe, `
             target\release\diskrescue-gui.exe, LICENSE, README.md, docs\USAGE.md $name
           Compress-Archive -Path $name -DestinationPath "$name.zip"
       - uses: actions/upload-artifact@v4
         with:
-          name: windows
-          path: diskrescue-*-x86_64-windows.zip
+          name: windows-${{ matrix.arch }}
+          path: diskrescue-*-windows.zip
           if-no-files-found: error
       # The Microsoft Store package, for uploading in Partner Center (the Store
       # signs it; it is not attached to the GitHub release).
       - name: Microsoft Store package
         shell: powershell
-        run: packaging\windows\msix\build-msix.ps1 -Out "dist\DiskRescue-$($env:GITHUB_REF_NAME.TrimStart('v'))-x64.msix"
+        run: packaging\windows\msix\build-msix.ps1 -Arch ${{ matrix.arch }} -Out "dist\DiskRescue-$($env:GITHUB_REF_NAME.TrimStart('v'))-${{ matrix.arch }}.msix"
       - uses: actions/upload-artifact@v4
         with:
-          name: microsoft-store
+          name: microsoft-store-${{ matrix.arch }}
           path: dist/*.msix
           if-no-files-found: error
 
@@ -64,7 +82,8 @@ jobs:
           cargo build --release -p diskrescue-gui
       - uses: actions/download-artifact@v4
         with:
-          name: windows
+          pattern: windows-*
+          merge-multiple: true
       - name: package
         run: |
           VERSION=${GITHUB_REF_NAME#v}
@@ -81,7 +100,7 @@ jobs:
             LICENSE README.md docs/USAGE.md "$NAME/"
           tar czf "$NAME.tar.gz" "$NAME"
           packaging/deb/build-deb.sh "$VERSION" "$CLI" "$TUI" "$GUI" .
-          sha256sum "$NAME.tar.gz" "diskrescue_${VERSION}_amd64.deb" diskrescue-*-x86_64-windows.zip > SHA256SUMS
+          sha256sum "$NAME.tar.gz" "diskrescue_${VERSION}_amd64.deb" diskrescue-*-windows.zip > SHA256SUMS
       - name: release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -89,4 +108,4 @@ jobs:
           NOTES=".github/release-notes/${GITHUB_REF_NAME}.md"
           if [ -f "$NOTES" ]; then set -- --notes-file "$NOTES"; else set -- --generate-notes; fi
           gh release create "$GITHUB_REF_NAME" --title "DiskRescue $GITHUB_REF_NAME" "$@" \
-            diskrescue-*.tar.gz diskrescue-*-x86_64-windows.zip diskrescue_*_amd64.deb SHA256SUMS
+            diskrescue-*.tar.gz diskrescue-*-windows.zip diskrescue_*_amd64.deb SHA256SUMS

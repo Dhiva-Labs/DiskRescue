@@ -92,7 +92,8 @@ zero-filled, never invented), what was repaired and how.
 
 **Windows:** DiskRescue is in the [Microsoft Store](https://apps.microsoft.com/detail/9NS2VVPWDM9T) (paid): signed,
 updated by the Store, and it adds the `diskrescue` and `diskrescue-tui` commands. The
-releases page also has `diskrescue-<version>-x86_64-windows.zip` with the
+releases page also has `diskrescue-<version>-x86_64-windows.zip` (most PCs)
+and `diskrescue-<version>-aarch64-windows.zip` (Windows on ARM) with the
 three programs; they are not signed, so SmartScreen or Smart App Control may
 warn about them or block them. When a drive needs administrator rights, the
 desktop app offers to restart itself with them (a UAC prompt).

@@ -1,8 +1,10 @@
 # Microsoft Store listing (Partner Center)
 
 The text entered in Partner Center for DiskRescue, kept here for future updates.
-The package comes from the release workflow (artifact `microsoft-store`,
-`DiskRescue-<version>-x64.msix`); `make-assets.py` renders the images.
+The packages come from the release workflow (artifacts `microsoft-store-x64`
+and `microsoft-store-arm64`: `DiskRescue-<version>-x64.msix` and
+`DiskRescue-<version>-arm64.msix`, both uploaded to the same submission);
+`make-assets.py` renders the images.
 
 ## Pricing and availability
 
@@ -19,8 +21,9 @@ The package comes from the release workflow (artifact `microsoft-store`,
 - Website: <https://github.com/Dhiva-Labs/DiskRescue>
 - Support contact: reachout@dhivalabs.com
 - Product declarations: installs to alternate drives allowed.
-- System requirements: Windows 10 version 1809 or later, 64-bit. Reading a whole
-  drive needs an administrator account (or an administrator's password).
+- System requirements: Windows 10 version 1809 or later, on an x64 or ARM64 PC
+  (native on both). Reading a whole drive needs an administrator account (or
+  an administrator's password).
 
 ## Store listing (English, United States)
 
@@ -46,7 +49,7 @@ Pick the drive, press Rescue, and browse your photos as they come back. Everythi
 
 DiskRescue is open source (MIT) at github.com/Dhiva-Labs/DiskRescue.
 
-**What's new in this version:** First Windows release.
+**What's new in this version:** First Windows release, native on x64 and ARM64 PCs.
 
 **Product features:**
 
