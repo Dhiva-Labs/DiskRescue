@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.2.1 (2026-10-15)
+
+- Windows on ARM: native ARM64 builds, as a zip on the releases page and as a
+  Microsoft Store package next to the x64 one. CI builds and tests them on
+  Windows 11 on ARM (the test suite, the virtual-disk rescue and the
+  installed Store package), like x64. Nothing changes on Linux.
+
 ## 0.2.0 (2026-10-15)
 
 Windows support.
