@@ -7,9 +7,11 @@
 //! that owns a page-aligned buffer, so `O_DIRECT` alignment of the memory
 //! is always satisfied and a hung `pread` costs a thread, not the caller.
 //! The caller's offset and length must be multiples of
-//! [`Source::sector_size`] when direct I/O is in effect
-//! ([`Source::requires_alignment`]); misaligned requests are rejected with
-//! `Unaligned` before reaching the kernel.
+//! [`Source::sector_size`] when direct I/O is in effect, and always for a
+//! Windows disk, which rejects unaligned reads of `\\.\PhysicalDriveN`
+//! even without `FILE_FLAG_NO_BUFFERING` ([`Source::requires_alignment`]);
+//! misaligned requests are rejected with `Unaligned` before reaching the
+//! kernel.
 //!
 //! Errors are classified as follows:
 //!
@@ -894,6 +896,14 @@ impl DeviceSource {
         self.direct.load(Ordering::SeqCst)
     }
 
+    /// Reads must be whole sectors: under direct I/O, and always for a
+    /// Windows disk (buffered reads of `\\.\PhysicalDriveN` that are not
+    /// sector aligned fail with ERROR_INVALID_PARAMETER, which looked like
+    /// unreadable sectors at the end of every file).
+    fn aligned_reads(&self) -> bool {
+        self.direct_io() || (cfg!(windows) && self.is_block)
+    }
+
     /// True for block devices, false for image files opened through
     /// [`crate::open_device`].
     pub fn is_block_device(&self) -> bool {
@@ -1166,13 +1176,13 @@ impl Source for DeviceSource {
                 ),
             ));
         }
-        let direct = self.direct_io();
+        let aligned = self.aligned_reads();
         let sector = self.sector as u64;
-        if direct && (offset % sector != 0 || buf.len() as u64 % sector != 0) {
+        if aligned && (offset % sector != 0 || buf.len() as u64 % sector != 0) {
             return Err(ReadError::unaligned(offset, buf.len(), self.sector));
         }
         let want = (self.size - offset).min(buf.len() as u64) as usize;
-        let job = if direct {
+        let job = if aligned {
             (want as u64).div_ceil(sector) as usize * sector as usize
         } else {
             want
@@ -1249,7 +1259,7 @@ impl Source for DeviceSource {
     }
 
     fn requires_alignment(&self) -> bool {
-        self.direct_io()
+        self.aligned_reads()
     }
 
     fn reopen(&self) -> std::result::Result<(), ReadError> {
