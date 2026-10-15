@@ -90,7 +90,16 @@ zero-filled, never invented), what was repaired and how.
 
 ## Install
 
-Download the binaries from the releases page, or build them:
+**Windows:** DiskRescue is in the Microsoft Store (paid): signed, updated by
+the Store, and it adds the `diskrescue` and `diskrescue-tui` commands. The
+releases page also has `diskrescue-<version>-x86_64-windows.zip` with the
+three programs; they are not signed, so SmartScreen or Smart App Control may
+warn about them or block them. When a drive needs administrator rights, the
+desktop app offers to restart itself with them (a UAC prompt).
+
+**Linux:** download the `.deb` or the tarball from the releases page.
+
+**From source:**
 
 ```
 cargo build --release -p diskrescue -p diskrescue-tui -p diskrescue-gui
@@ -99,8 +108,8 @@ cargo build --release -p diskrescue -p diskrescue-tui -p diskrescue-gui
 They land in `target/release/`. Keep `diskrescue` next to `diskrescue-gui`:
 the desktop app uses it to copy drives with administrator rights.
 
-Reading raw devices needs administrator rights. The desktop app asks for them
-when it needs them (a system password prompt through pkexec); in a terminal
+Reading raw devices needs administrator rights. On Linux the desktop app asks
+for them when it needs them (a system password prompt through pkexec); in a terminal
 run `sudo diskrescue-tui` or `sudo diskrescue ...`, or add yourself to the
 `disk` group. Image files and repairs need no special rights. On Linux,
 `packaging/linux/diskrescue.desktop` adds the app to your applications menu.
@@ -111,13 +120,16 @@ run `sudo diskrescue-tui` or `sudo diskrescue ...`, or add yourself to the
   (SD card asks to be formatted, pen drive disconnects, clicking hard disk,
   SSD, deleted photos, video will not play).
 - `docs/ARCHITECTURE.md`: how it is built.
+- `PRIVACY.md`: DiskRescue works offline and sends nothing anywhere.
 - `docs/specs/`: the on-disk formats and algorithms it implements.
 
 ## Limits
 
 - Tested extensively on synthetic images, simulated failing devices and
   generated media; not yet on real failing hardware or real camera RAW files.
-- Windows device access compiles but has not been run on Windows.
+- On Windows, every release is tested end to end on a virtual disk (listing,
+  imaging, recovery of existing and deleted files, the desktop app, the
+  Microsoft Store package), but not yet on real failing hardware.
 - The desktop app has been tested offscreen (every page is driven by
   automated UI tests and rendered headless) but not yet on many real desktops.
 - Deleted files on SSDs are usually erased by TRIM within minutes; recovering
