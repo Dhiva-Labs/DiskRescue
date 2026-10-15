@@ -1,3 +1,13 @@
+diskrescue (0.2.0~noble1) noble; urgency=medium
+
+  * Windows support: drive letters, so the system disk and drives in use are
+    recognised; Microsoft Store package.
+  * Repaired copies always stay inside the output folder.
+  * Progress maps of badly damaged drives with 4 KiB sectors load in linear
+    time.
+
+ -- Dhiva Labs <dhivakar1010@gmail.com>  Thu, 15 Oct 2026 06:57:14 +0000
+
 diskrescue (0.1.0~noble1) noble; urgency=medium
 
   * Initial release.

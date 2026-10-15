@@ -1,5 +1,31 @@
 # Changelog
 
+## 0.2.0 (2026-10-15)
+
+Windows support.
+
+- Windows builds: the drive list shows drive letters, so the drive Windows
+  runs from is marked as the system disk and a drive in use is refused
+  unless `--allow-mounted` is given; messages say how to take a drive out of
+  use on Windows. The `.exe` files link the C runtime statically and need no
+  Visual C++ Redistributable.
+- The desktop app offers "Restart as administrator" (the UAC prompt) when a
+  drive needs administrator rights on Windows; the desktop and terminal apps
+  give Windows advice (Disk Management, a terminal opened as administrator)
+  instead of Linux's (unmount, sudo).
+- Microsoft Store package: the desktop app plus the `diskrescue` and
+  `diskrescue-tui` commands. Releases also attach a Windows zip.
+- Every change is tested on Windows: the test suite, and a rescue of a FAT32
+  virtual disk through `\\.\PhysicalDriveN` (listing, in-use and
+  output-on-source guards, raw image, byte-exact recovery of existing and
+  deleted photos and videos, the desktop app), also from the installed
+  Store package.
+- Fix: a repaired copy could be written outside the output folder when the
+  file's recorded path was rooted or drive-relative (Windows) or contained
+  `..`; only plain folder names are kept now.
+- Fix: loading the progress map of a badly damaged drive with 4 KiB sectors
+  took seconds (quadratic joining of sub-sector blocks); it is now linear.
+
 ## 0.1.0 (2026-10-13)
 
 First version.
