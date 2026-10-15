@@ -38,24 +38,54 @@ jobs:
         run: env -u DISPLAY -u WAYLAND_DISPLAY cargo test --workspace --no-fail-fast
 
   windows:
-    name: windows build + test + virtual disk
+    name: windows ${{ matrix.arch }} build + test + virtual disk
     # Builds with MSVC, runs the test suite (tests whose fixture tools are
     # Linux-only skip themselves), then rescues a FAT32 VHDX through
     # \\.\PhysicalDriveN: listing, the output-on-source guard, raw imaging,
     # recovery of existing and deleted photos and videos, and the desktop app;
     # then the same again through the installed Microsoft Store package.
-    runs-on: windows-latest
+    # ARM64 is built and tested natively on Windows 11 on ARM.
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x64
+            os: windows-latest
+            machine: '0x8664'
+          - arch: arm64
+            os: windows-11-arm
+            machine: '0xAA64'
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
+      - name: Install rustup (the ARM image has none)
+        run: |
+          if (-not (Get-Command rustup -ErrorAction SilentlyContinue)) {
+            $init = "$env:RUNNER_TEMP\rustup-init.exe"
+            Invoke-WebRequest "https://static.rust-lang.org/rustup/dist/aarch64-pc-windows-msvc/rustup-init.exe" -OutFile $init
+            & $init -y --default-toolchain none --profile minimal
+            "$env:USERPROFILE\.cargo\bin" | Out-File -Append -Encoding utf8 $env:GITHUB_PATH
+          }
       - name: Install toolchain (rust-toolchain.toml)
         run: rustup show
       - uses: Swatinem/rust-cache@v2
         with:
-          key: windows
+          key: windows-${{ matrix.arch }}
       - name: test
         run: cargo test --workspace --no-fail-fast
       - name: build release
-        run: cargo build --release -p diskrescue -p diskrescue-tui -p diskrescue-gui
+        run: |
+          cargo build --release -p diskrescue -p diskrescue-tui -p diskrescue-gui
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          # The programs are native to this machine (PE machine type).
+          foreach ($exe in 'diskrescue', 'diskrescue-tui', 'diskrescue-gui') {
+            $b = [IO.File]::ReadAllBytes("target\release\$exe.exe")
+            $machine = [BitConverter]::ToUInt16($b, [BitConverter]::ToInt32($b, 0x3C) + 4)
+            if ($machine -ne ${{ matrix.machine }}) { throw ("{0}.exe is machine 0x{1:X4}, expected ${{ matrix.machine }}" -f $exe, $machine) }
+          }
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
       - name: tools for the test photos and videos
         run: |
           python -m pip install --quiet pillow
@@ -68,18 +98,21 @@ jobs:
           $ErrorActionPreference = 'Stop'
           $pub = 'CN=DiskRescue CI'
           $msix = "$env:RUNNER_TEMP\diskrescue-ci.msix"
-          & .\packaging\windows\msix\build-msix.ps1 -Name 'DiskRescue.CI' -Publisher $pub -Out $msix
+          & .\packaging\windows\msix\build-msix.ps1 -Name 'DiskRescue.CI' -Publisher $pub -Arch ${{ matrix.arch }} -Out $msix
           # A throwaway certificate, trusted on this CI machine only, to install it.
           $cert = New-SelfSignedCertificate -Type CodeSigningCert -Subject $pub -CertStoreLocation Cert:\CurrentUser\My -TextExtension @('2.5.29.19={text}')
           $pw = ConvertTo-SecureString -String 'ci' -Force -AsPlainText
           $pfx = "$env:RUNNER_TEMP\ci.pfx"
           Export-PfxCertificate -Cert $cert -FilePath $pfx -Password $pw | Out-Null
           Import-PfxCertificate -FilePath $pfx -CertStoreLocation Cert:\LocalMachine\TrustedPeople -Password $pw | Out-Null
-          $signtool = (Get-ChildItem 'C:\Program Files (x86)\Windows Kits\10\bin\10.*\x64\signtool.exe' | Sort-Object FullName -Descending | Select-Object -First 1).FullName
+          $signtool = (Get-ChildItem 'C:\Program Files (x86)\Windows Kits\10\bin\10.*\*\signtool.exe' |
+            Where-Object { $_.Directory.Name -in 'x64', 'arm64' } | Sort-Object FullName -Descending | Select-Object -First 1).FullName
           & $signtool sign /fd SHA256 /f $pfx /p ci $msix
           if ($LASTEXITCODE) { throw 'signing failed' }
           Add-AppxPackage $msix
-          "installed $((Get-AppxPackage DiskRescue.CI).PackageFullName)"
+          $pkg = Get-AppxPackage DiskRescue.CI
+          "installed $($pkg.PackageFullName)"
+          if ($pkg.Architecture -ne '${{ matrix.arch }}') { throw "installed as $($pkg.Architecture), expected ${{ matrix.arch }}" }
       - name: virtual disk end-to-end, inside the package
         run: |
           $version = (Select-String -Path Cargo.toml -Pattern '^version = "(.+)"').Matches[0].Groups[1].Value
@@ -94,14 +127,19 @@ jobs:
         if: always()
         shell: powershell
         run: Get-AppxPackage DiskRescue.CI | Remove-AppxPackage
+      # Copied into the workspace first: upload-artifact refuses files outside
+      # it when both are on the same drive (the ARM image checks out on C:).
+      - name: collect the screenshots and the report
+        if: always()
+        run: |
+          New-Item -ItemType Directory -Force smoke | Out-Null
+          $files = @{ 'C:\drsmoke\gui.png' = 'gui.png'; 'C:\drsmoke\out-device\report.txt' = 'report.txt'; 'C:\drsmoke-msix\gui.png' = 'gui-package.png' }
+          foreach ($f in $files.Keys) { if (Test-Path $f) { Copy-Item $f "smoke\$($files[$f])" } }
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: windows-smoke
-          path: |
-            C:\drsmoke\gui.png
-            C:\drsmoke\out-device\report.txt
-            C:\drsmoke-msix\gui.png
+          name: windows-smoke-${{ matrix.arch }}
+          path: smoke/
           if-no-files-found: ignore
 
   musl-build:

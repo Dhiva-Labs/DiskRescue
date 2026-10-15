@@ -1,7 +1,7 @@
 name: diskrescue
 title: DiskRescue
 base: core24
-version: '0.2.0'
+version: '0.2.1'
 summary: Recover photos and videos from failing drives and repair them
 description: |
   DiskRescue gets photos and videos back from hard disks, SSDs, USB drives

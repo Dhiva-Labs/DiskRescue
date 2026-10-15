@@ -1,3 +1,9 @@
+diskrescue (0.2.1~noble1) noble; urgency=medium
+
+  * Native Windows ARM64 builds; nothing changes on Linux.
+
+ -- Dhiva Labs <dhivakar1010@gmail.com>  Thu, 15 Oct 2026 14:30:33 +0000
+
 diskrescue (0.2.0~noble1) noble; urgency=medium
 
   * Windows support: drive letters, so the system disk and drives in use are
