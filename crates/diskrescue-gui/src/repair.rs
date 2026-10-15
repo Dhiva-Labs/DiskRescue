@@ -52,6 +52,10 @@ pub struct RepairPage {
     pub job: Option<JobHandle<RepairState>>,
     /// The output of the running (or last) repair.
     pub job_output: PathBuf,
+    /// The folder name shown instead of `job_output` (for screenshots made
+    /// on another system, which write the path in that system's style).
+    #[doc(hidden)]
+    pub shown_folder: Option<String>,
     /// Why the last repair did not run.
     pub error: Option<String>,
     picker: Option<(Target, Task<Option<Vec<PathBuf>>>)>,
@@ -71,6 +75,7 @@ impl Default for RepairPage {
             .to_string(),
             job: None,
             job_output: PathBuf::new(),
+            shown_folder: None,
             error: None,
             picker: None,
             note: None,
@@ -161,6 +166,21 @@ impl RepairPage {
             }
         });
         self.picker = Some((target, task));
+    }
+
+    /// `p` (inside the output folder) as shown to the user.
+    fn shown(&self, p: &Path) -> String {
+        match (&self.shown_folder, p.strip_prefix(&self.job_output)) {
+            (Some(folder), Ok(rel)) => {
+                let mut s = folder.trim_end_matches('\\').to_string();
+                for part in rel.components() {
+                    s.push('\\');
+                    s.push_str(&part.as_os_str().to_string_lossy());
+                }
+                s
+            }
+            _ => p.display().to_string(),
+        }
     }
 
     /// The rows of the last repair (live while it runs).
@@ -463,7 +483,7 @@ impl RepairPage {
                         ),
                         &format!(
                             "Repaired copies are in {}.",
-                            self.job_output.join("repaired").display()
+                            self.shown(&self.job_output.join("repaired"))
                         ),
                     );
                 }
@@ -504,8 +524,9 @@ impl RepairPage {
                 });
         }
         if let Some(p) = &r.repaired {
+            let shown = self.shown(p);
             ui.horizontal(|ui| {
-                widgets::weak(ui, format!("Repaired copy: {}", p.display()));
+                widgets::weak(ui, format!("Repaired copy: {shown}"));
             });
             if !is_root {
                 ui.horizontal(|ui| {
@@ -595,4 +616,23 @@ pub fn looks_like_image(p: &Path) -> bool {
         .map(|e| e.to_string_lossy().to_ascii_lowercase())
         .unwrap_or_default();
     matches!(ext.as_str(), "img" | "dd" | "raw" | "iso" | "bin" | "image")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_shown_folder_replaces_the_output_folder() {
+        let mut page = RepairPage {
+            job_output: PathBuf::from("/out"),
+            ..RepairPage::default()
+        };
+        let p = Path::new("/out/repaired/a.jpg");
+        assert_eq!(page.shown(p), p.display().to_string());
+        page.shown_folder = Some(r"C:\Pictures\Repaired\".into());
+        assert_eq!(page.shown(p), r"C:\Pictures\Repaired\repaired\a.jpg");
+        let other = Path::new("/elsewhere/a.jpg");
+        assert_eq!(page.shown(other), other.display().to_string());
+    }
 }
