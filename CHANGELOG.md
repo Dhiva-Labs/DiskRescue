@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+- Linux on Arm64: `diskrescue-<tag>-aarch64-linux.tar.gz` (static `diskrescue`
+  and `diskrescue-tui` plus the desktop app) and `diskrescue_<version>_arm64.deb`,
+  built and started natively on Arm in CI next to the x86-64 ones; the test
+  suite also runs on Arm64 Linux. The snap builds for arm64 as well, and its
+  desktop-app launcher knows core24's aarch64 loader.
+
 ## 0.2.1 (2026-10-15)
 
 - Windows on ARM: native ARM64 builds, as a zip on the releases page and as a

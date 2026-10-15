@@ -490,7 +490,8 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn ioctl_numbers() {
-        #[cfg(target_arch = "x86_64")]
+        // x86-64 and Arm64 share the generic ioctl encoding.
+        #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
         assert_eq!(imp::BLKGETSIZE64, 0x8008_1272);
         let e = io::Error::from_raw_os_error(libc::ENXIO);
         assert_eq!(classify_os_error(&e, true), ErrClass::Gone);

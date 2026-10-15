@@ -1,17 +1,29 @@
 name: Release
 
+# A version tag builds, packages and publishes the release. Pull requests that
+# touch the release machinery, and manual runs, build and check every package
+# the same way but publish nothing: only the last job uploads, and only for a tag.
 on:
   push:
     tags: ["v*"]
+  pull_request:
+    paths:
+      - ".github/workflows/release.yml"
+      - "packaging/**"
+      - "rust-toolchain.toml"
+      - ".cargo/config.toml"
+      - "Cargo.lock"
+  workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   windows:
     name: Windows binaries (${{ matrix.arch }})
     # Each architecture is built natively (ARM64 on Windows 11 on ARM).
     strategy:
+      fail-fast: false
       matrix:
         include:
           - arch: x64
@@ -23,6 +35,13 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
+      # TAG is the release tag; outside a tag run (pull request, manual) it is
+      # the tag the current version would get, so the file names are the same.
+      - name: Release tag
+        run: |
+          if ($env:GITHUB_REF_TYPE -eq 'tag') { $tag = $env:GITHUB_REF_NAME }
+          else { $tag = 'v' + (Select-String -Path Cargo.toml -Pattern '^version = "(.+)"').Matches[0].Groups[1].Value }
+          "TAG=$tag" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
       - name: Install rustup (the ARM image has none)
         run: |
           if (-not (Get-Command rustup -ErrorAction SilentlyContinue)) {
@@ -40,7 +59,7 @@ jobs:
         run: cargo build --release -p diskrescue -p diskrescue-tui -p diskrescue-gui
       - name: package
         run: |
-          $name = "diskrescue-$env:GITHUB_REF_NAME-${{ matrix.triple }}-windows"
+          $name = "diskrescue-$env:TAG-${{ matrix.triple }}-windows"
           New-Item -ItemType Directory $name | Out-Null
           Copy-Item target\release\diskrescue.exe, target\release\diskrescue-tui.exe, `
             target\release\diskrescue-gui.exe, LICENSE, README.md, docs\USAGE.md $name
@@ -54,58 +73,180 @@ jobs:
       # signs it; it is not attached to the GitHub release).
       - name: Microsoft Store package
         shell: powershell
-        run: packaging\windows\msix\build-msix.ps1 -Arch ${{ matrix.arch }} -Out "dist\DiskRescue-$($env:GITHUB_REF_NAME.TrimStart('v'))-${{ matrix.arch }}.msix"
+        run: packaging\windows\msix\build-msix.ps1 -Arch ${{ matrix.arch }} -Out "dist\DiskRescue-$($env:TAG.TrimStart('v'))-${{ matrix.arch }}.msix"
       - uses: actions/upload-artifact@v4
         with:
           name: microsoft-store-${{ matrix.arch }}
           path: dist/*.msix
           if-no-files-found: error
 
-  release:
-    name: build binaries + .deb + GitHub release
-    needs: windows
+  linux:
+    name: Linux ${{ matrix.arch }} (binaries + .deb)
     # The desktop app links against the system glibc: build on the oldest
-    # Ubuntu the packages support.
-    runs-on: ubuntu-24.04
+    # Ubuntu the packages support, natively on each architecture.
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            deb: amd64
+            runner: ubuntu-24.04
+            file: x86-64
+          - arch: aarch64
+            deb: arm64
+            runner: ubuntu-24.04-arm
+            file: ARM aarch64
+    runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
+      - name: Release tag
+        run: |
+          if [ "$GITHUB_REF_TYPE" = tag ]; then
+            tag=$GITHUB_REF_NAME
+          else
+            tag=v$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1)
+          fi
+          echo "TAG=$tag" >> "$GITHUB_ENV"
+          echo "VERSION=${tag#v}" >> "$GITHUB_ENV"
       - name: Install toolchain (rust-toolchain.toml)
         run: rustup show
       - name: build dependencies
         run: sudo apt-get update && sudo apt-get install -y musl-tools libxkbcommon-dev libgtk-3-dev libwayland-dev dpkg-dev
       - uses: Swatinem/rust-cache@v2
         with:
-          key: release
+          key: release-${{ matrix.arch }}
       - name: build
         run: |
-          cargo build --release --target x86_64-unknown-linux-musl -p diskrescue -p diskrescue-tui
+          cargo build --release --target ${{ matrix.arch }}-unknown-linux-musl -p diskrescue -p diskrescue-tui
           cargo build --release -p diskrescue-gui
-      - uses: actions/download-artifact@v4
-        with:
-          pattern: windows-*
-          merge-multiple: true
       - name: package
         run: |
-          VERSION=${GITHUB_REF_NAME#v}
-          CLI=target/x86_64-unknown-linux-musl/release/diskrescue
-          TUI=target/x86_64-unknown-linux-musl/release/diskrescue-tui
+          CLI=target/${{ matrix.arch }}-unknown-linux-musl/release/diskrescue
+          TUI=target/${{ matrix.arch }}-unknown-linux-musl/release/diskrescue-tui
           GUI=target/release/diskrescue-gui
           for b in "$CLI" "$TUI"; do
             # ldd wording differs: "not a dynamic executable" vs "statically linked".
             ldd "$b" 2>&1 | grep -qE "statically linked|not a dynamic executable" || { echo "$b is not static"; exit 1; }
           done
-          NAME=diskrescue-${GITHUB_REF_NAME}-x86_64-linux
+          NAME=diskrescue-${TAG}-${{ matrix.arch }}-linux
           mkdir "$NAME"
           cp "$CLI" "$TUI" "$GUI" packaging/linux/diskrescue.desktop packaging/linux/diskrescue.svg \
             LICENSE README.md docs/USAGE.md "$NAME/"
           tar czf "$NAME.tar.gz" "$NAME"
-          packaging/deb/build-deb.sh "$VERSION" "$CLI" "$TUI" "$GUI" .
-          sha256sum "$NAME.tar.gz" "diskrescue_${VERSION}_amd64.deb" diskrescue-*-windows.zip > SHA256SUMS
+          packaging/deb/build-deb.sh "$VERSION" "$CLI" "$TUI" "$GUI" . ${{ matrix.deb }}
+          ls -l
+      - name: check the packages are ${{ matrix.arch }}
+        run: |
+          deb=diskrescue_${VERSION}_${{ matrix.deb }}.deb
+          tgz=diskrescue-${TAG}-${{ matrix.arch }}-linux.tar.gz
+          test -f "$deb" && test -f "$tgz"
+          test "$(dpkg-deb -f "$deb" Architecture)" = ${{ matrix.deb }}
+          dpkg-deb -f "$deb" Depends
+          mkdir "$RUNNER_TEMP/tar"
+          tar xzf "$tgz" -C "$RUNNER_TEMP/tar"
+          for b in diskrescue diskrescue-tui diskrescue-gui; do
+            file "$RUNNER_TEMP/tar/diskrescue-${TAG}-${{ matrix.arch }}-linux/$b"
+            file "$RUNNER_TEMP/tar/diskrescue-${TAG}-${{ matrix.arch }}-linux/$b" | grep -q '${{ matrix.file }}'
+          done
+          # The static programs run straight out of the tarball.
+          for b in diskrescue diskrescue-tui; do
+            "$RUNNER_TEMP/tar/diskrescue-${TAG}-${{ matrix.arch }}-linux/$b" --version
+          done
+      - name: install the .deb and start the programs
+        # Its dependencies must resolve on this architecture, the installed
+        # programs must run, and the desktop app must open a window.
+        run: |
+          # The libraries every desktop has, which the desktop app loads at run time.
+          sudo apt-get install -y ./diskrescue_${VERSION}_${{ matrix.deb }}.deb xvfb libxcursor1 libxi6 libxrandr2 \
+            libxkbcommon-x11-0 libx11-xcb1 libgl1 libegl1 libgl1-mesa-dri libvulkan1 mesa-vulkan-drivers
+          diskrescue --version
+          diskrescue-tui --version
+          status=0
+          xvfb-run -a timeout 10 diskrescue-gui || status=$?
+          # 124: still running when the timeout stopped it.
+          test "$status" -eq 124 || { echo "diskrescue-gui exited early with status $status"; exit 1; }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-${{ matrix.arch }}
+          path: |
+            diskrescue-*-linux.tar.gz
+            diskrescue_*.deb
+          if-no-files-found: error
+
+  checksums:
+    name: release notes + SHA256SUMS
+    needs: [windows, linux]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: windows-*
+          path: dist
+          merge-multiple: true
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: linux-*
+          path: dist
+          merge-multiple: true
+      - name: Release tag
+        run: |
+          if [ "$GITHUB_REF_TYPE" = tag ]; then
+            tag=$GITHUB_REF_NAME
+          else
+            tag=v$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1)
+          fi
+          echo "TAG=$tag" >> "$GITHUB_ENV"
+          echo "VERSION=${tag#v}" >> "$GITHUB_ENV"
+      - name: every platform delivered its package
+        run: |
+          ls -l dist
+          for f in \
+            diskrescue-$TAG-x86_64-linux.tar.gz diskrescue-$TAG-aarch64-linux.tar.gz \
+            diskrescue_${VERSION}_amd64.deb diskrescue_${VERSION}_arm64.deb \
+            diskrescue-$TAG-x86_64-windows.zip diskrescue-$TAG-aarch64-windows.zip; do
+            test -f "dist/$f" || { echo "missing $f"; exit 1; }
+          done
+          test "$(ls dist | wc -l)" -eq 6
+      - name: checksums
+        run: |
+          mkdir meta
+          (cd dist && sha256sum * | tee ../meta/SHA256SUMS)
+          if [ -f ".github/release-notes/$TAG.md" ]; then cp ".github/release-notes/$TAG.md" meta/notes.md; fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-meta
+          path: meta/*
+          if-no-files-found: error
+
+  release:
+    name: GitHub release
+    if: github.ref_type == 'tag'
+    needs: checksums
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: windows-*
+          path: dist
+          merge-multiple: true
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: linux-*
+          path: dist
+          merge-multiple: true
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-meta
+          path: dist
       - name: release
         env:
           GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
         run: |
-          NOTES=".github/release-notes/${GITHUB_REF_NAME}.md"
-          if [ -f "$NOTES" ]; then set -- --notes-file "$NOTES"; else set -- --generate-notes; fi
-          gh release create "$GITHUB_REF_NAME" --title "DiskRescue $GITHUB_REF_NAME" "$@" \
-            diskrescue-*.tar.gz diskrescue-*-windows.zip diskrescue_*_amd64.deb SHA256SUMS
+          ls -l dist
+          if [ -f dist/notes.md ]; then set -- --notes-file dist/notes.md; else set -- --generate-notes; fi
+          rm -f dist/notes.md
+          gh release create "$GITHUB_REF_NAME" --title "DiskRescue $GITHUB_REF_NAME" "$@" dist/*

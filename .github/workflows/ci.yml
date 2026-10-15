@@ -4,19 +4,33 @@ on:
   push:
     branches: [main]
   pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
   lint-test:
-    name: fmt + clippy + test
+    name: fmt + clippy + test (${{ matrix.arch }})
     # The test suite builds fixtures with the system's own tools and checks
     # them against those tools (exfatprogs >= 1.2.3, ffmpeg with HEIF, recent
-    # Pillow), which Ubuntu 26.04 provides.
-    runs-on: ubuntu-26.04
+    # Pillow), which Ubuntu 26.04 provides, on x86-64 and on Arm64 alike.
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            os: ubuntu-26.04
+          - arch: aarch64
+            os: ubuntu-26.04-arm
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
+      - name: The runner is ${{ matrix.arch }}
+        run: test "$(uname -m)" = ${{ matrix.arch }}
       - name: Install toolchain (rust-toolchain.toml)
         run: rustup show
       - name: Fixture tools
@@ -28,6 +42,8 @@ jobs:
           # through ntfs-3g), which needs the setuid helper.
           sudo chmod u+s "$(command -v ntfs-3g)"
       - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.arch }}
       - name: rustfmt
         run: cargo fmt --all -- --check
       - name: clippy
@@ -143,8 +159,18 @@ jobs:
           if-no-files-found: ignore
 
   musl-build:
-    name: static musl build
-    runs-on: ubuntu-latest
+    name: static musl build (${{ matrix.arch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            os: ubuntu-latest
+            file: x86-64
+          - arch: aarch64
+            os: ubuntu-24.04-arm
+            file: ARM aarch64
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - name: Install toolchain (rust-toolchain.toml)
@@ -153,15 +179,54 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y musl-tools
       - uses: Swatinem/rust-cache@v2
         with:
-          key: musl
+          key: musl-${{ matrix.arch }}
       - name: build
-        run: cargo build --release --target x86_64-unknown-linux-musl -p diskrescue -p diskrescue-tui
+        run: cargo build --release --target ${{ matrix.arch }}-unknown-linux-musl -p diskrescue -p diskrescue-tui
       - name: verify static
         run: |
-          BIN=target/x86_64-unknown-linux-musl/release/diskrescue
-          file "$BIN"
-          ldd "$BIN" 2>&1 | grep -qE "statically linked|not a dynamic executable" || { echo "binary is not static"; exit 1; }
+          for b in diskrescue diskrescue-tui; do
+            BIN=target/${{ matrix.arch }}-unknown-linux-musl/release/$b
+            file "$BIN"
+            file "$BIN" | grep -q '${{ matrix.file }}'
+            ldd "$BIN" 2>&1 | grep -qE "statically linked|not a dynamic executable" || { echo "$b is not static"; exit 1; }
+            "$BIN" --version
+          done
       - uses: actions/upload-artifact@v4
         with:
-          name: diskrescue-x86_64-linux-musl
-          path: target/x86_64-unknown-linux-musl/release/diskrescue
+          name: diskrescue-${{ matrix.arch }}-linux-musl
+          path: target/${{ matrix.arch }}-unknown-linux-musl/release/diskrescue
+
+  snap-arm64:
+    name: snap (arm64)
+    # Built natively on Arm, in LXD like a store build, then installed and
+    # started. The result is only a workflow artifact: it is never uploaded
+    # to the Snap Store from here.
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+      - uses: snapcore/action-build@v1
+        id: snapcraft
+      - name: check the snap is arm64
+        run: |
+          snap="${{ steps.snapcraft.outputs.snap }}"
+          ls -l "$snap"
+          d="$RUNNER_TEMP/snap"
+          unsquashfs -d "$d" -f "$snap" meta/snap.yaml bin
+          cat "$d/meta/snap.yaml"
+          grep -q 'arm64' "$d/meta/snap.yaml"
+          grep -q 'confinement: classic' "$d/meta/snap.yaml"
+          for b in diskrescue diskrescue-tui diskrescue-gui; do
+            file "$d/bin/$b"
+            file "$d/bin/$b" | grep -q 'ARM aarch64'
+          done
+          # The programs patched onto core24 must name core24's aarch64 loader.
+          for b in diskrescue diskrescue-tui; do
+            readelf -l "$d/bin/$b" | grep -q 'Requesting program interpreter: /snap/core24/current/lib/ld-linux-aarch64.so.1'
+          done
+      - name: install the snap and run its programs
+        run: .github/scripts/snap-smoke.sh "${{ steps.snapcraft.outputs.snap }}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: diskrescue-snap-arm64
+          path: ${{ steps.snapcraft.outputs.snap }}
+          if-no-files-found: error

@@ -1,13 +1,17 @@
 #!/bin/sh
-# Build diskrescue_<version>_amd64.deb from already-built binaries.
+# Build diskrescue_<version>_<arch>.deb from already-built binaries.
 #
-#   packaging/deb/build-deb.sh VERSION CLI TUI GUI OUTDIR
+#   packaging/deb/build-deb.sh VERSION CLI TUI GUI OUTDIR [ARCH]
+#
+# ARCH is the Debian architecture of the binaries (amd64, arm64); it defaults
+# to the architecture of the machine the script runs on.
 #
 # CLI and TUI may be static (musl) builds; GUI links against the system's
 # glibc and GTK, so build it on the oldest Ubuntu the package should support.
 set -eu
 
 VERSION=$1; CLI=$2; TUI=$3; GUI=$4; OUT=$5
+ARCH=${6:-$(dpkg --print-architecture)}
 ROOT=$(cd "$(dirname "$0")/../.." && pwd)
 STAGE=$(mktemp -d)
 trap 'rm -rf "$STAGE"' EXIT
@@ -47,7 +51,7 @@ install -Dm644 "$STAGE/copyright" "$PKG/usr/share/doc/diskrescue/copyright"
 DEPS="libc6"
 if command -v dpkg-shlibdeps >/dev/null 2>&1; then
   mkdir -p "$STAGE/debian"
-  printf 'Source: diskrescue\n\nPackage: diskrescue\nArchitecture: amd64\n' > "$STAGE/debian/control"
+  printf 'Source: diskrescue\n\nPackage: diskrescue\nArchitecture: %s\n' "$ARCH" > "$STAGE/debian/control"
   DEPS=$(cd "$STAGE" && dpkg-shlibdeps -O "$PKG/usr/bin/diskrescue-gui" 2>/dev/null | sed -n 's/^shlibs:Depends=//p')
 fi
 SIZE=$(du -sk "$PKG" | cut -f1)
@@ -56,7 +60,7 @@ mkdir -p "$PKG/DEBIAN"
 cat > "$PKG/DEBIAN/control" <<CONTROL
 Package: diskrescue
 Version: $VERSION
-Architecture: amd64
+Architecture: $ARCH
 Maintainer: Dhiva Labs <dhivakar1010@gmail.com>
 Installed-Size: $SIZE
 Depends: $DEPS, libxkbcommon0, libgl1 | libegl1
@@ -79,5 +83,5 @@ Description: Recover photos and videos from failing drives and repair them
 CONTROL
 
 mkdir -p "$OUT"
-dpkg-deb --root-owner-group -Zxz --build "$PKG" "$OUT/diskrescue_${VERSION}_amd64.deb" >/dev/null
-echo "$OUT/diskrescue_${VERSION}_amd64.deb"
+dpkg-deb --root-owner-group -Zxz --build "$PKG" "$OUT/diskrescue_${VERSION}_${ARCH}.deb" >/dev/null
+echo "$OUT/diskrescue_${VERSION}_${ARCH}.deb"
