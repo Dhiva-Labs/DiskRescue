@@ -26,13 +26,13 @@
   </Resources>
 
   <Applications>
-    <!-- One application: the desktop app. Reading a whole drive needs
-         administrator rights: it then restarts itself through the UAC prompt
-         (allowElevation). The command line and the terminal app are execution
-         aliases of the same application, each with its own executable, so they
-         work in any terminal without a Start menu entry. (A second application
-         hidden with AppListEntry="none" counts as a headless app, which the
-         Store refuses without a waiver.) -->
+    <!-- The Store refuses hidden (AppListEntry="none") applications as
+         "headless" without a waiver, and allows one execution-alias extension
+         per application, with one executable. So:
+         - the desktop app, whose alias is the command line, `diskrescue`;
+         - the terminal app, a Start menu entry of its own, `diskrescue-tui`.
+         Reading a whole drive needs administrator rights: the desktop app then
+         restarts itself through the UAC prompt (allowElevation). -->
     <Application Id="DiskRescue" Executable="diskrescue-gui.exe" EntryPoint="Windows.FullTrustApplication">
       <uap:VisualElements
         DisplayName="DiskRescue"
@@ -43,16 +43,23 @@
         <uap:DefaultTile Wide310x150Logo="Assets\Wide310x150Logo.png" />
       </uap:VisualElements>
       <Extensions>
-        <uap5:Extension Category="windows.appExecutionAlias" Executable="diskrescue-gui.exe" EntryPoint="Windows.FullTrustApplication">
-          <uap5:AppExecutionAlias>
-            <uap5:ExecutionAlias Alias="diskrescue-gui.exe" />
-          </uap5:AppExecutionAlias>
-        </uap5:Extension>
         <uap5:Extension Category="windows.appExecutionAlias" Executable="diskrescue.exe" EntryPoint="Windows.FullTrustApplication">
           <uap5:AppExecutionAlias desktop4:Subsystem="console">
             <uap5:ExecutionAlias Alias="diskrescue.exe" />
           </uap5:AppExecutionAlias>
         </uap5:Extension>
+      </Extensions>
+    </Application>
+
+    <Application Id="DiskRescueTui" Executable="diskrescue-tui.exe" EntryPoint="Windows.FullTrustApplication"
+      desktop4:Subsystem="console" desktop4:SupportsMultipleInstances="true">
+      <uap:VisualElements
+        DisplayName="DiskRescue (terminal)"
+        Description="DiskRescue's interactive terminal app: the same rescue, recovery and repair in a console window."
+        BackgroundColor="transparent"
+        Square150x150Logo="Assets\Square150x150Logo.png"
+        Square44x44Logo="Assets\Square44x44Logo.png" />
+      <Extensions>
         <uap5:Extension Category="windows.appExecutionAlias" Executable="diskrescue-tui.exe" EntryPoint="Windows.FullTrustApplication">
           <uap5:AppExecutionAlias desktop4:Subsystem="console">
             <uap5:ExecutionAlias Alias="diskrescue-tui.exe" />
