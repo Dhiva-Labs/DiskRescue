@@ -19,6 +19,7 @@ if ($Packaged) { $Bin = "$env:LOCALAPPDATA\Microsoft\WindowsApps" }
 elseif (-not $Bin) { throw 'pass -Bin <folder with the .exe files> or -Packaged' }
 $cli = (Resolve-Path (Join-Path $Bin 'diskrescue.exe')).Path
 $gui = (Resolve-Path (Join-Path $Bin 'diskrescue-gui.exe')).Path
+$tui = (Resolve-Path (Join-Path $Bin 'diskrescue-tui.exe')).Path
 $work = $Work
 $vhd = "$work\card.vhdx"
 $letter = 'R'
@@ -74,6 +75,13 @@ foreach ($exe in Get-ChildItem (Join-Path $Bin 'diskrescue*.exe') | Where-Object
     if ($text.IndexOf('vcruntime140', [System.StringComparison]::OrdinalIgnoreCase) -ge 0) {
         Fail "$($exe.Name) needs the Visual C++ Redistributable (VCRUNTIME140.dll)"
     }
+}
+
+# Every program answers, through its alias when packaged.
+foreach ($p in @($cli, $tui)) {
+    $v = & $p --version 2>&1 | Out-String
+    if ($LASTEXITCODE -or $v -notmatch '0\.\d+\.\d+') { Fail "$p --version: exit $LASTEXITCODE, '$($v.Trim())'" }
+    else { Write-Host "ok   $(Split-Path -Leaf $p): $($v.Trim())" }
 }
 
 Remove-Item -Recurse -Force $work -ErrorAction SilentlyContinue
