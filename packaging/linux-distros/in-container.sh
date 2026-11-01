@@ -22,8 +22,8 @@ case "$MODE" in
   rpm-suse)
     zypper -n -q --gpg-auto-import-keys refresh
     pkgs=(file findutils which procps "${SMOKE_PKGS_SUSE[@]}")
-    # xvfb-run needs awk; dbus-run-session is not in dbus-1 on Tumbleweed.
-    if [ "$gui" = 1 ]; then pkgs+=(xvfb-run gawk /usr/bin/dbus-run-session Mesa-dri dbus-1); fi
+    # xvfb-run needs awk; dbus-run-session ships in dbus-1-daemon on Tumbleweed (dbus-1 is the broker).
+    if [ "$gui" = 1 ]; then pkgs+=(xvfb-run gawk dbus-1-daemon Mesa-dri dbus-1); fi
     zypper -n -q install "${pkgs[@]}"
     ;;
   pacman)
