@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+- Linux packages for more distributions, for x86-64 and Arm64, repackaged
+  from the `.deb` build: `.rpm` for Fedora, RHEL and openSUSE, `.pkg.tar.zst`
+  for Arch Linux, an AppImage of the desktop app, and an AUR `diskrescue-bin`
+  PKGBUILD. CI installs each one on its distribution and starts the programs
+  there. From the AppImage, copying a drive that needs administrator rights
+  needs `--appimage-extract-and-run` (pkexec cannot reach a program inside a
+  mounted AppImage).
+
 ## 0.2.2 (2026-10-16)
 
 - Linux on Arm64: `diskrescue-<tag>-aarch64-linux.tar.gz` (static `diskrescue`

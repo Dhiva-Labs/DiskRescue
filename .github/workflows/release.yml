@@ -173,9 +173,133 @@ jobs:
             diskrescue_*.deb
           if-no-files-found: error
 
+  # Repackages each architecture's .deb for Fedora/RHEL/openSUSE (.rpm), Arch
+  # (.pkg.tar.zst) and any glibc distribution (AppImage), so every format
+  # ships the same programs, then installs each one on the real distribution
+  # and starts all three programs there. No Flatpak: reading a raw device
+  # needs root, and inside the sandbox pkexec cannot gain it (setuid is
+  # disabled there) and DiskRescue has no UDisks2 path to ask for the device.
+  distros:
+    name: rpm + Arch + AppImage ${{ matrix.arch }}
+    needs: [linux]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { arch: x86_64, deb: amd64, nfpm_arch: x86_64, runner: ubuntu-24.04 }
+          - { arch: aarch64, deb: arm64, nfpm_arch: arm64, runner: ubuntu-24.04-arm }
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 40
+    env:
+      NFPM_VERSION: '2.48.0'
+      APPIMAGETOOL_VERSION: '1.9.1'
+    steps:
+      - uses: actions/checkout@v4
+      - name: Release tag
+        run: |
+          if [ "$GITHUB_REF_TYPE" = tag ]; then
+            tag=$GITHUB_REF_NAME
+          else
+            tag=v$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1)
+          fi
+          echo "TAG=$tag" >> "$GITHUB_ENV"
+          echo "VERSION=${tag#v}" >> "$GITHUB_ENV"
+      - uses: actions/download-artifact@v4
+        with:
+          name: linux-${{ matrix.arch }}
+          path: deb
+      - name: install nfpm and appimagetool
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/bin"
+          cd "$RUNNER_TEMP/bin"
+          tarball="nfpm_${NFPM_VERSION}_Linux_${{ matrix.nfpm_arch }}.tar.gz"
+          gh release download "v$NFPM_VERSION" -R goreleaser/nfpm -p "$tarball" -p checksums.txt
+          grep " $tarball\$" checksums.txt | sha256sum -c -
+          tar -xzf "$tarball" nfpm
+          gh release download "$APPIMAGETOOL_VERSION" -R AppImage/appimagetool \
+            -p "appimagetool-${{ matrix.arch }}.AppImage" -O appimagetool
+          chmod +x appimagetool
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+      - name: build the .rpm, Arch package and AppImage
+        run: |
+          dpkg-deb -x "deb/diskrescue_${VERSION}_${{ matrix.deb }}.deb" "$RUNNER_TEMP/root"
+          packaging/linux-distros/pack.sh "$RUNNER_TEMP/root" ${{ matrix.deb }} dist
+      - name: install and run on Fedora, openSUSE and Arch
+        run: packaging/linux-distros/verify.sh dist ${{ matrix.deb }}
+      - name: what pkexec can reach from the AppImage
+        # The desktop app reads a device that needs root by running `pkexec
+        # <its own directory>/diskrescue image ...`. A FUSE-mounted AppImage
+        # is unreadable for every user but its owner, root included, so pkexec
+        # cannot start that program; with --appimage-extract-and-run the app
+        # runs from a plain directory under /tmp, which root can. The README
+        # documents both; this step keeps that true.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y fuse3 xvfb libxcursor1 libxi6 libxkbcommon-x11-0 libx11-xcb1 \
+            libegl1 libgl1-mesa-dri
+          appimage=$PWD/dist/DiskRescue-$VERSION-${{ matrix.arch }}.AppImage
+          "$appimage" --appimage-mount > "$RUNNER_TEMP/mountpoint" &
+          mounter=$!
+          for _ in $(seq 1 30); do test -s "$RUNNER_TEMP/mountpoint" && break; sleep 1; done
+          mnt=$(head -n1 "$RUNNER_TEMP/mountpoint")
+          "$mnt/usr/bin/diskrescue" --version
+          if sudo test -e "$mnt/usr/bin/diskrescue"; then
+            echo "root can read the mounted AppImage: the README's pkexec note is wrong"; exit 1
+          fi
+          echo "root cannot read $mnt (as documented)"
+          kill "$mounter"
+          status=0
+          NO_CLEANUP=1 xvfb-run -a timeout 10 "$appimage" --appimage-extract-and-run || status=$?
+          # 124: still running when the timeout stopped it.
+          test "$status" -eq 124 || { echo "the extracted desktop app exited early with status $status"; exit 1; }
+          set -- "${TMPDIR:-/tmp}"/appimage_extracted_*/usr/bin/diskrescue
+          test -x "$1"
+          sudo "$1" --version
+      - uses: actions/upload-artifact@v4
+        with:
+          name: distros-${{ matrix.arch }}
+          path: |
+            dist/*.rpm
+            dist/*.pkg.tar.zst
+            dist/*.AppImage
+          if-no-files-found: error
+
+  # AUR recipe: PKGBUILD + .SRCINFO for diskrescue-bin, rendered with this
+  # build's checksums and proven with makepkg on archlinux:latest.
+  aur:
+    name: AUR PKGBUILD
+    needs: [linux]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Release tag
+        run: |
+          if [ "$GITHUB_REF_TYPE" = tag ]; then
+            tag=$GITHUB_REF_NAME
+          else
+            tag=v$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1)
+          fi
+          echo "TAG=$tag" >> "$GITHUB_ENV"
+          echo "VERSION=${tag#v}" >> "$GITHUB_ENV"
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: linux-*
+          path: debs
+          merge-multiple: true
+      - name: render and check the PKGBUILD
+        run: packaging/arch/aur.sh "debs/diskrescue_${VERSION}_amd64.deb" "debs/diskrescue_${VERSION}_arm64.deb" dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: aur
+          path: dist/*-aur.tar.gz
+          if-no-files-found: error
+
   checksums:
     name: release notes + SHA256SUMS
-    needs: [windows, linux]
+    needs: [windows, linux, distros, aur]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -189,6 +313,15 @@ jobs:
           pattern: linux-*
           path: dist
           merge-multiple: true
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: distros-*
+          path: dist
+          merge-multiple: true
+      - uses: actions/download-artifact@v4
+        with:
+          name: aur
+          path: dist
       - name: Release tag
         run: |
           if [ "$GITHUB_REF_TYPE" = tag ]; then
@@ -204,15 +337,23 @@ jobs:
           for f in \
             diskrescue-$TAG-x86_64-linux.tar.gz diskrescue-$TAG-aarch64-linux.tar.gz \
             diskrescue_${VERSION}_amd64.deb diskrescue_${VERSION}_arm64.deb \
-            diskrescue-$TAG-x86_64-windows.zip diskrescue-$TAG-aarch64-windows.zip; do
+            diskrescue-$TAG-x86_64-windows.zip diskrescue-$TAG-aarch64-windows.zip \
+            diskrescue-$VERSION-1.x86_64.rpm diskrescue-$VERSION-1.aarch64.rpm \
+            diskrescue-$VERSION-1-x86_64.pkg.tar.zst diskrescue-$VERSION-1-aarch64.pkg.tar.zst \
+            DiskRescue-$VERSION-x86_64.AppImage DiskRescue-$VERSION-aarch64.AppImage \
+            diskrescue-bin-$VERSION-aur.tar.gz; do
             test -f "dist/$f" || { echo "missing $f"; exit 1; }
           done
-          test "$(ls dist | wc -l)" -eq 6
+          test "$(ls dist | wc -l)" -eq 13
       - name: checksums
         run: |
           mkdir meta
           (cd dist && sha256sum * | tee ../meta/SHA256SUMS)
-          if [ -f ".github/release-notes/$TAG.md" ]; then cp ".github/release-notes/$TAG.md" meta/notes.md; fi
+          if [ -f ".github/release-notes/$TAG.md" ]; then
+            cp ".github/release-notes/$TAG.md" meta/notes.md
+            # The other-distribution packages, the same for every release.
+            sed "s/@VERSION@/$VERSION/g" packaging/linux-distros/release-notes.md >> meta/notes.md
+          fi
       - uses: actions/upload-artifact@v4
         with:
           name: release-meta
@@ -237,6 +378,15 @@ jobs:
           pattern: linux-*
           path: dist
           merge-multiple: true
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: distros-*
+          path: dist
+          merge-multiple: true
+      - uses: actions/download-artifact@v4
+        with:
+          name: aur
+          path: dist
       - uses: actions/download-artifact@v4
         with:
           name: release-meta
