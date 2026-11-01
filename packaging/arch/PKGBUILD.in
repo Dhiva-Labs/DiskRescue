@@ -1,0 +1,30 @@
+# Maintainer: Dhiva Labs <dhivakar1010@gmail.com>
+#
+# AUR package. It repackages the .deb from the GitHub release, so Arch users
+# run the same build as every other distribution. packaging/arch/aur.sh
+# renders this file for each release (version and checksums) and checks it
+# with makepkg; the rendered PKGBUILD and .SRCINFO are what gets pushed to
+# the AUR.
+pkgname=@NAME@-bin
+pkgver=@VERSION@
+pkgrel=1
+pkgdesc='@SUMMARY@'
+arch=('x86_64' 'aarch64')
+url='@HOMEPAGE@'
+license=('@LICENSE@')
+# The desktop app dlopen()s its display libraries, so they are listed by
+# hand; diskrescue and diskrescue-tui are static.
+depends=(@ARCH_DEPENDS@)
+optdepends=(@ARCH_OPTDEPENDS@)
+provides=('@NAME@')
+conflicts=('@NAME@')
+options=('!strip' '!debug')
+source_x86_64=("@RELEASE_URL@/@DEB_AMD64@")
+source_aarch64=("@RELEASE_URL@/@DEB_ARM64@")
+sha256sums_x86_64=('@SHA_AMD64@')
+sha256sums_aarch64=('@SHA_ARM64@')
+
+package() {
+  bsdtar -xf data.tar.* -C "$pkgdir"
+  install -Dm644 "$pkgdir/usr/share/doc/@NAME@/copyright" "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+}

@@ -3,6 +3,7 @@
 [![ARM64 builds](https://github.com/Dhiva-Labs/DiskRescue/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/Dhiva-Labs/DiskRescue/actions/workflows/ci.yml)
 ![Linux x64 | arm64](https://img.shields.io/badge/Linux-x64%20%7C%20arm64-informational?logo=linux&logoColor=white)
 ![Windows x64 | arm64](https://img.shields.io/badge/Windows-x64%20%7C%20arm64-informational?logo=windows&logoColor=white)
+![Linux: deb | rpm | Arch | AppImage | Snap](https://img.shields.io/badge/Linux-deb%20%7C%20rpm%20%7C%20Arch%20%7C%20AppImage%20%7C%20Snap-informational?logo=linux&logoColor=white)
 
 **Get your photos and videos back from a dying drive, and repair the files
 that came back broken.**
@@ -112,6 +113,47 @@ x86-64 or Arm64:
 
 `sudo apt install ./diskrescue_<version>_<arch>.deb`. The releases page also
 lists `SHA256SUMS` for every download.
+
+**Fedora, openSUSE, Arch and AppImage:** from the next release on, the
+releases page also has these, repackaged from the same build as the `.deb`:
+
+| | x86-64 | Arm64 (aarch64) |
+|---|---|---|
+| Fedora / RHEL / openSUSE | `diskrescue-<version>-1.x86_64.rpm` | `diskrescue-<version>-1.aarch64.rpm` |
+| Arch / Manjaro / EndeavourOS | `diskrescue-<version>-1-x86_64.pkg.tar.zst` | `diskrescue-<version>-1-aarch64.pkg.tar.zst` |
+| AppImage (the desktop app) | `DiskRescue-<version>-x86_64.AppImage` | `DiskRescue-<version>-aarch64.AppImage` |
+| AUR recipe (`diskrescue-bin`) | `diskrescue-bin-<version>-aur.tar.gz` | (same file) |
+
+- Fedora / RHEL: `sudo dnf install ./diskrescue-<version>-1.x86_64.rpm`
+- openSUSE: `sudo zypper install --allow-unsigned-rpm ./diskrescue-<version>-1.x86_64.rpm`
+  (the `.rpm` is not signed)
+- Arch: `sudo pacman -U ./diskrescue-<version>-1-x86_64.pkg.tar.zst`;
+  `diskrescue-bin` on the AUR once it is published (until then, `makepkg -si`
+  in the unpacked `diskrescue-bin-<version>-aur.tar.gz`)
+- AppImage: `chmod +x DiskRescue-<version>-x86_64.AppImage && ./DiskRescue-<version>-x86_64.AppImage`
+
+All of them need glibc 2.39 or newer, like the `.deb` (Fedora 40+, openSUSE
+Tumbleweed, current Arch; not RHEL 9 or openSUSE Leap 15). The `.rpm` and the
+Arch package install all three programs and recommend pkexec (polkit) and
+`xdg-desktop-portal`, as the `.deb` does. CI installs the `.rpm` on Fedora and
+openSUSE Tumbleweed, the Arch package on Arch Linux (x86-64; Arch has no
+official Arm64 image, so the Arm64 package gets a static check) and the
+AppImage on Fedora, and starts all three programs there.
+
+The AppImage holds the desktop app (the command-line and terminal programs
+are inside it too, but it starts the desktop app). **Copying a drive that
+needs administrator rights does not work from a mounted AppImage:** the
+desktop app runs `pkexec` on the `diskrescue` program next to itself, and a
+mounted AppImage can only be read by the user who started it, not by root,
+so pkexec fails and the app reports that administrator rights could not be
+asked for. Start it with `./DiskRescue-<version>-x86_64.AppImage
+--appimage-extract-and-run` instead: it unpacks to `/tmp` first, and pkexec
+works from there. Recovering from image files and repairing files need no
+administrator rights and work either way.
+
+There is no Flatpak: reading a raw device needs root, and inside the sandbox
+pkexec cannot gain it and there is no UDisks2 path in DiskRescue to ask for
+the device instead.
 
 **From source:**
 
