@@ -18,7 +18,10 @@ $ErrorActionPreference = 'Stop'
 if ($Packaged) { $Bin = "$env:LOCALAPPDATA\Microsoft\WindowsApps" }
 elseif (-not $Bin) { throw 'pass -Bin <folder with the .exe files> or -Packaged' }
 $cli = (Resolve-Path (Join-Path $Bin 'diskrescue.exe')).Path
-$gui = (Resolve-Path (Join-Path $Bin 'diskrescue-gui.exe')).Path
+# The package has no alias for the desktop app (its alias is the command
+# line); it is started from its app ID, as the Start menu does.
+if (-not $Packaged) { $gui = (Resolve-Path (Join-Path $Bin 'diskrescue-gui.exe')).Path }
+$tui = (Resolve-Path (Join-Path $Bin 'diskrescue-tui.exe')).Path
 $work = $Work
 $vhd = "$work\card.vhdx"
 $letter = 'R'
@@ -74,6 +77,13 @@ foreach ($exe in Get-ChildItem (Join-Path $Bin 'diskrescue*.exe') | Where-Object
     if ($text.IndexOf('vcruntime140', [System.StringComparison]::OrdinalIgnoreCase) -ge 0) {
         Fail "$($exe.Name) needs the Visual C++ Redistributable (VCRUNTIME140.dll)"
     }
+}
+
+# Every program answers, through its alias when packaged.
+foreach ($p in @($cli, $tui)) {
+    $v = & $p --version 2>&1 | Out-String
+    if ($LASTEXITCODE -or $v -notmatch '0\.\d+\.\d+') { Fail "$p --version: exit $LASTEXITCODE, '$($v.Trim())'" }
+    else { Write-Host "ok   $(Split-Path -Leaf $p): $($v.Trim())" }
 }
 
 Remove-Item -Recurse -Force $work -ErrorAction SilentlyContinue
@@ -178,10 +188,19 @@ assign letter=$letter
     Check-Recovered "$work\out-device" 'device'
 
     # ------------------------------------------------------------ desktop app
-    $p = Start-Process $gui -PassThru -RedirectStandardError "$work\gui-stderr.txt"
-    Start-Sleep -Seconds 15
-    if ($p.HasExited) {
-        Fail "the desktop app exited with $($p.ExitCode): $(Get-Content -Raw "$work\gui-stderr.txt")"
+    if ($Packaged) {
+        $pkg = Get-AppxPackage | Where-Object { $_.Name -like '*DiskRescue*' } | Select-Object -First 1
+        Start-Process "shell:AppsFolder\$($pkg.PackageFamilyName)!DiskRescue"
+        Start-Sleep -Seconds 15
+        $p = Get-Process diskrescue-gui -ErrorAction SilentlyContinue | Select-Object -First 1
+        $why = 'the packaged desktop app is not running 15 s after its start'
+    } else {
+        $p = Start-Process $gui -PassThru -RedirectStandardError "$work\gui-stderr.txt"
+        Start-Sleep -Seconds 15
+        $why = "the desktop app exited with $($p.ExitCode): $(Get-Content -Raw "$work\gui-stderr.txt" -ErrorAction SilentlyContinue)"
+    }
+    if (-not $p -or $p.HasExited) {
+        Fail $why
     } else {
         Add-Type -AssemblyName System.Windows.Forms, System.Drawing
         $b = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds
