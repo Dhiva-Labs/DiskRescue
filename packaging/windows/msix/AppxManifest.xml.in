@@ -31,9 +31,12 @@
          per application, with one executable. So:
          - the desktop app, whose alias is the command line, `diskrescue`;
          - the terminal app, a Start menu entry of its own, `diskrescue-tui`.
+         A console alias is only valid on an application that allows several
+         instances, hence SupportsMultipleInstances on both.
          Reading a whole drive needs administrator rights: the desktop app then
          restarts itself through the UAC prompt (allowElevation). -->
-    <Application Id="DiskRescue" Executable="diskrescue-gui.exe" EntryPoint="Windows.FullTrustApplication">
+    <Application Id="DiskRescue" Executable="diskrescue-gui.exe" EntryPoint="Windows.FullTrustApplication"
+      desktop4:SupportsMultipleInstances="true">
       <uap:VisualElements
         DisplayName="DiskRescue"
         Description="Recover photos and videos from failing or formatted SD cards, USB drives and disks, and repair damaged ones."
