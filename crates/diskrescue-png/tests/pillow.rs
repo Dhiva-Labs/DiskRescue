@@ -1,5 +1,6 @@
-//! Interop with files written by Pillow (skipped when python3 + Pillow are
-//! not installed).
+//! Interop with files written by Pillow. Missing python3 + Pillow fails the
+//! tests; they skip only on Windows (whose CI test step runs before Pillow is
+//! installed) or with `DISKRESCUE_ALLOW_FIXTURE_SKIP=1`.
 
 mod common;
 
@@ -62,8 +63,14 @@ fn have_pillow() -> bool {
 
 fn generate(dir: &Path) -> bool {
     if !have_pillow() {
-        eprintln!("skipped: python3 with Pillow missing");
-        return false;
+        if cfg!(windows) || std::env::var_os("DISKRESCUE_ALLOW_FIXTURE_SKIP").is_some() {
+            eprintln!("!!!!!! SKIPPED, NOTHING WAS TESTED: python3 with Pillow missing");
+            return false;
+        }
+        panic!(
+            "python3 with Pillow is missing (Debian/Ubuntu: python3-pil). \
+             Set DISKRESCUE_ALLOW_FIXTURE_SKIP=1 to skip these tests."
+        );
     }
     let out = Command::new("python3")
         .arg("-c")

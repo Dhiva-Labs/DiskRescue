@@ -67,8 +67,9 @@ pub fn embed(file: &[u8], before: usize, after: usize, rng: &mut Rng) -> (Shared
 
 static FIXTURES: OnceLock<Option<PathBuf>> = OnceLock::new();
 
-/// Directory with the Pillow-generated files, or `None` (after printing a
-/// skip notice) when python3 or Pillow is missing.
+/// Directory with the Pillow-generated files. Missing python3 or Pillow fails
+/// the test; `None` (after a loud skip notice) only on Windows, whose CI test
+/// step runs before Pillow is installed, or with `DISKRESCUE_ALLOW_FIXTURE_SKIP=1`.
 pub fn pillow_dir() -> Option<&'static Path> {
     FIXTURES
         .get_or_init(|| {
@@ -83,10 +84,7 @@ pub fn pillow_dir() -> Option<&'static Path> {
                 .spawn()
             {
                 Ok(c) => c,
-                Err(_) => {
-                    eprintln!("skipped: python3 missing");
-                    return None;
-                }
+                Err(e) => return fixtures_unavailable(&format!("cannot run python3: {e}")),
             };
             use std::io::Write;
             child
@@ -98,14 +96,22 @@ pub fn pillow_dir() -> Option<&'static Path> {
             let st = child.wait().unwrap();
             match st.code() {
                 Some(0) => Some(dir),
-                Some(3) => {
-                    eprintln!("skipped: python3 Pillow missing");
-                    None
-                }
+                Some(3) => fixtures_unavailable("Pillow missing"),
                 other => panic!("fixture generator failed: {other:?}"),
             }
         })
         .as_deref()
+}
+
+fn fixtures_unavailable(why: &str) -> Option<PathBuf> {
+    if cfg!(windows) || std::env::var_os("DISKRESCUE_ALLOW_FIXTURE_SKIP").is_some() {
+        eprintln!("!!!!!! SKIPPED, NOTHING WAS TESTED: Pillow fixtures unavailable: {why}");
+        return None;
+    }
+    panic!(
+        "Pillow fixtures unavailable: {why}. These tests need python3 with Pillow \
+         (Debian/Ubuntu: python3-pil). Set DISKRESCUE_ALLOW_FIXTURE_SKIP=1 to skip them."
+    );
 }
 
 /// Bytes of one Pillow-generated fixture, or `None` to skip.
