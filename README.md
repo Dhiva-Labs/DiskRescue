@@ -1,9 +1,8 @@
 # DiskRescue
 
-[![ARM64 builds](https://github.com/Dhiva-Labs/DiskRescue/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/Dhiva-Labs/DiskRescue/actions/workflows/ci.yml)
+[![CI](https://github.com/Dhiva-Labs/DiskRescue/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/Dhiva-Labs/DiskRescue/actions/workflows/ci.yml)
 ![Linux x64 | arm64](https://img.shields.io/badge/Linux-x64%20%7C%20arm64-informational?logo=linux&logoColor=white)
 ![Windows x64 | arm64](https://img.shields.io/badge/Windows-x64%20%7C%20arm64-informational?logo=windows&logoColor=white)
-![Linux: deb | rpm | Arch | AppImage | Snap](https://img.shields.io/badge/Linux-deb%20%7C%20rpm%20%7C%20Arch%20%7C%20AppImage%20%7C%20Snap-informational?logo=linux&logoColor=white)
 
 **Get your photos and videos back from a dying drive, and repair the files
 that came back broken.**
@@ -31,6 +30,46 @@ diskrescue recover card.img -o ~/Recovered  # names, deleted files, carving, rep
 diskrescue repair broken.mp4 -o fixed --donor good_clip_from_same_phone.mp4
 ```
 
+## Engineering highlights
+
+- **A re-implementation of GNU ddrescue's algorithm, not a wrapper.** The
+  imaging engine follows ddrescue 1.28 (copy, trim, divide, scrape, retry)
+  over a read-only `Source` trait, and documents its phases and invariants in
+  the module header: data is written before the map marks it finished, the
+  output is fsynced before every mapfile save, and a device that vanishes
+  never gets sectors marked bad. See
+  [`engine.rs`](crates/diskrescue-imaging/src/engine.rs).
+- **Fault-injection tests for the engine.** A simulated faulty device
+  (bad, slow, flaky areas, timeouts, disappearing devices, short reads) drives
+  [`behaviour.rs`](crates/diskrescue-imaging/tests/behaviour.rs), including a
+  randomized fuzz (`randomized_fault_fuzz`, seed and iteration count set with
+  `FUZZ_SEED` and `FUZZ_ITERS`) that asserts the image never holds wrong data
+  for a finished byte, nothing outside the domain is touched, and with all
+  phases enabled the bad sectors are exactly the faulty ones. Further
+  attacks (flapping devices, absurd sector sizes, failing mapfile saves) are
+  in [`review_attacks.rs`](crates/diskrescue-imaging/tests/review_attacks.rs).
+- **Mapfile format compatibility.** The mapfile reader and writer
+  ([`mapfile.rs`](crates/diskrescue-imaging/src/mapfile.rs)) are tested
+  against the examples in ddrescue's format description, including its exact
+  column layout, hex/octal/suffixed numbers and older files
+  ([`mapfile_compat.rs`](crates/diskrescue-imaging/tests/mapfile_compat.rs)).
+  They are not yet checked against the real `ddrescue` binary.
+- **Fuzzing the parsers.** 5000 mutated JPEGs go through every public entry
+  point of the JPEG crate; no panic may escape and "valid" is never reported
+  for data with an error in it
+  ([`fuzz.rs`](crates/diskrescue-jpeg/tests/fuzz.rs)). NTFS is tested on real
+  `mkntfs` volumes with timing-out and vanishing sources, short reads, damaged
+  and torn MFT records and a boot sector that points at the wrong MFT
+  ([`media_faults.rs`](crates/diskrescue-ntfs/tests/media_faults.rs)).
+- **Many small crates with one direction of dependency.** A Rust workspace of
+  19 crates: filesystem parsers (FAT/exFAT, NTFS, ext), a carver, per-format
+  repair crates and the CLI, TUI and GUI front-ends. The parser crates never
+  depend on each other. See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
+- **Ground-truth fixtures.** Test images are generated at test time with the
+  system's own tools (`mkfs.*`, `mkntfs`, ffmpeg) and checked against fsck,
+  ntfs-3g, ffprobe and a BLAKE3 manifest of every file
+  ([`diskrescue-fixtures`](crates/diskrescue-fixtures)).
+
 ## What it does
 
 **Images failing devices the way a recovery lab would.** The read strategy
@@ -42,8 +81,10 @@ follows the device type, detected automatically:
 | SATA / NVMe SSD | large reads, short timeouts, no trimming (flash fails in whole pages), more retry passes |
 | USB pen drive, SD card | small reads, short timeouts, re-opens the device after errors, waits for it to come back when it drops off the bus and recognises it by serial number and first sector, re-checks data after errors because some USB bridges return stale data |
 
-Progress is kept in a GNU ddrescue compatible mapfile: stop at any time, run
-the same command again to continue, or continue in ddrescue. A full-screen
+Progress is kept in a mapfile in GNU ddrescue's format: stop at any time and
+run the same command again to continue. The format is meant to let ddrescue
+continue the same map too, but that has only been tested against ddrescue's
+documented examples, not against the ddrescue program. A full-screen
 view shows the block map, rates, errors and ETA.
 
 **Recovers by name.** Existing and deleted files, with folders and
@@ -95,16 +136,28 @@ zero-filled, never invented), what was repaired and how.
 
 ## Install
 
+The latest release is v0.2.1. Version 0.2.2 (Linux on Arm64) is in the
+source tree and CI but has not been released yet, and neither have the
+packages under "Fedora, openSUSE, Arch and AppImage" below.
+
+**Ubuntu (24.04, x86-64):** from the Dhiva Labs PPA, which currently carries
+DiskRescue 0.2.0:
+
+```
+sudo add-apt-repository ppa:dhiva-labs/apps
+sudo apt install diskrescue
+```
+
 **Windows:** DiskRescue is in the [Microsoft Store](https://apps.microsoft.com/detail/9NS2VVPWDM9T) (paid): signed,
 updated by the Store, and it adds the `diskrescue` and `diskrescue-tui` commands. The
-releases page also has `diskrescue-<version>-x86_64-windows.zip` (most PCs)
-and `diskrescue-<version>-aarch64-windows.zip` (Windows on ARM) with the
+releases page also has `diskrescue-<tag>-x86_64-windows.zip` (most PCs)
+and `diskrescue-<tag>-aarch64-windows.zip` (Windows on ARM) with the
 three programs; they are not signed, so SmartScreen or Smart App Control may
 warn about them or block them. When a drive needs administrator rights, the
 desktop app offers to restart itself with them (a UAC prompt).
 
-**Linux:** download the `.deb` or the tarball from the releases page, for
-x86-64 or Arm64:
+**Linux:** download the `.deb` or the tarball from the releases page. v0.2.1
+has the x86-64 files; the Arm64 files are built from 0.2.2 on:
 
 | | x86-64 | Arm64 (aarch64) |
 |---|---|---|
@@ -114,8 +167,9 @@ x86-64 or Arm64:
 `sudo apt install ./diskrescue_<version>_<arch>.deb`. The releases page also
 lists `SHA256SUMS` for every download.
 
-**Fedora, openSUSE, Arch and AppImage:** from the next release on, the
-releases page also has these, repackaged from the same build as the `.deb`:
+**Fedora, openSUSE, Arch and AppImage:** not in a release yet. CI builds
+these from the same build as the `.deb`, and the releases page will have them
+from the next release on:
 
 | | x86-64 | Arm64 (aarch64) |
 |---|---|---|
@@ -170,6 +224,28 @@ run `sudo diskrescue-tui` or `sudo diskrescue ...`, or add yourself to the
 `disk` group. Image files and repairs need no special rights. On Linux,
 `packaging/linux/diskrescue.desktop` adds the app to your applications menu.
 
+## Build and test
+
+The toolchain is pinned in `rust-toolchain.toml` (Rust 1.97.1; `rustup`
+installs it on first use). The tests build their fixtures with system tools,
+so install `dosfstools`, `exfatprogs` (1.2.3 or newer), `ntfs-3g`,
+`e2fsprogs`, `ffmpeg` and Python 3 with Pillow first (on Debian/Ubuntu:
+`sudo apt install dosfstools exfatprogs ntfs-3g e2fsprogs ffmpeg python3-pil`;
+the GUI also needs the GTK/Wayland/xkbcommon development packages listed in
+`.github/workflows/ci.yml`). Some tests mount NTFS images as a normal user and
+need `ntfs-3g` to be setuid. Tests that need a fixture tool that is missing
+may skip rather than fail, so use the same tools as CI.
+
+```
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets -- -D warnings
+env -u DISPLAY -u WAYLAND_DISPLAY cargo test --workspace --no-fail-fast
+FUZZ_ITERS=1000 FUZZ_SEED=1 cargo test -p diskrescue-imaging --test behaviour randomized_fault_fuzz
+```
+
+CI runs the first three on x86-64 and Arm64 Linux, and the test suite on
+Windows x64 and ARM64 too.
+
 ## Documentation
 
 - `docs/USAGE.md`: commands, options and what to do in common situations
@@ -181,11 +257,16 @@ run `sudo diskrescue-tui` or `sudo diskrescue ...`, or add yourself to the
 
 ## Limits
 
+- Not audited or reviewed by anyone outside the project, and young: the first
+  release is from October 2026.
 - Tested extensively on synthetic images, simulated failing devices and
   generated media; not yet on real failing hardware or real camera RAW files.
 - On Windows, every release is tested end to end on a virtual disk (listing,
   imaging, recovery of existing and deleted files, the desktop app, the
   Microsoft Store package), but not yet on real failing hardware.
+- At the last CI run on `main` (2 November 2026), the two Windows jobs
+  failed at the step that installs the Microsoft Store package (see issue
+  #9); the Linux jobs passed.
 - The desktop app has been tested offscreen (every page is driven by
   automated UI tests and rendered headless) but not yet on many real desktops.
 - Deleted files on SSDs are usually erased by TRIM within minutes; recovering
