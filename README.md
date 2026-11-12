@@ -7,6 +7,8 @@
 **Get your photos and videos back from a dying drive, and repair the files
 that came back broken.**
 
+**Documentation:** step-by-step guides at [learn.dhivalabs.com](https://learn.dhivalabs.com/apps/diskrescue/): [install](https://learn.dhivalabs.com/apps/diskrescue/install) · [beginner guide](https://learn.dhivalabs.com/apps/diskrescue/getting-started) · [troubleshooting](https://learn.dhivalabs.com/apps/diskrescue/faq). New to the topic? Try the [Files, backups and recovery](https://learn.dhivalabs.com/tracks/files/) learning track.
+
 DiskRescue recovers photos and videos from hard disks, SSDs, USB pen drives
 and SD cards that are failing, have failed, were reformatted or had files
 deleted, and repairs damaged JPEG, PNG, MP4/MOV and AVI files. It comes in
