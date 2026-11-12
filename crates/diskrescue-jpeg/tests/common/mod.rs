@@ -10,8 +10,9 @@ use std::sync::{Arc, OnceLock};
 
 use diskrescue_jpeg::core::source::{MemSource, ReadError, SharedSource, Source};
 
-/// Directory with the Pillow-generated fixture set, or `None` (after an
-/// explicit "skipped" message) when python3 + Pillow are unavailable.
+/// Directory with the Pillow-generated fixture set. A missing python3 or
+/// Pillow fails the test (see `fixtures_unavailable`); `None` only where a
+/// skip is allowed.
 pub fn fixtures() -> Option<&'static Path> {
     static DIR: OnceLock<Option<PathBuf>> = OnceLock::new();
     DIR.get_or_init(|| generate("all")).as_deref()
@@ -43,8 +44,8 @@ pub fn camera_manifest(dir: &Path) -> Vec<(String, u64)> {
         .collect()
 }
 
-/// True when Pillow decodes `path` completely (`None` when python3 or
-/// Pillow is missing, after an explicit "skipped" message).
+/// True when Pillow decodes `path` completely (`None` only where a skip is
+/// allowed and python3 or Pillow is missing).
 pub fn pillow_decodes(path: &Path) -> Option<bool> {
     let o = Command::new("python3")
         .arg("-c")
@@ -55,16 +56,28 @@ pub fn pillow_decodes(path: &Path) -> Option<bool> {
         Ok(o) if o.status.success() => Some(true),
         Ok(o) => {
             if String::from_utf8_lossy(&o.stderr).contains("No module named") {
-                eprintln!("skipped: Pillow missing");
-                return None;
+                return fixtures_unavailable("Pillow missing");
             }
             Some(false)
         }
-        Err(_) => {
-            eprintln!("skipped: python3 missing");
-            None
-        }
+        Err(_) => fixtures_unavailable("python3 missing"),
     }
+}
+
+/// A fixture the tests need could not be built. That fails the test, so a
+/// broken fixture environment can never pass by testing nothing. The one
+/// exception is Windows, whose CI test step runs before python3 and Pillow
+/// are installed, and anyone who sets `DISKRESCUE_ALLOW_FIXTURE_SKIP=1`:
+/// there the tests skip, with a loud message (shown with `--nocapture`).
+fn fixtures_unavailable<T>(why: &str) -> Option<T> {
+    if cfg!(windows) || std::env::var_os("DISKRESCUE_ALLOW_FIXTURE_SKIP").is_some() {
+        eprintln!("!!!!!! SKIPPED, NOTHING WAS TESTED: JPEG fixtures unavailable: {why}");
+        return None;
+    }
+    panic!(
+        "JPEG fixtures unavailable: {why}. These tests need python3 with Pillow \
+         (Debian/Ubuntu: python3-pil). Set DISKRESCUE_ALLOW_FIXTURE_SKIP=1 to skip them."
+    );
 }
 
 fn generate(set: &str) -> Option<PathBuf> {
@@ -85,20 +98,15 @@ fn run_script(script: &str, tag: &str, args: &[&str]) -> Option<PathBuf> {
         .output()
     {
         Ok(o) if o.status.success() => Some(dir),
-        Ok(o) => {
-            eprintln!(
-                "skipped: python3+Pillow missing ({})",
-                String::from_utf8_lossy(&o.stderr)
-                    .lines()
-                    .last()
-                    .unwrap_or("")
-            );
-            None
-        }
-        Err(_) => {
-            eprintln!("skipped: python3 missing");
-            None
-        }
+        Ok(o) => fixtures_unavailable(&format!(
+            "{script:?} failed ({}): {}",
+            o.status,
+            String::from_utf8_lossy(&o.stderr)
+                .lines()
+                .last()
+                .unwrap_or("")
+        )),
+        Err(e) => fixtures_unavailable(&format!("cannot run python3: {e}")),
     }
 }
 
