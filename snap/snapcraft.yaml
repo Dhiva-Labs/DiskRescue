@@ -29,7 +29,9 @@ confinement: classic
 contact: https://github.com/Dhiva-Labs/DiskRescue/issues
 issues: https://github.com/Dhiva-Labs/DiskRescue/issues
 source-code: https://github.com/Dhiva-Labs/DiskRescue
-website: https://github.com/Dhiva-Labs/DiskRescue
+website:
+  - https://github.com/Dhiva-Labs/DiskRescue
+  - https://learn.dhivalabs.com/apps/diskrescue/
 icon: packaging/linux/diskrescue.svg
 platforms:
   amd64:
